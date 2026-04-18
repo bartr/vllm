@@ -37,6 +37,7 @@ mkdir -p $HOME/.k9s
 
 git config --global user.name bartr
 git config --global user.email bartr@microsoft.comgit config --global core.whitespace blank-at-eol,blank-at-eof,space-before-tab
+git config --global credential.helper store
 git config --global pull.rebase false
 git config --global init.defaultbranch main
 git config --global fetch.prune true
