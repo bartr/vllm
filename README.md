@@ -241,6 +241,110 @@ Once the starter deployment works, the next tuning knobs are:
 3. Confirm `kubectl logs -n llm deploy/vllm` shows the model loaded successfully.
 4. Test the authenticated ingress endpoint with `/v1/chat/completions`.
 
+## Add Observability
+
+The repo now includes a first-phase, in-cluster observability stack for K3s:
+
+- `Prometheus` for time-series collection
+- `Grafana` for dashboards
+- `node-exporter` and `kube-state-metrics` for node and workload basics
+- `NVIDIA DCGM exporter` for GPU utilization, memory, temperature, and power metrics
+- `OpenCost` for infrastructure cost estimation using local custom pricing
+
+This stack is tuned for the same local, single-node setup as the vLLM manifests. It keeps retention short, uses modest resource requests, and exposes the UIs with NodePorts so you can inspect the stack from the LAN without adding ingress auth yet.
+
+The active `vllm` service is now included in Prometheus scraping through [manifests/vllm-servicemonitor.yaml](/home/bartr/vllm/manifests/vllm-servicemonitor.yaml). The pinned vLLM image exposes Prometheus metrics on the same API port at `/metrics`, so the stack can collect request, latency, token, cache, and HTTP server metrics from whichever model profile is deployed.
+
+### Install the observability stack
+
+The installer follows the same pattern as the existing GPU support scripts and will install the monitoring stack, the GPU exporter, OpenCost, and the repo-provided Grafana dashboards:
+
+```bash
+./scripts/install-observability.sh
+```
+
+It installs these charts into the `monitoring` namespace using the in-repo values files:
+
+- [helm/kube-prometheus-stack-values.yaml](/home/bartr/vllm/helm/kube-prometheus-stack-values.yaml)
+- [helm/dcgm-exporter-values.yaml](/home/bartr/vllm/helm/dcgm-exporter-values.yaml)
+- [helm/opencost-values.yaml](/home/bartr/vllm/helm/opencost-values.yaml)
+
+The script prints the node IP and these local endpoints when the rollout completes:
+
+- Grafana: `http://<node-ip>:30080`
+- Prometheus: `http://<node-ip>:30090`
+- OpenCost: `http://<node-ip>:30081`
+
+Grafana uses `admin` / `change-me` by default in this local-first setup. Change it in [helm/kube-prometheus-stack-values.yaml](/home/bartr/vllm/helm/kube-prometheus-stack-values.yaml) before installation if you do not want the default local password.
+
+### What you get first
+
+Out of the box, Grafana includes the kube-prometheus dashboards plus three repo-provided dashboards:
+
+- [manifests/observability-grafana-dashboards.yaml](/home/bartr/vllm/manifests/observability-grafana-dashboards.yaml) provisions a `GPU Observability` dashboard
+- [manifests/observability-grafana-dashboards.yaml](/home/bartr/vllm/manifests/observability-grafana-dashboards.yaml) provisions a `Cost Observability` dashboard
+- [manifests/vllm-observability-dashboard.yaml](/home/bartr/vllm/manifests/vllm-observability-dashboard.yaml) provisions a `vLLM Observability` dashboard
+
+Use the default dashboards for node CPU, memory, disk, pod health, and Kubernetes workload status. Use the custom dashboards for:
+
+- GPU utilization by pod
+- GPU framebuffer memory used by pod
+- GPU power draw and temperature
+- cluster hourly cost
+- GPU, CPU, RAM, and persistent-volume hourly cost
+- running and queued vLLM requests
+- vLLM KV cache usage
+- request success rate, token throughput, and p95 TTFT / end-to-end latency
+- HTTP request rate for chat and completion endpoints
+
+### Verify the stack
+
+Once the installer finishes:
+
+```bash
+kubectl -n monitoring get pods
+kubectl -n monitoring get servicemonitors
+```
+
+Check Prometheus target health at `http://<node-ip>:30090/targets` and confirm you can see healthy scrape targets for:
+
+- `monitoring-prometheus-node-exporter`
+- `monitoring-kube-state-metrics`
+- `dcgm-dcgm-exporter`
+- `opencost`
+- `vllm`
+
+You can also confirm the key metric families directly in Prometheus:
+
+```bash
+# GPU metrics
+DCGM_FI_DEV_GPU_UTIL
+
+# OpenCost metrics
+node_total_hourly_cost
+node_gpu_hourly_cost
+
+# vLLM metrics
+vllm:num_requests_running
+vllm:request_success_total
+vllm:time_to_first_token_seconds_bucket
+```
+
+### Pricing assumptions
+
+OpenCost is configured with a simple local custom pricing model in [helm/opencost-values.yaml](/home/bartr/vllm/helm/opencost-values.yaml). The default values are intentionally easy to edit for a laptop or edge node:
+
+- CPU: `$0.03` per core-hour
+- RAM: `$0.004` per GiB-hour
+- GPU: `$0.35` per GPU-hour
+- storage: `$0.0001` per GiB-hour
+
+Adjust those values to match your own electricity, amortization, or internal chargeback model.
+
+### vLLM application metrics
+
+The pinned `vllm/vllm-openai:v0.19.1` image exposes Prometheus metrics at `/metrics` on the same API service port, so the current setup now scrapes request, token, cache, and HTTP server metrics from the active `vllm` workload. That adds application-level latency and throughput visibility on top of the node, GPU, and infrastructure-cost dashboards.
+
 ## Support
 
 This project uses GitHub Issues to track bugs and feature requests. Please search the existing issues before filing new issues to avoid duplicates.  For new issues, file your bug or feature request as a new issue.

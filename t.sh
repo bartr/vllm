@@ -1,0 +1,20 @@
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail" &
+./ask.sh "what are some reasons to deploy vllm on an edge kubernetes server in retail"

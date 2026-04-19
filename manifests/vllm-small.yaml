@@ -21,6 +21,8 @@ kind: Deployment
 metadata:
   name: vllm
   namespace: llm
+  labels:
+    app.kubernetes.io/name: vllm
 spec:
   replicas: 1
   strategy:
@@ -32,6 +34,7 @@ spec:
     metadata:
       labels:
         app: vllm
+        app.kubernetes.io/name: vllm
     spec:
       enableServiceLinks: false
       runtimeClassName: nvidia
@@ -104,6 +107,8 @@ kind: Service
 metadata:
   name: vllm
   namespace: llm
+  labels:
+    app.kubernetes.io/name: vllm
 spec:
   selector:
     app: vllm

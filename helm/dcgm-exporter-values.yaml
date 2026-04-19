@@ -1,0 +1,18 @@
+runtimeClassName: nvidia
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  additionalLabels:
+    release: monitoring
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 200m
+    memory: 512Mi
+
+kubernetes:
+  enablePodLabels: true
