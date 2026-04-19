@@ -4,13 +4,14 @@ cd "$(dirname $BASH_SOURCE[0])"
 export dir=$(pwd)
 
 if [ "$USER" != "root" ] || [ "$SUDO_USER" == "" ]; then
-    echo "You must run using sudo ./base.sh"
+    echo "You must run using sudo ./scripts/base.sh"
     exit 1
 fi
 
 passwd
 
 mkdir -p /etc/systemd/logind.conf.d
+mkdir -p /etc/systemd/sleep.conf.d
 
 tee /etc/systemd/logind.conf.d/lid.conf >/dev/null <<'EOF'
 [Login]
@@ -18,6 +19,17 @@ HandleLidSwitch=ignore
 HandleLidSwitchExternalPower=ignore
 HandleLidSwitchDocked=ignore
 EOF
+
+tee /etc/systemd/sleep.conf.d/always-on.conf >/dev/null <<'EOF'
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowHybridSleep=no
+AllowSuspendThenHibernate=no
+EOF
+
+systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+systemctl restart systemd-logind
 
 echo "$SUDO_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$SUDO_USER
 chmod 0440 /etc/sudoers.d/$SUDO_USER

@@ -13,11 +13,13 @@ git clone https://github.com/bartr/vllm
 
 ```bash
 
-sudo ./base.sh
+sudo ./scripts/base.sh
 
-./config.sh
+./scripts/config.sh
 
 ```
+
+`./scripts/base.sh` also configures Ubuntu to stay awake on this laptop by ignoring lid-close events and disabling suspend, hibernate, and hybrid sleep.
 
 ## Install NVIDIA GPU Support For K3s
 
@@ -25,7 +27,7 @@ K3s needs the NVIDIA container toolkit on the host before the device plugin can 
 
 ```bash
 
-sudo ./install-nvidia-container-toolkit.sh
+sudo ./scripts/install-nvidia-container-toolkit.sh
 
 ```
 
@@ -33,7 +35,7 @@ The script installs chart version `0.19.0` with automatic GPU node labeling enab
 
 ```bash
 
-./install-nvidia-device-plugin.sh --clean
+./scripts/install-nvidia-device-plugin.sh --clean
 
 ```
 
@@ -152,7 +154,7 @@ These `http` examples are for interactive API checks. The helper script below us
 
 Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 
-`sudo ./base.sh` installs `glow`, so the script can render Markdown responses in the terminal.
+`sudo ./scripts/base.sh` installs `glow`, so the script can render Markdown responses in the terminal.
 
 ```bash
 ./ask.sh
