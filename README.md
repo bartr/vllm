@@ -345,6 +345,29 @@ Adjust those values to match your own electricity, amortization, or internal cha
 
 The pinned `vllm/vllm-openai:v0.19.1` image exposes Prometheus metrics at `/metrics` on the same API service port, so the current setup now scrapes request, token, cache, and HTTP server metrics from the active `vllm` workload. That adds application-level latency and throughput visibility on top of the node, GPU, and infrastructure-cost dashboards.
 
+## Reset the cluster
+
+```bash
+
+sudo /usr/local/bin/k3s-uninstall.sh
+sudo rm -f ~/.kube/config
+sudo rm -rf /etc/rancher/k3s
+
+## agressive wipe
+#sudo rm -rf /var/lib/rancher /var/lib/kubelet /etc/cni /var/lib/cni
+
+```
+
+### Create a new cluster
+
+```bash
+
+curl -sfL https://get.k3s.io | sh -
+./scripts/config.sh
+kubectl get nodes
+
+```
+
 ## Support
 
 This project uses GitHub Issues to track bugs and feature requests. Please search the existing issues before filing new issues to avoid duplicates.  For new issues, file your bug or feature request as a new issue.
