@@ -18,10 +18,7 @@ mkdir -p $HOME/bin
 mkdir -p $HOME/.k9s
 
 {
-    echo "export PATH=\$PATH:\$HOME/bin:\$HOME/.dotnet/tools:\$HOME/go/bin"
-    echo "export GO111MODULE=on"
     echo ""
-
     echo "alias k='kubectl'"
     echo "alias kaf='kubectl apply -f'"
     echo "alias kdelf='kubectl delete -f'"
@@ -33,10 +30,9 @@ mkdir -p $HOME/.k9s
     echo "alias kgi='kubectl get ingress -A'"
     echo "alias kgc='kubectl config get-contexts'"
     echo "alias ipconfig='ip -4 a show wlp4s0 | grep inet | sed \"s/inet//g\" | sed \"s/ //g\" | cut -d / -f 1'"
-} > $HOME/.zshenv
+} >> $HOME/.zshenv
 
-git config --global user.name bartr
-git config --global user.email bartr@microsoft.comgit config --global core.whitespace blank-at-eol,blank-at-eof,space-before-tab
+git config --global core.whitespace blank-at-eol,blank-at-eof,space-before-tab
 git config --global credential.helper store
 git config --global pull.rebase false
 git config --global init.defaultbranch main
