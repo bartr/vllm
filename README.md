@@ -92,7 +92,7 @@ The deployment uses:
 - `runtimeClassName: nvidia`
 - one GPU via `nvidia.com/gpu: 1`
 - a `PersistentVolumeClaim` named `vllm-model-cache` for Hugging Face model files
-- one shared `NodePort` service on port `30080`
+- one shared internal `Service` named `vllm` on port `8000`
 - `enableServiceLinks: false` to avoid the Kubernetes `VLLM_PORT` env var collision
 - a `startupProbe` plus `Recreate` rollout strategy so first boot works reliably on a single GPU node
 - exactly one model manifest should be applied at a time on a single 8 GB GPU
@@ -123,7 +123,7 @@ kubectl apply -f manifests/vllm-medium.yaml
 kubectl -n llm rollout status deploy/vllm
 ```
 
-This keeps the same service name, same NodePort, and same PVC cache.
+This keeps the same service name, same ingress route target, and same PVC cache.
 
 Do not apply multiple model manifests and expect them to run side by side on this single GPU node. They manage the same `vllm` deployment and service on purpose.
 
@@ -141,16 +141,40 @@ Get the node IP that is hosting the pod:
 kubectl -n llm get pods -o wide
 ```
 
-Then call the active model directly. If you are running the request from the K3s host, the service is reachable at `http://localhost:30080`.
+This setup uses the Traefik ingress as the primary endpoint. The service itself stays internal to the cluster.
 
-Verify the server is up:
+Create the basic-auth secret in the `llm` namespace:
 
 ```bash
-http http://localhost:30080/health
-http http://localhost:30080/v1/models
+VLLM_BASIC_AUTH_USER=admin
+VLLM_BASIC_AUTH_PASSWORD='change-me'
+HASH=$(openssl passwd -apr1 "$VLLM_BASIC_AUTH_PASSWORD")
+printf '%s:%s\n' "$VLLM_BASIC_AUTH_USER" "$HASH" > users
+kubectl -n llm create secret generic vllm-basic-auth --from-file=users=./users
+rm -f users
 ```
 
-These `http` examples are for interactive API checks. The helper script below uses `curl` and does not depend on `httpie`.
+Apply the Traefik middleware and ingress route:
+
+```bash
+kubectl apply -f manifests/vllm-ingress-basic-auth.yaml
+```
+
+The manifest uses the host `vllm.local`. Add a hosts-file entry on the client that will call the service:
+
+```bash
+NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+echo "$NODE_IP vllm.local" | sudo tee -a /etc/hosts
+```
+
+Verify the server is up through ingress:
+
+```bash
+http -a admin:change-me http://vllm.local/health
+http -a admin:change-me http://vllm.local/v1/models
+```
+
+These `http` examples are for interactive API checks. The helper script below uses `curl` and supports ingress basic auth with `VLLM_AUTH`.
 
 Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 
@@ -160,10 +184,12 @@ Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 ./ask.sh
 ```
 
+If `VLLM_AUTH` is not already set, `ask.sh` prompts for the ingress username and password interactively.
+
 You can also pass the user context directly:
 
 ```bash
-./ask.sh "Give me three uses for an edge-hosted LLM."
+VLLM_AUTH='admin:change-me' ./ask.sh "Give me three uses for an edge-hosted LLM."
 ```
 
 It will:
@@ -171,12 +197,31 @@ It will:
 - set `VLLM_MODEL` automatically if it is not already set
 - prompt for the user context
 - send the request to the active model
+- prompt for ingress credentials when `VLLM_AUTH` is not set and the script is run interactively
+- authenticate to the ingress when `VLLM_AUTH` is set
 - render the assistant content with `glow`
 - print elapsed time and token usage on separate lines after the rendered response
 
 On the first startup, expect a delay while vLLM pulls the container image, downloads model weights, compiles kernels, and captures CUDA graphs. On this 8 GB GPU, the large 7B AWQ profile took about 150 seconds to download weights and about 56 seconds to finish engine initialization after that.
 
 The 1.5B profile should start faster and leave more room for context length, while the 3B profile is a good middle ground. The 7B AWQ profile should produce the strongest answers of the three on this hardware.
+
+### Offline and edge operation
+
+Once the vLLM pod is running and the model has already been cached in `vllm-model-cache`, the service can continue running without internet access.
+
+For offline operation, make sure these artifacts are already local on the node:
+
+- the pinned `vllm/vllm-openai:v0.19.1` container image has already been pulled
+- the selected model has already been downloaded into `/cache/huggingface`
+- the `vllm-model-cache` PVC is still attached and contains the cached model files
+
+Internet access is still needed when:
+
+- you start from a fresh node that does not have the vLLM image yet
+- you switch to a model that is not already cached
+- you clear or lose the PVC-backed Hugging Face cache
+- you intentionally pull a newer container image or different model
 
 ### Tune after the first successful run
 
@@ -194,7 +239,7 @@ Once the starter deployment works, the next tuning knobs are:
 1. Deploy the starter manifest unchanged.
 2. Choose one of `vllm-small.yaml`, `vllm-medium.yaml`, or `vllm-large.yaml`.
 3. Confirm `kubectl logs -n llm deploy/vllm` shows the model loaded successfully.
-4. Test the shared `NodePort` endpoint with `/v1/chat/completions`.
+4. Test the authenticated ingress endpoint with `/v1/chat/completions`.
 
 ## Support
 

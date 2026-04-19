@@ -37,10 +37,12 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.19.1@sha256:89c1d0629d377daa3f7f369cbea6167a7b48ea89aaacd12555e2b0b2f7f740d3
           args:
             - --model
             - Qwen/Qwen2.5-1.5B-Instruct
+            - --revision
+            - 989aa7980e4cf806f80c7fef2b1adb7bc71aa306
             - --served-model-name
             - Qwen/Qwen2.5-1.5B-Instruct
             - --host
@@ -103,11 +105,9 @@ metadata:
   name: vllm
   namespace: llm
 spec:
-  type: NodePort
   selector:
     app: vllm
   ports:
     - name: http
       port: 8000
       targetPort: http
-      nodePort: 30080
