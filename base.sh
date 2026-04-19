@@ -71,6 +71,22 @@ rm -f kubectl
 # install flux
 curl -s https://fluxcd.io/install.sh | bash
 
+# install glow
+GLOW_VERSION=$(curl -fsSL https://api.github.com/repos/charmbracelet/glow/releases/latest | jq -r '.tag_name')
+GLOW_ARCH=$(dpkg --print-architecture)
+case "$GLOW_ARCH" in
+    amd64|arm64)
+        GLOW_DEB="glow_${GLOW_VERSION#v}_${GLOW_ARCH}.deb"
+        wget "https://github.com/charmbracelet/glow/releases/download/$GLOW_VERSION/$GLOW_DEB"
+        dpkg -i "$GLOW_DEB"
+        rm -f "$GLOW_DEB"
+        ;;
+    *)
+        echo "Unsupported architecture for glow: $GLOW_ARCH"
+        exit 1
+        ;;
+esac
+
 # install K9s
 VERSION=$(curl -i https://github.com/derailed/k9s/releases/latest | grep "location: https://github.com/" | rev | cut -f 1 -d / | rev | sed 's/\r//')
 wget https://github.com/derailed/k9s/releases/download/$VERSION/k9s_Linux_amd64.tar.gz
