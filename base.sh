@@ -10,6 +10,15 @@ fi
 
 passwd
 
+mkdir -p /etc/systemd/logind.conf.d
+
+tee /etc/systemd/logind.conf.d/lid.conf >/dev/null <<'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+
 echo "$SUDO_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$SUDO_USER
 chmod 0440 /etc/sudoers.d/$SUDO_USER
 
