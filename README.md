@@ -21,11 +21,29 @@ sudo ./base.sh
 
 ## Install NVIDIA GPU Support For K3s
 
+K3s needs the NVIDIA container toolkit on the host before the device plugin can start pods with `runtimeClassName: nvidia`.
+
+```bash
+
+sudo ./install-nvidia-container-toolkit.sh
+
+```
+
 The script installs chart version `0.19.0` with automatic GPU node labeling enabled and prints the GPU capacity discovered on each node.
 
 ```bash
 
 ./install-nvidia-device-plugin.sh --clean
+
+```
+
+For a reusable GPU smoke test inside K3s:
+
+```bash
+
+kubectl apply -f manifests/gpu-smoke-test.yaml
+kubectl logs gpu-smoke-test
+kubectl delete -f manifests/gpu-smoke-test.yaml
 
 ```
 
