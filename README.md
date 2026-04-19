@@ -13,17 +13,21 @@ git clone https://github.com/bartr/vllm
 
 ```bash
 
-sudo ./install.sh
+sudo ./base.sh
+
+./config.sh
 
 ```
 
-## Finish Setup
+## Install NVIDIA GPU Support For K3s
 
-  ```bash
+The script installs chart version `0.19.0` with automatic GPU node labeling enabled and prints the GPU capacity discovered on each node.
 
-  ./config.sh
+```bash
 
-  ```
+./install-nvidia-device-plugin.sh --clean
+
+```
 
 ## Support
 

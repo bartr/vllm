@@ -8,23 +8,36 @@ if [ "$USER" != "root" ] || [ "$SUDO_USER" == "" ]; then
     exit 1
 fi
 
+passwd
+
 echo "$SUDO_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$SUDO_USER
 chmod 0440 /etc/sudoers.d/$SUDO_USER
+
+cp /usr/share/zoneinfo/America/Chicago /etc/localtime
+
+groupadd docker
+groupadd admin
+
+usermod -aG sudo $SUDO_USER
+usermod -aG admin $SUDO_USER
+usermod -aG docker $SUDO_USER
+gpasswd -a $SUDO_USER sudo
+gpasswd -a $SUDO_USER admin
+gpasswd -a $SUDO_USER docker
+
+chown -r $SUDO_USER:$SUDO_USER /home/$SUDO_USER
 
 #update-alternatives --set iptables /usr/sbin/iptables-legacy
 
 apt-get update
 apt-get install -y gpg wget
-apt-get install -y apt-utils dialog apt-transport-https ca-certificates software-properties-common
+apt-get install -y apt-utils dialog apt-transport-https ca-certificates software-properties-common iputils-ping
 apt-get install -y libssl-dev libffi-dev python2-dev build-essential cifs-utils lsb-release gnupg-agent
-apt-get install -y curl git wget nano zsh
+apt-get install -y curl git nano zsh
 apt-get install -y jq zip unzip httpie dnsutils
-apt-get install -y golang
+#apt-get install -y golang
 #apt-get install -y nginx mariadb-server mariadb-client
 #apt-get install -y php-fpm php-common php-mysql php-gmp php-curl php-intl php-mbstring php-xmlrpc php-gd php-xml php-cli php-zip
-
-apt-get upgrade -y
-#apt-get install -y dotnet-sdk-7.0 dotnet-sdk-8.0
 
 # add Docker repo
 install -m 0755 -d /etc/apt/keyrings
@@ -36,8 +49,7 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.
 # Install Docker
 apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-# apt-get install -y gh
+apt-get upgrade -y
 
 # install kubectl
 curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
