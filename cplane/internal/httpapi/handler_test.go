@@ -24,7 +24,8 @@ func TestRoutes(t *testing.T) {
 	}{
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
-		{name: "ask", method: http.MethodGet, path: "/ask", statusCode: http.StatusOK, body: "success\n"},
+		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: "success\n"},
+		{name: "ask missing q", method: http.MethodGet, path: "/ask", statusCode: http.StatusBadRequest, body: "missing q\n"},
 		{name: "ask method not allowed", method: http.MethodPost, path: "/ask", statusCode: http.StatusMethodNotAllowed, body: "Method Not Allowed\n"},
 	}
 
@@ -58,7 +59,7 @@ func TestRoutesRequestLogging(t *testing.T) {
 	defer log.SetOutput(originalOutput)
 
 	handler := NewHandler().Routes()
-	req := httptest.NewRequest(http.MethodGet, "/ask", nil)
+	req := httptest.NewRequest(http.MethodGet, "/ask?q=success", nil)
 	recorder := httptest.NewRecorder()
 
 	handler.ServeHTTP(recorder, req)
@@ -66,7 +67,7 @@ func TestRoutesRequestLogging(t *testing.T) {
 	logLine := logBuffer.String()
 	for _, want := range []string{
 		"method=GET",
-		"path=/ask",
+		"path=/ask?q=success",
 		"status=200",
 		"bytes=8",
 	} {

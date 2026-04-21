@@ -38,8 +38,14 @@ func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
 	writePlainText(w, http.StatusOK, "ready\n")
 }
 
-func (h *Handler) ask(w http.ResponseWriter, _ *http.Request) {
-	writePlainText(w, http.StatusOK, "success\n")
+func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		writePlainText(w, http.StatusBadRequest, "missing q\n")
+		return
+	}
+
+	writePlainText(w, http.StatusOK, query+"\n")
 }
 
 func writePlainText(w http.ResponseWriter, status int, body string) {
