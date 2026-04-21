@@ -56,7 +56,6 @@ apt-get install -y apt-utils dialog apt-transport-https ca-certificates software
 apt-get install -y libssl-dev libffi-dev python2-dev build-essential cifs-utils lsb-release gnupg-agent
 apt-get install -y curl git nano zsh
 apt-get install -y jq zip unzip httpie dnsutils
-#apt-get install -y golang
 #apt-get install -y nginx mariadb-server mariadb-client
 #apt-get install -y php-fpm php-common php-mysql php-gmp php-curl php-intl php-mbstring php-xmlrpc php-gd php-xml php-cli php-zip
 
@@ -120,3 +119,8 @@ cd $OLD_PWD
 
 # install k3s
 curl -sfL https://get.k3s.io | sh -
+
+# install Go
+curl -LO https://go.dev/dl/go1.26.2.linux-amd64.tar.gz
+tar -C /usr/local -xzf go1.26.2.linux-amd64.tar.gz
+rm go1.26.2.linux-amd64.tar.gz
