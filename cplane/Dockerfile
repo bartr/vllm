@@ -6,14 +6,14 @@ COPY go.mod ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags='-s -w' -o /out/cllm ./cmd/cllm
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags='-s -w' -o /out/cplane ./cmd/cplane
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /
 
-COPY --from=build /out/cllm /cllm
+COPY --from=build /out/cplane /cplane
 
 EXPOSE 8080
 
-ENTRYPOINT ["/cllm"]
+ENTRYPOINT ["/cplane"]

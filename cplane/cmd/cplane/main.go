@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"cllm/internal/config"
-	"cllm/internal/httpapi"
+	"cplane/internal/config"
+	"cplane/internal/httpapi"
 )
 
 func main() {

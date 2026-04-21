@@ -1,13 +1,13 @@
 GO ?= go
-BINARY ?= cllm
+BINARY ?= cplane
 
 .PHONY: build run test fmt clean
 
 build:
-	$(GO) build -o bin/$(BINARY) ./cmd/cllm
+	$(GO) build -o bin/$(BINARY) ./cmd/cplane
 
 run:
-	$(GO) run ./cmd/cllm
+	$(GO) run ./cmd/cplane
 
 test:
 	$(GO) test ./...
