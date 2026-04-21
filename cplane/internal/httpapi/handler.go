@@ -3,17 +3,21 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
 	defaultVLLMURL          = "http://127.0.0.1:32080"
+	defaultCacheSize        = 100
 	defaultSystemPrompt     = "You are a concise assistant."
 	defaultMaxTokens        = 500
 	defaultTemperature      = 0.2
@@ -22,6 +26,7 @@ const (
 
 type Handler struct {
 	ready      atomic.Bool
+	cache      *lruCache
 	vllmURL    string
 	httpClient *http.Client
 }
@@ -29,18 +34,22 @@ type Handler struct {
 func NewHandler() *Handler {
 	handler := &Handler{}
 	handler.ready.Store(true)
+	handler.cache = newLRUCache(defaultCacheSize)
 	handler.vllmURL = defaultVLLMURL
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
 	return handler
 }
 
-func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client) *Handler {
+func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int) *Handler {
 	handler := NewHandler()
 	if vllmURL != "" {
 		handler.vllmURL = vllmURL
 	}
 	if httpClient != nil {
 		handler.httpClient = httpClient
+	}
+	if cacheSize > 0 {
+		handler.cache = newLRUCache(cacheSize)
 	}
 	return handler
 }
@@ -69,9 +78,27 @@ func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
 func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
+		markCacheHit(w, false)
 		writePlainText(w, http.StatusBadRequest, "missing q\n")
 		return
 	}
+
+	cacheKey := standardizeCacheKey(query)
+	if cacheKey == "" {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, "missing q\n")
+		return
+	}
+
+	if cachedResponse, ok := h.cache.Get(cacheKey); ok {
+		markCacheHit(w, true)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(cachedResponse.statusCode)
+		_, _ = w.Write(cachedResponse.body)
+		return
+	}
+
+	markCacheHit(w, false)
 
 	model, err := h.fetchModel(r.Context())
 	if err != nil {
@@ -85,9 +112,15 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody})
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(responseBody)
+}
+
+func standardizeCacheKey(query string) string {
+	return strings.ToLower(strings.Join(strings.Fields(query), ""))
 }
 
 type modelsResponse struct {
@@ -184,8 +217,13 @@ func writePlainText(w http.ResponseWriter, status int, body string) {
 
 type loggingResponseWriter struct {
 	http.ResponseWriter
+	cacheHit   bool
 	statusCode int
 	bytes      int
+}
+
+func (w *loggingResponseWriter) SetCacheHit(cacheHit bool) {
+	w.cacheHit = cacheHit
 }
 
 func (w *loggingResponseWriter) WriteHeader(statusCode int) {
@@ -203,6 +241,15 @@ func (w *loggingResponseWriter) Write(body []byte) (int, error) {
 	return bytesWritten, err
 }
 
+func markCacheHit(w http.ResponseWriter, cacheHit bool) {
+	cacheAwareWriter, ok := w.(interface{ SetCacheHit(bool) })
+	if !ok {
+		return
+	}
+
+	cacheAwareWriter.SetCacheHit(cacheHit)
+}
+
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedAt := time.Now()
@@ -216,12 +263,93 @@ func requestLogger(next http.Handler) http.Handler {
 		}
 
 		log.Printf(
-			"method=%s path=%s status=%d bytes=%d duration_ms=%.2f",
+			"method=%s path=%s status=%d bytes=%d cache=%t duration_ms=%.2f",
 			r.Method,
 			r.URL.RequestURI(),
 			statusCode,
 			responseWriter.bytes,
+			responseWriter.cacheHit,
 			float64(time.Since(startedAt))/float64(time.Millisecond),
 		)
 	})
+}
+
+type cachedVLLMResponse struct {
+	statusCode int
+	body       []byte
+}
+
+type lruCache struct {
+	capacity int
+	entries  map[string]*list.Element
+	items    *list.List
+	mu       sync.Mutex
+}
+
+type cacheEntry struct {
+	key   string
+	value cachedVLLMResponse
+}
+
+func newLRUCache(capacity int) *lruCache {
+	if capacity < 1 {
+		capacity = defaultCacheSize
+	}
+
+	return &lruCache{
+		capacity: capacity,
+		entries:  make(map[string]*list.Element, capacity),
+		items:    list.New(),
+	}
+}
+
+func (c *lruCache) Get(key string) (cachedVLLMResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	element, ok := c.entries[key]
+	if !ok {
+		return cachedVLLMResponse{}, false
+	}
+
+	c.items.MoveToFront(element)
+	entry := element.Value.(*cacheEntry)
+	return cachedVLLMResponse{
+		statusCode: entry.value.statusCode,
+		body:       append([]byte(nil), entry.value.body...),
+	}, true
+}
+
+func (c *lruCache) Add(key string, value cachedVLLMResponse) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if element, ok := c.entries[key]; ok {
+		c.items.MoveToFront(element)
+		entry := element.Value.(*cacheEntry)
+		entry.value = cachedVLLMResponse{statusCode: value.statusCode, body: append([]byte(nil), value.body...)}
+		return
+	}
+
+	element := c.items.PushFront(&cacheEntry{
+		key: key,
+		value: cachedVLLMResponse{
+			statusCode: value.statusCode,
+			body:       append([]byte(nil), value.body...),
+		},
+	})
+	c.entries[key] = element
+
+	if c.items.Len() <= c.capacity {
+		return
+	}
+
+	oldest := c.items.Back()
+	if oldest == nil {
+		return
+	}
+
+	c.items.Remove(oldest)
+	entry := oldest.Value.(*cacheEntry)
+	delete(c.entries, entry.key)
 }

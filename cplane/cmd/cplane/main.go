@@ -23,7 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := httpapi.NewHandler()
+	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler.Routes(),

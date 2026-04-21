@@ -10,6 +10,7 @@ import (
 
 type Config struct {
 	Addr            string
+	CacheSize       int
 	ShutdownTimeout time.Duration
 }
 
@@ -26,8 +27,15 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid SHUTDOWN_TIMEOUT %q: %w", shutdownTimeoutRaw, err)
 	}
 
+	cacheSizeRaw := envOrDefault("CACHE_SIZE", "100")
+	cacheSize, err := strconv.Atoi(cacheSizeRaw)
+	if err != nil || cacheSize < 1 {
+		return Config{}, fmt.Errorf("invalid CACHE_SIZE %q", cacheSizeRaw)
+	}
+
 	return Config{
 		Addr:            net.JoinHostPort("", strconv.Itoa(portNumber)),
+		CacheSize:       cacheSize,
 		ShutdownTimeout: shutdownTimeout,
 	}, nil
 }
