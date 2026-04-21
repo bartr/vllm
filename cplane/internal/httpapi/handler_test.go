@@ -97,7 +97,7 @@ func TestAskCachesNormalizedQueries(t *testing.T) {
 	firstRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(firstRecorder, firstRequest)
 
-	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=%20%20what%20is%20%20%20the%20capital%20of%20texas?%20%20", nil)
+	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=%20%20what%20is%20%20%20the%20capital%20of%20texas!!!%20%20", nil)
 	secondRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(secondRecorder, secondRequest)
 
@@ -118,6 +118,27 @@ func TestAskCachesNormalizedQueries(t *testing.T) {
 	}
 }
 
+func TestStandardizeCacheKey(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "whitespace and punctuation", input: " What, is the capital of Texas?! ", want: "whatisthecapitaloftexas"},
+		{name: "numbers preserved", input: "Model 3.1 Turbo", want: "model31turbo"},
+		{name: "only punctuation", input: "?! ,.-", want: ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := standardizeCacheKey(test.input)
+			if got != test.want {
+				t.Fatalf("standardizeCacheKey(%q) = %q, want %q", test.input, got, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfigCacheSize(t *testing.T) {
 	t.Setenv("PORT", "8080")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
@@ -129,6 +150,35 @@ func TestLoadConfigCacheSize(t *testing.T) {
 	}
 	if cfg.CacheSize != 123 {
 		t.Fatalf("CacheSize = %d, want 123", cfg.CacheSize)
+	}
+}
+
+func TestLRUCacheLifecycleLogging(t *testing.T) {
+	var logBuffer bytes.Buffer
+	originalOutput := log.Writer()
+	log.SetOutput(&logBuffer)
+	defer log.SetOutput(originalOutput)
+
+	cache := newLRUCache(1)
+	cache.Add("firstkey", cachedVLLMResponse{statusCode: http.StatusOK, body: []byte(`{"ok":true}`)})
+	cache.Add("secondkey", cachedVLLMResponse{statusCode: http.StatusOK, body: []byte(`{"ok":true}`)})
+
+	logOutput := logBuffer.String()
+	for _, want := range []string{
+		"cache_insert size=1 capacity=1",
+		"cache_insert size=2 capacity=1",
+		"cache_delete size=1 capacity=1",
+		"reason=evict",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("log output %q does not contain %q", logOutput, want)
+		}
+	}
+
+	for _, unwanted := range []string{"firstkey", "secondkey"} {
+		if strings.Contains(logOutput, unwanted) {
+			t.Fatalf("log output %q unexpectedly contains %q", logOutput, unwanted)
+		}
 	}
 }
 

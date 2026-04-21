@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"unicode"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -120,7 +121,16 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 }
 
 func standardizeCacheKey(query string) string {
-	return strings.ToLower(strings.Join(strings.Fields(query), ""))
+	var builder strings.Builder
+	builder.Grow(len(query))
+
+	for _, char := range strings.ToLower(query) {
+		if unicode.IsLetter(char) || unicode.IsNumber(char) {
+			builder.WriteRune(char)
+		}
+	}
+
+	return builder.String()
 }
 
 type modelsResponse struct {
@@ -339,6 +349,7 @@ func (c *lruCache) Add(key string, value cachedVLLMResponse) {
 		},
 	})
 	c.entries[key] = element
+	log.Printf("cache_insert size=%d capacity=%d", c.items.Len(), c.capacity)
 
 	if c.items.Len() <= c.capacity {
 		return
@@ -352,4 +363,5 @@ func (c *lruCache) Add(key string, value cachedVLLMResponse) {
 	c.items.Remove(oldest)
 	entry := oldest.Value.(*cacheEntry)
 	delete(c.entries, entry.key)
+	log.Printf("cache_delete size=%d capacity=%d reason=evict", c.items.Len(), c.capacity)
 }
