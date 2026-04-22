@@ -17,7 +17,7 @@ func TestRunHelp(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exitCode = %d, want 0", exitCode)
 	}
-	for _, want := range []string{"Usage: cache [options]", "--models-cache-ttl", "--version", "-h, --help", `Default system prompt for /ask (default "You are a concise assistant.")`, "Default max tokens for /ask (default 500)", "Default temperature for /ask (default 0.2)"} {
+	for _, want := range []string{"Usage: cache [options]", "--models-cache-ttl", "--replay-delay", "--version", "-h, --help", `Default system prompt for /ask (default "You are a helpful assistant.")`, "Default max tokens for /ask (default 4000)", "Default temperature for /ask (default 0.2)"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output %q does not contain %q", stdout.String(), want)
 		}

@@ -42,6 +42,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetModelsCacheTTL(cfg.ModelsCacheTTL)
+	handler.SetReplayDelay(cfg.ReplayDelay)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler.Routes(),
@@ -57,6 +58,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"addr", cfg.Addr,
 			"cache_size", cfg.CacheSize,
 			"models_cache_ttl", cfg.ModelsCacheTTL,
+			"replay_delay", cfg.ReplayDelay,
 			"system_prompt", cfg.SystemPrompt,
 			"max_tokens", cfg.MaxTokens,
 			"temperature", cfg.Temperature,

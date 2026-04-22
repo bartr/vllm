@@ -50,6 +50,7 @@ type Handler struct {
 	ready      atomic.Bool
 	cache      *lruCache
 	defaults   askOptions
+	replayDelay time.Duration
 	vllmURL    string
 	httpClient *http.Client
 	sleep      func(time.Duration)
@@ -68,6 +69,7 @@ func NewHandler() *Handler {
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
 	handler.sleep = time.Sleep
 	handler.now = time.Now
+	handler.replayDelay = 0
 	handler.modelsCacheTTL = defaultModelsCacheTTL
 	return handler
 }
@@ -79,6 +81,13 @@ func (h *Handler) SetModelsCacheTTL(ttl time.Duration) {
 	h.modelsMu.Lock()
 	h.modelsCacheTTL = ttl
 	h.modelsMu.Unlock()
+}
+
+func (h *Handler) SetReplayDelay(delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+	h.replayDelay = delay
 }
 
 func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
@@ -150,14 +159,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	replayDelay, err := parseReplayDelay(r)
-	if err != nil {
-		markCacheHit(w, false)
-		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
-		return
-	}
-
-	requestPayload, err = h.populateChatCompletionDefaults(r.Context(), requestPayload)
+	requestPayload, err := h.populateChatCompletionDefaults(r.Context(), requestPayload)
 	if err != nil {
 		markCacheHit(w, false)
 		http.Error(w, fmt.Sprintf("prepare chat completion: %v", err), http.StatusBadGateway)
@@ -175,11 +177,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse, replayDelay)
+				h.replayCachedStream(r.Context(), w, cachedResponse, h.replayDelay)
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse, replayDelay)
+			h.replayCachedResponse(r.Context(), w, cachedResponse, h.replayDelay)
 			return
 		}
 	}
@@ -236,22 +238,15 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	replayDelay, err := parseReplayDelay(r)
-	if err != nil {
-		markCacheHit(w, false)
-		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
-		return
-	}
-
 	if h.cache != nil {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse, replayDelay)
+				h.replayCachedStream(r.Context(), w, cachedResponse, h.replayDelay)
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse, replayDelay)
+			h.replayCachedResponse(r.Context(), w, cachedResponse, h.replayDelay)
 			return
 		}
 	}
@@ -343,23 +338,6 @@ func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
 	}
 
 	return options, nil
-}
-
-func parseReplayDelay(r *http.Request) (time.Duration, error) {
-	replayDelayRaw := r.URL.Query().Get("replay-delay-ms")
-	if replayDelayRaw == "" {
-		return 0, nil
-	}
-
-	replayDelayMS, err := strconv.Atoi(replayDelayRaw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid replay-delay-ms %q", replayDelayRaw)
-	}
-	if replayDelayMS < 0 {
-		return 0, fmt.Errorf("replay-delay-ms must be non-negative")
-	}
-
-	return time.Duration(replayDelayMS) * time.Millisecond, nil
 }
 
 func buildCacheKey(query string, options askOptions) string {

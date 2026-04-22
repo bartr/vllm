@@ -289,12 +289,13 @@ func TestAskCachedStreamReplayDelay(t *testing.T) {
 	handler.sleep = func(delay time.Duration) {
 		delays = append(delays, delay)
 	}
+	handler.SetReplayDelay(5 * time.Millisecond)
 	routes := handler.Routes()
 
 	routes.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil))
 
 	secondRecorder := httptest.NewRecorder()
-	routes.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true&replay-delay-ms=5", nil))
+	routes.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil))
 
 	if secondRecorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusOK)
@@ -319,6 +320,7 @@ func TestAskCachedNonStreamReplayDelayUsesCompletionTokens(t *testing.T) {
 			t.Fatalf("delay = %s, want %s", delay, 15*time.Millisecond)
 		}
 	}
+	handler.SetReplayDelay(5 * time.Millisecond)
 
 	cacheKey := buildCacheKey("hello", askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
 	handler.cache.Add(cacheKey, cachedVLLMResponse{
@@ -328,7 +330,7 @@ func TestAskCachedNonStreamReplayDelayUsesCompletionTokens(t *testing.T) {
 	})
 
 	recorder := httptest.NewRecorder()
-	handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello&replay-delay-ms=5", nil))
+	handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -447,39 +449,6 @@ func TestParseAskOptions(t *testing.T) {
 	}
 }
 
-func TestParseReplayDelay(t *testing.T) {
-	tests := []struct {
-		name    string
-		path    string
-		want    time.Duration
-		wantErr string
-	}{
-		{name: "missing", path: "/ask?q=hello", want: 0},
-		{name: "valid", path: "/ask?q=hello&replay-delay-ms=5", want: 5 * time.Millisecond},
-		{name: "negative", path: "/ask?q=hello&replay-delay-ms=-1", wantErr: "replay-delay-ms must be non-negative"},
-		{name: "invalid", path: "/ask?q=hello&replay-delay-ms=nope", wantErr: "invalid replay-delay-ms \"nope\""},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, test.path, nil)
-			got, err := parseReplayDelay(req)
-			if test.wantErr != "" {
-				if err == nil || err.Error() != test.wantErr {
-					t.Fatalf("parseReplayDelay() error = %v, want %q", err, test.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseReplayDelay() error = %v", err)
-			}
-			if got != test.want {
-				t.Fatalf("parseReplayDelay() = %s, want %s", got, test.want)
-			}
-		})
-	}
-}
-
 func TestAskUsesDefaultVLLMOptions(t *testing.T) {
 	vllmServer, captured := newCapturingTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
@@ -590,6 +559,42 @@ func TestLoadConfigModelsCacheTTLFlagPrecedence(t *testing.T) {
 	}
 }
 
+func TestLoadConfigReplayDelay(t *testing.T) {
+	originalArgs := os.Args
+	defer func() { os.Args = originalArgs }()
+	os.Args = []string{"cache"}
+
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_REPLAY_DELAY", "25ms")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	if cfg.ReplayDelay != 25*time.Millisecond {
+		t.Fatalf("ReplayDelay = %s, want %s", cfg.ReplayDelay, 25*time.Millisecond)
+	}
+}
+
+func TestLoadConfigReplayDelayFlagPrecedence(t *testing.T) {
+	originalArgs := os.Args
+	defer func() { os.Args = originalArgs }()
+	os.Args = []string{"cache", "--replay-delay", "15ms"}
+
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_REPLAY_DELAY", "25ms")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	if cfg.ReplayDelay != 15*time.Millisecond {
+		t.Fatalf("ReplayDelay = %s, want %s", cfg.ReplayDelay, 15*time.Millisecond)
+	}
+}
+
 func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
@@ -682,6 +687,41 @@ func TestLoadConfigInvalidModelsCacheTTL(t *testing.T) {
 			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 			if test.env != "" {
 				t.Setenv("CACHE_MODELS_CACHE_TTL", test.env)
+			}
+
+			_, err := config.Load()
+			if err == nil {
+				t.Fatalf("config.Load() error = nil, want %q", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("config.Load() error = %q, want substring %q", err.Error(), test.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadConfigInvalidReplayDelay(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		env     string
+		wantErr string
+	}{
+		{name: "invalid flag", args: []string{"cache", "--replay-delay", "nope"}, wantErr: "invalid runtime flag"},
+		{name: "invalid env", args: []string{"cache"}, env: "nope", wantErr: "invalid CACHE_REPLAY_DELAY \"nope\""},
+		{name: "negative env", args: []string{"cache"}, env: "-1s", wantErr: "CACHE_REPLAY_DELAY must be non-negative"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			originalArgs := os.Args
+			defer func() { os.Args = originalArgs }()
+			os.Args = test.args
+
+			t.Setenv("CACHE_PORT", "8080")
+			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
+			if test.env != "" {
+				t.Setenv("CACHE_REPLAY_DELAY", test.env)
 			}
 
 			_, err := config.Load()
@@ -798,9 +838,9 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 		wantErr string
 	}{
 		{name: "invalid env max tokens", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
-		{name: "env max tokens out of range", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 10000"},
+		{name: "env max tokens out of range", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
 		{name: "invalid env temperature", args: []string{"cache"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
-		{name: "flag max tokens out of range", args: []string{"cache", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 10000"},
+		{name: "flag max tokens out of range", args: []string{"cache", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
 		{name: "invalid flag temperature", args: []string{"cache", "--temperature", "nope"}, wantErr: "invalid runtime flag"},
 	}
 
