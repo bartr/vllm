@@ -30,7 +30,7 @@ func TestRoutes(t *testing.T) {
 	}{
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, body: "{\"downstream_url\":\"" + vllmServer.URL + "\",\"downstream_model\":\"\",\"system_prompt\":\"You are a detailed assistant.\",\"max_tokens\":2500,\"temperature\":0.2,\"stream\":false,\"replay_delay\":\"0s\",\"models_cache_ttl\":\"1h0m0s\"}\n"},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, body: "{\"downstream_url\":\"" + vllmServer.URL + "\",\"downstream_model\":\"\",\"system_prompt\":\"You are a detailed assistant.\",\"max_tokens\":2500,\"temperature\":0.2,\"stream\":false,\"models_cache_ttl\":\"1h0m0s\"}\n"},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
 		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
@@ -329,68 +329,6 @@ func TestAskStreamsAndReplaysCachedStreamWithFreshMetadata(t *testing.T) {
 	}
 }
 
-func TestAskCachedStreamReplayDelay(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-
-	var delays []time.Duration
-	handler.sleep = func(delay time.Duration) {
-		delays = append(delays, delay)
-	}
-	handler.SetReplayDelay(5 * time.Millisecond)
-	routes := handler.Routes()
-
-	routes.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil))
-
-	secondRecorder := httptest.NewRecorder()
-	routes.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil))
-
-	if secondRecorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusOK)
-	}
-	if got := counters.chat.Load(); got != 1 {
-		t.Fatalf("chat requests = %d, want 1", got)
-	}
-	if len(delays) == 0 {
-		t.Fatal("expected replay delay hook to be invoked for cached stream")
-	}
-	for _, delay := range delays {
-		if delay != 5*time.Millisecond {
-			t.Fatalf("delay = %s, want %s", delay, 5*time.Millisecond)
-		}
-	}
-}
-
-func TestAskCachedNonStreamReplayDelayUsesCompletionTokens(t *testing.T) {
-	handler := NewHandler()
-	handler.sleep = func(delay time.Duration) {
-		if delay != 15*time.Millisecond {
-			t.Fatalf("delay = %s, want %s", delay, 15*time.Millisecond)
-		}
-	}
-	handler.SetReplayDelay(5 * time.Millisecond)
-
-	cacheKey := buildCacheKey("hello", askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.cache.Add(cacheKey, cachedVLLMResponse{
-		statusCode:  http.StatusOK,
-		contentType: "application/json",
-		body:        []byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`),
-	})
-
-	recorder := httptest.NewRecorder()
-	handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
-	}
-	if !strings.Contains(recorder.Body.String(), `"cache":true`) {
-		t.Fatalf("cached response body %q does not contain cache=true", recorder.Body.String())
-	}
-	if recorder.Body.String() == "" {
-		t.Fatal("expected cached response body")
-	}
-}
-
 func TestAskDoesNotReuseCacheAcrossStreamMode(t *testing.T) {
 	vllmServer, counters := newCountingTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
@@ -561,7 +499,7 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 
 	configRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?downstream-url="+url.QueryEscape(vllmServer.URL)+"&downstream-model=gpt-4.1&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&replay-delay=5ms&models-cache-ttl=30m", nil))
+	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?downstream-url="+url.QueryEscape(vllmServer.URL)+"&downstream-model=gpt-4.1&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&models-cache-ttl=30m", nil))
 
 	if configRecorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", configRecorder.Code, http.StatusOK)
@@ -588,9 +526,6 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	}
 	if !got.Stream {
 		t.Fatal("stream = false, want true")
-	}
-	if got.ReplayDelay != "5ms" {
-		t.Fatalf("replay delay = %q, want %q", got.ReplayDelay, "5ms")
 	}
 	if got.ModelsCacheTTL != "30m0s" {
 		t.Fatalf("models cache ttl = %q, want %q", got.ModelsCacheTTL, "30m0s")
@@ -627,7 +562,7 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&replay_delay=100ms&models_cache_ttl=30m", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&models_cache_ttl=30m", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -649,9 +584,6 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
 	}
-	if got.ReplayDelay != "100ms" {
-		t.Fatalf("replay delay = %q, want %q", got.ReplayDelay, "100ms")
-	}
 	if got.ModelsCacheTTL != "30m0s" {
 		t.Fatalf("models cache ttl = %q, want %q", got.ModelsCacheTTL, "30m0s")
 	}
@@ -660,13 +592,13 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 func TestConfigEndpointRejectsInvalidValues(t *testing.T) {
 	handler := NewHandler().Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?replay-delay=nope", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?models-cache-ttl=nope", nil))
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
-	if !strings.Contains(recorder.Body.String(), `invalid replay-delay "nope"`) {
-		t.Fatalf("body = %q, want invalid replay-delay error", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), `invalid models-cache-ttl "nope"`) {
+		t.Fatalf("body = %q, want invalid models-cache-ttl error", recorder.Body.String())
 	}
 }
 
@@ -721,42 +653,6 @@ func TestLoadConfigModelsCacheTTLFlagPrecedence(t *testing.T) {
 	}
 	if cfg.ModelsCacheTTL != 15*time.Minute {
 		t.Fatalf("ModelsCacheTTL = %s, want %s", cfg.ModelsCacheTTL, 15*time.Minute)
-	}
-}
-
-func TestLoadConfigReplayDelay(t *testing.T) {
-	originalArgs := os.Args
-	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm"}
-
-	t.Setenv("CACHE_PORT", "8080")
-	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CACHE_REPLAY_DELAY", "25ms")
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("config.Load() error = %v", err)
-	}
-	if cfg.ReplayDelay != 25*time.Millisecond {
-		t.Fatalf("ReplayDelay = %s, want %s", cfg.ReplayDelay, 25*time.Millisecond)
-	}
-}
-
-func TestLoadConfigReplayDelayFlagPrecedence(t *testing.T) {
-	originalArgs := os.Args
-	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--replay-delay", "15ms"}
-
-	t.Setenv("CACHE_PORT", "8080")
-	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CACHE_REPLAY_DELAY", "25ms")
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("config.Load() error = %v", err)
-	}
-	if cfg.ReplayDelay != 15*time.Millisecond {
-		t.Fatalf("ReplayDelay = %s, want %s", cfg.ReplayDelay, 15*time.Millisecond)
 	}
 }
 
@@ -852,41 +748,6 @@ func TestLoadConfigInvalidModelsCacheTTL(t *testing.T) {
 			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 			if test.env != "" {
 				t.Setenv("CACHE_MODELS_CACHE_TTL", test.env)
-			}
-
-			_, err := config.Load()
-			if err == nil {
-				t.Fatalf("config.Load() error = nil, want %q", test.wantErr)
-			}
-			if !strings.Contains(err.Error(), test.wantErr) {
-				t.Fatalf("config.Load() error = %q, want substring %q", err.Error(), test.wantErr)
-			}
-		})
-	}
-}
-
-func TestLoadConfigInvalidReplayDelay(t *testing.T) {
-	tests := []struct {
-		name    string
-		args    []string
-		env     string
-		wantErr string
-	}{
-		{name: "invalid flag", args: []string{"cllm", "--replay-delay", "nope"}, wantErr: "invalid runtime flag"},
-		{name: "invalid env", args: []string{"cllm"}, env: "nope", wantErr: "invalid CACHE_REPLAY_DELAY \"nope\""},
-		{name: "negative env", args: []string{"cllm"}, env: "-1s", wantErr: "CACHE_REPLAY_DELAY must be non-negative"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			originalArgs := os.Args
-			defer func() { os.Args = originalArgs }()
-			os.Args = test.args
-
-			t.Setenv("CACHE_PORT", "8080")
-			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
-			if test.env != "" {
-				t.Setenv("CACHE_REPLAY_DELAY", test.env)
 			}
 
 			_, err := config.Load()

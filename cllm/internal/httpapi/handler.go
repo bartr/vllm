@@ -56,12 +56,10 @@ type Handler struct {
 	cache      *lruCache
 	configMu   sync.RWMutex
 	defaults   askOptions
-	replayDelay time.Duration
 	vllmURL    string
 	downstreamToken string
 	downstreamModel string
 	httpClient *http.Client
-	sleep      func(time.Duration)
 	now        func() time.Time
 	modelsMu   sync.RWMutex
 	modelsCache *cachedModelsResponse
@@ -75,9 +73,7 @@ func NewHandler() *Handler {
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
-	handler.sleep = time.Sleep
 	handler.now = time.Now
-	handler.replayDelay = 0
 	handler.modelsCacheTTL = defaultModelsCacheTTL
 	return handler
 }
@@ -89,13 +85,6 @@ func (h *Handler) SetModelsCacheTTL(ttl time.Duration) {
 	h.modelsMu.Lock()
 	h.modelsCacheTTL = ttl
 	h.modelsMu.Unlock()
-}
-
-func (h *Handler) SetReplayDelay(delay time.Duration) {
-	if delay < 0 {
-		delay = 0
-	}
-	h.replayDelay = delay
 }
 
 func (h *Handler) SetDownstreamToken(token string) {
@@ -164,7 +153,6 @@ type runtimeConfig struct {
 	MaxTokens      int     `json:"max_tokens"`
 	Temperature    float64 `json:"temperature"`
 	Stream         bool    `json:"stream"`
-	ReplayDelay    string  `json:"replay_delay"`
 	ModelsCacheTTL string  `json:"models_cache_ttl"`
 }
 
@@ -236,11 +224,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse, h.getReplayDelay())
+				h.replayCachedStream(w, cachedResponse)
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse, h.getReplayDelay())
+			h.replayCachedResponse(w, cachedResponse)
 			return
 		}
 	}
@@ -301,11 +289,11 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse, h.getReplayDelay())
+				h.replayCachedStream(w, cachedResponse)
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse, h.getReplayDelay())
+			h.replayCachedResponse(w, cachedResponse)
 			return
 		}
 	}
@@ -405,15 +393,8 @@ func (h *Handler) getDefaults() askOptions {
 	return h.defaults
 }
 
-func (h *Handler) getReplayDelay() time.Duration {
-	h.configMu.RLock()
-	defer h.configMu.RUnlock()
-	return h.replayDelay
-}
-
 func (h *Handler) currentConfig() runtimeConfig {
 	defaults := h.getDefaults()
-	replayDelay := h.getReplayDelay()
 
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
@@ -428,7 +409,6 @@ func (h *Handler) currentConfig() runtimeConfig {
 		MaxTokens:      defaults.maxTokens,
 		Temperature:    defaults.temperature,
 		Stream:         defaults.stream,
-		ReplayDelay:    replayDelay.String(),
 		ModelsCacheTTL: modelsCacheTTL.String(),
 	}
 }
@@ -472,18 +452,6 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 		defaults.stream = stream
 	}
 
-	replayDelay := h.getReplayDelay()
-	if replayDelayRaw := configQueryValue(queryValues, "replay-delay", "replay_delay"); replayDelayRaw != "" {
-		parsed, err := time.ParseDuration(replayDelayRaw)
-		if err != nil {
-			return false, fmt.Errorf("invalid replay-delay %q: %w", replayDelayRaw, err)
-		}
-		if parsed < 0 {
-			return false, fmt.Errorf("replay-delay must be non-negative")
-		}
-		replayDelay = parsed
-	}
-
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
 	downstreamModel := h.downstreamModel
@@ -508,7 +476,6 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 
 	h.configMu.Lock()
 	h.defaults = defaults
-	h.replayDelay = replayDelay
 	h.configMu.Unlock()
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamModel(downstreamModel)
@@ -801,7 +768,7 @@ func buildChatCompletionCacheKey(requestPayload chatCompletionRequest) (string, 
 	return string(requestBody), nil
 }
 
-func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, replayDelay time.Duration) {
+func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
 	w.Header().Set("Content-Type", contentTypeOrDefault(cachedResponse.contentType, "text/event-stream"))
 	w.WriteHeader(cachedResponse.statusCode)
 
@@ -809,22 +776,15 @@ func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter,
 	reader := bytes.NewReader(cachedResponse.body)
 	streamID := newChatCompletionID()
 	createdAt := time.Now().UnixMilli()
-	firstLine := true
 
 	for {
 		line, err := readSSELine(reader)
 		if len(line) > 0 {
-			if !firstLine && replayDelay > 0 {
-				if !sleepWithContext(ctx, replayDelay, h.sleep) {
-					return
-				}
-			}
 			rewritten := rewriteSSEDataLine(line, true, streamID, createdAt)
 			_, _ = w.Write(rewritten)
 			if flusher != nil {
 				flusher.Flush()
 			}
-			firstLine = false
 		}
 
 		if err == nil {
@@ -834,53 +794,12 @@ func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 		return
-	}
-}
-
-func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, replayDelay time.Duration) {
-	completionTokens := cachedCompletionTokens(cachedResponse.body)
-	if completionTokens > 0 && replayDelay > 0 {
-		totalDelay := replayDelay * time.Duration(completionTokens)
-		if !sleepWithContext(ctx, totalDelay, h.sleep) {
-			return
+func (h *Handler) replayCachedResponse(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
 		}
 	}
 
 	body := rewriteJSONCacheField(cachedResponse.body, true)
 	w.Header().Set("Content-Type", cachedResponse.contentType)
-	w.WriteHeader(cachedResponse.statusCode)
-	_, _ = w.Write(body)
-}
-
-func cachedCompletionTokens(body []byte) int {
-	var response struct {
-		Usage struct {
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
-	}
-
-	if err := json.Unmarshal(body, &response); err != nil {
-		return 0
-	}
-	if response.Usage.CompletionTokens < 0 {
-		return 0
-	}
-	return response.Usage.CompletionTokens
-}
-
-func sleepWithContext(ctx context.Context, delay time.Duration, sleepFn func(time.Duration)) bool {
-	if delay <= 0 {
-		return true
-	}
-	if err := ctx.Err(); err != nil {
-		return false
-	}
-	if sleepFn == nil {
-		time.Sleep(delay)
-		return ctx.Err() == nil
-	}
-	sleepFn(delay)
-	return ctx.Err() == nil
 }
 
 func readSSELine(reader io.Reader) ([]byte, error) {

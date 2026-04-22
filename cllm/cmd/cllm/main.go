@@ -44,7 +44,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
 	handler.SetModelsCacheTTL(cfg.ModelsCacheTTL)
-	handler.SetReplayDelay(cfg.ReplayDelay)
 	server := newServer(cfg, handler.Routes())
 
 	serverErrCh := make(chan error, 1)
@@ -56,7 +55,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"downstream_url", cfg.DownstreamURL,
 			"downstream_model", cfg.DownstreamModel,
 			"models_cache_ttl", cfg.ModelsCacheTTL,
-			"replay_delay", cfg.ReplayDelay,
 			"system_prompt", cfg.SystemPrompt,
 			"max_tokens", cfg.MaxTokens,
 			"temperature", cfg.Temperature,
