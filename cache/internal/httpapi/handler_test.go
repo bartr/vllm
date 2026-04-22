@@ -541,8 +541,8 @@ func TestLoadConfigCacheSize(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_CACHE_SIZE", "123")
 
 	cfg, err := config.Load()
@@ -559,8 +559,8 @@ func TestLoadConfigModelsCacheTTL(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_MODELS_CACHE_TTL", "30m")
 
 	cfg, err := config.Load()
@@ -577,8 +577,8 @@ func TestLoadConfigModelsCacheTTLFlagPrecedence(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache", "--models-cache-ttl", "15m"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_MODELS_CACHE_TTL", "30m")
 
 	cfg, err := config.Load()
@@ -595,8 +595,8 @@ func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache", "--cache-size", "7"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_CACHE_SIZE", "123")
 
 	cfg, err := config.Load()
@@ -613,8 +613,8 @@ func TestLoadConfigShortCacheSizeFlag(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache", "-c", "0"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_CACHE_SIZE", "123")
 
 	cfg, err := config.Load()
@@ -645,8 +645,8 @@ func TestLoadConfigInvalidCacheSize(t *testing.T) {
 			defer func() { os.Args = originalArgs }()
 			os.Args = test.args
 
-			t.Setenv("PORT", "8080")
-			t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+			t.Setenv("CACHE_PORT", "8080")
+			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 			t.Setenv("CACHE_CACHE_SIZE", test.env)
 
 			_, err := config.Load()
@@ -678,8 +678,8 @@ func TestLoadConfigInvalidModelsCacheTTL(t *testing.T) {
 			defer func() { os.Args = originalArgs }()
 			os.Args = test.args
 
-			t.Setenv("PORT", "8080")
-			t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+			t.Setenv("CACHE_PORT", "8080")
+			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 			if test.env != "" {
 				t.Setenv("CACHE_MODELS_CACHE_TTL", test.env)
 			}
@@ -742,8 +742,8 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
@@ -768,8 +768,8 @@ func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	defer func() { os.Args = originalArgs }()
 	os.Args = []string{"cache", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
 
-	t.Setenv("PORT", "8080")
-	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("CACHE_PORT", "8080")
+	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
@@ -810,8 +810,8 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 			defer func() { os.Args = originalArgs }()
 			os.Args = test.args
 
-			t.Setenv("PORT", "8080")
-			t.Setenv("SHUTDOWN_TIMEOUT", "10s")
+			t.Setenv("CACHE_PORT", "8080")
+			t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 			if test.envKey != "" {
 				t.Setenv(test.envKey, test.envVal)
 			}

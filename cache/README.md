@@ -17,7 +17,7 @@ go run ./cmd/cache
 Or with an explicit port:
 
 ```bash
-PORT=8081 go run ./cmd/cache
+CACHE_PORT=8081 go run ./cmd/cache
 ```
 
 Show help or version:
@@ -42,7 +42,7 @@ The server supports these runtime settings:
 Example:
 
 ```bash
-CACHE_MODELS_CACHE_TTL=30m go run ./cmd/cache --cache-size 200 --models-cache-ttl 15m
+CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_MODELS_CACHE_TTL=30m go run ./cmd/cache --cache-size 200 --models-cache-ttl 15m
 ```
 
 ## Build

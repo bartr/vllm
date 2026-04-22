@@ -41,16 +41,16 @@ func LoadFromArgs(args []string) (Config, error) {
 		return Config{}, err
 	}
 
-	port := envOrDefault("PORT", "8080")
+	port := envOrDefault("CACHE_PORT", "8080")
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return Config{}, fmt.Errorf("invalid PORT %q", port)
+		return Config{}, fmt.Errorf("invalid CACHE_PORT %q", port)
 	}
 
-	shutdownTimeoutRaw := envOrDefault("SHUTDOWN_TIMEOUT", "10s")
+	shutdownTimeoutRaw := envOrDefault("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	shutdownTimeout, err := time.ParseDuration(shutdownTimeoutRaw)
 	if err != nil {
-		return Config{}, fmt.Errorf("invalid SHUTDOWN_TIMEOUT %q: %w", shutdownTimeoutRaw, err)
+		return Config{}, fmt.Errorf("invalid CACHE_SHUTDOWN_TIMEOUT %q: %w", shutdownTimeoutRaw, err)
 	}
 
 	return Config{
@@ -76,8 +76,8 @@ func Usage() string {
 	builder.WriteString("      --max-tokens int        Default max tokens for /ask\n")
 	builder.WriteString("      --temperature float     Default temperature for /ask\n\n")
 	builder.WriteString("Environment:\n")
-	builder.WriteString("  PORT\n")
-	builder.WriteString("  SHUTDOWN_TIMEOUT\n")
+	builder.WriteString("  CACHE_PORT\n")
+	builder.WriteString("  CACHE_SHUTDOWN_TIMEOUT\n")
 	builder.WriteString("  CACHE_CACHE_SIZE\n")
 	builder.WriteString("  CACHE_MODELS_CACHE_TTL\n")
 	builder.WriteString("  CACHE_SYSTEM_PROMPT\n")
