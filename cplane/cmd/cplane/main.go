@@ -16,6 +16,7 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -23,7 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize)
+	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler.Routes(),
@@ -34,7 +35,7 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		logger.Info("server starting", "addr", cfg.Addr)
+		logger.Info("server starting", "addr", cfg.Addr, "cache_size", cfg.CacheSize, "max_tokens", cfg.MaxTokens, "temperature", cfg.Temperature)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrCh <- err

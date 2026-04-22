@@ -7,8 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"unicode"
 	"strings"
 	"sync"
@@ -20,14 +21,31 @@ const (
 	defaultVLLMURL          = "http://127.0.0.1:32080"
 	defaultCacheSize        = 100
 	defaultSystemPrompt     = "You are a concise assistant."
+	minMaxTokens            = 100
+	maxMaxTokens            = 10000
 	defaultMaxTokens        = 500
 	defaultTemperature      = 0.2
 	defaultVLLMHTTPTimeout  = 30 * time.Second
 )
 
+type askOptions struct {
+	systemPrompt string
+	maxTokens    int
+	temperature  float64
+}
+
+func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askOptions {
+	return askOptions{
+		systemPrompt: systemPrompt,
+		maxTokens:    maxTokens,
+		temperature:  temperature,
+	}
+}
+
 type Handler struct {
 	ready      atomic.Bool
 	cache      *lruCache
+	defaults   askOptions
 	vllmURL    string
 	httpClient *http.Client
 }
@@ -36,12 +54,13 @@ func NewHandler() *Handler {
 	handler := &Handler{}
 	handler.ready.Store(true)
 	handler.cache = newLRUCache(defaultCacheSize)
+	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = defaultVLLMURL
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
 	return handler
 }
 
-func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int) *Handler {
+func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
 	handler := NewHandler()
 	if vllmURL != "" {
 		handler.vllmURL = vllmURL
@@ -49,8 +68,14 @@ func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSi
 	if httpClient != nil {
 		handler.httpClient = httpClient
 	}
+	if cacheSize == 0 {
+		handler.cache = nil
+	}
 	if cacheSize > 0 {
 		handler.cache = newLRUCache(cacheSize)
+	}
+	if defaults.systemPrompt != "" {
+		handler.defaults = defaults
 	}
 	return handler
 }
@@ -84,19 +109,28 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheKey := standardizeCacheKey(query)
+	options, err := parseAskOptions(r, h.defaults)
+	if err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
+		return
+	}
+
+	cacheKey := buildCacheKey(query, options)
 	if cacheKey == "" {
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusBadRequest, "missing q\n")
 		return
 	}
 
-	if cachedResponse, ok := h.cache.Get(cacheKey); ok {
-		markCacheHit(w, true)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(cachedResponse.statusCode)
-		_, _ = w.Write(cachedResponse.body)
-		return
+	if h.cache != nil {
+		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
+			markCacheHit(w, true)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(cachedResponse.statusCode)
+			_, _ = w.Write(cachedResponse.body)
+			return
+		}
 	}
 
 	markCacheHit(w, false)
@@ -107,17 +141,59 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseBody, statusCode, err := h.createChatCompletion(r.Context(), model, query)
+	responseBody, statusCode, err := h.createChatCompletion(r.Context(), model, query, options)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody})
+	if h.cache != nil {
+		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(responseBody)
+}
+
+func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
+	options := defaults
+
+	queryValues := r.URL.Query()
+
+	if systemPrompt := queryValues.Get("system-prompt"); systemPrompt != "" {
+		options.systemPrompt = systemPrompt
+	}
+
+	if maxTokensRaw := queryValues.Get("max-tokens"); maxTokensRaw != "" {
+		maxTokens, err := strconv.Atoi(maxTokensRaw)
+		if err != nil {
+			return askOptions{}, fmt.Errorf("invalid max-tokens %q", maxTokensRaw)
+		}
+		if maxTokens < minMaxTokens || maxTokens > maxMaxTokens {
+			return askOptions{}, fmt.Errorf("max-tokens must be between %d and %d", minMaxTokens, maxMaxTokens)
+		}
+		options.maxTokens = maxTokens
+	}
+
+	if temperatureRaw := queryValues.Get("temperature"); temperatureRaw != "" {
+		temperature, err := strconv.ParseFloat(temperatureRaw, 64)
+		if err != nil {
+			return askOptions{}, fmt.Errorf("invalid temperature %q", temperatureRaw)
+		}
+		options.temperature = temperature
+	}
+
+	return options, nil
+}
+
+func buildCacheKey(query string, options askOptions) string {
+	queryKey := standardizeCacheKey(query)
+	if queryKey == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("%s|%s|%d|%.6f", queryKey, standardizeCacheKey(options.systemPrompt), options.maxTokens, options.temperature)
 }
 
 func standardizeCacheKey(query string) string {
@@ -179,15 +255,15 @@ func (h *Handler) fetchModel(ctx context.Context) (string, error) {
 	return models.Data[0].ID, nil
 }
 
-func (h *Handler) createChatCompletion(ctx context.Context, model, query string) ([]byte, int, error) {
+func (h *Handler) createChatCompletion(ctx context.Context, model, query string, options askOptions) ([]byte, int, error) {
 	requestPayload := chatCompletionRequest{
 		Model: model,
 		Messages: []chatCompletionMessage{
-			{Role: "system", Content: defaultSystemPrompt},
+			{Role: "system", Content: options.systemPrompt},
 			{Role: "user", Content: query},
 		},
-		Temperature: defaultTemperature,
-		MaxTokens:   defaultMaxTokens,
+		Temperature: options.temperature,
+		MaxTokens:   options.maxTokens,
 	}
 
 	requestBody, err := json.Marshal(requestPayload)
@@ -272,15 +348,25 @@ func requestLogger(next http.Handler) http.Handler {
 			statusCode = http.StatusOK
 		}
 
-		log.Printf(
-			"method=%s path=%s status=%d bytes=%d cache=%t duration_ms=%.2f",
-			r.Method,
-			r.URL.RequestURI(),
-			statusCode,
-			responseWriter.bytes,
-			responseWriter.cacheHit,
-			float64(time.Since(startedAt))/float64(time.Millisecond),
-		)
+		attrs := []any{
+			"method", r.Method,
+			"path", r.URL.RequestURI(),
+			"status", statusCode,
+			"bytes", responseWriter.bytes,
+			"cache", responseWriter.cacheHit,
+			"duration_ms", float64(time.Since(startedAt))/float64(time.Millisecond),
+		}
+
+		switch {
+		case statusCode == http.StatusNotFound:
+			slog.Warn("not found", attrs...)
+		case statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError:
+			slog.Warn("client error", attrs...)
+		case statusCode >= http.StatusInternalServerError:
+			slog.Error("server error", attrs...)
+		default:
+			slog.Info("request completed", attrs...)
+		}
 	})
 }
 
@@ -349,19 +435,16 @@ func (c *lruCache) Add(key string, value cachedVLLMResponse) {
 		},
 	})
 	c.entries[key] = element
-	log.Printf("cache_insert size=%d capacity=%d", c.items.Len(), c.capacity)
 
-	if c.items.Len() <= c.capacity {
-		return
+	if c.items.Len() > c.capacity {
+		oldest := c.items.Back()
+		if oldest != nil {
+			c.items.Remove(oldest)
+			entry := oldest.Value.(*cacheEntry)
+			delete(c.entries, entry.key)
+			slog.Info("cache evict", "size", c.items.Len(), "capacity", c.capacity)
+		}
 	}
 
-	oldest := c.items.Back()
-	if oldest == nil {
-		return
-	}
-
-	c.items.Remove(oldest)
-	entry := oldest.Value.(*cacheEntry)
-	delete(c.entries, entry.key)
-	log.Printf("cache_delete size=%d capacity=%d reason=evict", c.items.Len(), c.capacity)
+	slog.Info("cache insert", "size", c.items.Len(), "capacity", c.capacity)
 }
