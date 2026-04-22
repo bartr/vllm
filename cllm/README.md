@@ -54,10 +54,12 @@ For a local vLLM source, omit the downstream token and model settings and keep t
 You can inspect or update the live handler config at runtime:
 
 ```bash
-curl 'http://127.0.0.1:8080/config?system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&models-cache-ttl=30m'
+curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&models-cache-ttl=30m'
 ```
 
 `/config` now also returns `downstream_url` and `downstream_model`, and you can update them live with either hyphenated or snake_case query params.
+
+It also returns `cache_size` and `cache_entries`. You can resize the cache live with `cache-size` or `cache_size`; if the new size is smaller than the current number of entries, the least recently used entries are evicted immediately.
 
 Example switching the downstream source to OpenAI-compatible settings at runtime:
 
@@ -69,6 +71,12 @@ Equivalent snake_case form:
 
 ```bash
 curl 'http://127.0.0.1:8080/config?downstream_url=https%3A%2F%2Fapi.openai.com&downstream_model=gpt-4.1'
+```
+
+Example shrinking the cache to a single entry at runtime:
+
+```bash
+curl 'http://127.0.0.1:8080/config?cache-size=1'
 ```
 
 The downstream token is intentionally not returned by `/config`.

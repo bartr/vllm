@@ -108,6 +108,26 @@ func (h *Handler) SetDownstreamModel(model string) {
 	h.modelsMu.Unlock()
 }
 
+func (h *Handler) SetCacheSize(size int) {
+	if size < 0 {
+		return
+	}
+	if size == 0 {
+		h.configMu.Lock()
+		h.cache = nil
+		h.configMu.Unlock()
+		return
+	}
+
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if h.cache == nil {
+		h.cache = newLRUCache(size)
+		return
+	}
+	h.cache.Resize(size)
+}
+
 func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
 	handler := NewHandler()
 	if vllmURL != "" {
@@ -147,6 +167,8 @@ func (h *Handler) Routes() http.Handler {
 }
 
 type runtimeConfig struct {
+	CacheSize       int     `json:"cache_size"`
+	CacheEntries    int     `json:"cache_entries"`
 	DownstreamURL string  `json:"downstream_url"`
 	DownstreamModel string `json:"downstream_model"`
 	SystemPrompt   string  `json:"system_prompt"`
@@ -393,8 +415,19 @@ func (h *Handler) getDefaults() askOptions {
 	return h.defaults
 }
 
+func (h *Handler) cacheStats() (int, int) {
+	h.configMu.RLock()
+	cache := h.cache
+	h.configMu.RUnlock()
+	if cache == nil {
+		return 0, 0
+	}
+	return cache.Stats()
+}
+
 func (h *Handler) currentConfig() runtimeConfig {
 	defaults := h.getDefaults()
+	cacheSize, cacheEntries := h.cacheStats()
 
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
@@ -403,6 +436,8 @@ func (h *Handler) currentConfig() runtimeConfig {
 	h.modelsMu.RUnlock()
 
 	return runtimeConfig{
+		CacheSize: cacheSize,
+		CacheEntries: cacheEntries,
 		DownstreamURL: downstreamURL,
 		DownstreamModel: downstreamModel,
 		SystemPrompt:   defaults.systemPrompt,
@@ -452,6 +487,18 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 		defaults.stream = stream
 	}
 
+	cacheSize, _ := h.cacheStats()
+	if cacheSizeRaw := configQueryValue(queryValues, "cache-size", "cache_size"); cacheSizeRaw != "" {
+		parsed, err := strconv.Atoi(cacheSizeRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid cache-size %q", cacheSizeRaw)
+		}
+		if parsed < 0 {
+			return false, fmt.Errorf("cache-size must be non-negative")
+		}
+		cacheSize = parsed
+	}
+
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
 	downstreamModel := h.downstreamModel
@@ -477,6 +524,7 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.configMu.Lock()
 	h.defaults = defaults
 	h.configMu.Unlock()
+	h.SetCacheSize(cacheSize)
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamModel(downstreamModel)
 	h.SetModelsCacheTTL(modelsCacheTTL)
@@ -1087,4 +1135,29 @@ func (c *lruCache) Add(key string, value cachedVLLMResponse) {
 	}
 
 	slog.Info("cache insert", "size", c.items.Len(), "capacity", c.capacity)
+}
+
+func (c *lruCache) Resize(capacity int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if capacity < 1 {
+		capacity = 1
+	}
+	c.capacity = capacity
+	for c.items.Len() > c.capacity {
+		oldest := c.items.Back()
+		if oldest == nil {
+			break
+		}
+		c.items.Remove(oldest)
+		entry := oldest.Value.(*cacheEntry)
+		delete(c.entries, entry.key)
+		slog.Info("cache evict", "size", c.items.Len(), "capacity", c.capacity)
+	}
+}
+
+func (c *lruCache) Stats() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.capacity, c.items.Len()
 }
