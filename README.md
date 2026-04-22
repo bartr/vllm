@@ -174,7 +174,7 @@ http -a admin:change-me http://vllm.local/health
 http -a admin:change-me http://vllm.local/v1/models
 ```
 
-These `http` examples are for interactive API checks. The helper script below uses `curl` and supports ingress basic auth with `VLLM_AUTH`.
+These `http` examples are for interactive API checks. The helper script below uses `curl` and can call the local `cllm` cache service or another compatible endpoint.
 
 Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 
@@ -184,23 +184,46 @@ Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 ./ask.sh
 ```
 
-If `VLLM_AUTH` is not already set, `ask.sh` prompts for the ingress username and password interactively.
+By default, `ask.sh` targets `http://localhost:8080` through `ASK_URL`, which is expected to be the local `cllm` service.
+
+If `ASK_TOKEN` is set, `ask.sh` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints.
+
+If you point `ASK_URL` at `https://api.openai.com`, set `ASK_MODEL` to a model you have access to, such as `gpt-4.1`.
 
 You can also pass the user context directly:
 
 ```bash
-VLLM_AUTH='admin:change-me' ./ask.sh "Give me three uses for an edge-hosted LLM."
+ASK_TOKEN='your-api-token' ./ask.sh "Give me three uses for an edge-hosted LLM."
+```
+
+OpenAI example:
+
+```bash
+ASK_URL='https://api.openai.com' \
+ASK_TOKEN='your-api-token' \
+ASK_MODEL='gpt-4.1' \
+./ask.sh "Give me three uses for an edge-hosted LLM."
 ```
 
 It will:
 
-- set `VLLM_MODEL` automatically if it is not already set
 - prompt for the user context
-- send the request to the active model
-- prompt for ingress credentials when `VLLM_AUTH` is not set and the script is run interactively
-- authenticate to the ingress when `VLLM_AUTH` is set
-- render the assistant content with `glow`
-- print elapsed time and token usage on separate lines after the rendered response
+- send a streaming chat completion request to the configured endpoint
+- authenticate with `ASK_TOKEN` when it is set
+- support `ASK_URL`, `ASK_TOKEN`, `ASK_MODEL`, `ASK_SYSTEM_PROMPT`, `ASK_MAX_TOKENS`, `ASK_TEMPERATURE`, and `ASK_DEBUG`
+- fall back to the older `CACHE_*` and `VLLM_*` variables for compatibility
+- print the streamed assistant content first, then a metrics footer with elapsed time, cache hit state, and token usage
+
+Example footer:
+
+```text
+------------------
+elapsed_ms: 26
+cache: true
+prompt_tokens: 21
+completion_tokens: 405
+total_tokens: 426
+```
 
 On the first startup, expect a delay while vLLM pulls the container image, downloads model weights, compiles kernels, and captures CUDA graphs. On this 8 GB GPU, the large 7B AWQ profile took about 150 seconds to download weights and about 56 seconds to finish engine initialization after that.
 

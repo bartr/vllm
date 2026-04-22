@@ -24,12 +24,12 @@ const (
 	defaultVLLMURL          = "http://127.0.0.1:32080"
 	defaultCacheSize        = 100
 	defaultModelsCacheTTL   = time.Hour
-	defaultSystemPrompt     = "You are a detailed assistant."
+	defaultSystemPrompt     = "You are a helpful assistant."
 	minMaxTokens            = 100
 	maxMaxTokens            = 4000
-	defaultMaxTokens        = 2500
+	defaultMaxTokens        = 4000
 	defaultTemperature      = 0.2
-	defaultVLLMHTTPTimeout  = 60 * time.Second
+	defaultVLLMHTTPTimeout  = 120 * time.Second
 )
 
 type askOptions struct {

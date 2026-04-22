@@ -2,12 +2,37 @@
 
 set -euo pipefail
 
-CACHE_URL=${CACHE_URL:-${VLLM_URL:-http://localhost:8080}}
-CACHE_AUTH=${CACHE_AUTH:-${VLLM_AUTH:-}}
-CACHE_SYSTEM_PROMPT=${CACHE_SYSTEM_PROMPT:-${VLLM_SYSTEM_PROMPT:-You are a helpful assistant.}}
-CACHE_MAX_TOKENS=${CACHE_MAX_TOKENS:-${VLLM_MAX_TOKENS:-4000}}
-CACHE_TEMPERATURE=${CACHE_TEMPERATURE:-${VLLM_TEMPERATURE:-0.2}}
+ASK_URL=${ASK_URL:-http://localhost:8080}
+ASK_TOKEN=${ASK_TOKEN:-}
+ASK_MODEL=${ASK_MODEL:-}
+ASK_SYSTEM_PROMPT=${ASK_SYSTEM_PROMPT:-You are a helpful assistant.}
+ASK_MAX_TOKENS=${ASK_MAX_TOKENS:-4000}
+ASK_TEMPERATURE=${ASK_TEMPERATURE:-0.2}
 ASK_DEBUG=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./ask.sh [--debug] [prompt...]
+
+Send a streaming chat request to the configured endpoint.
+
+Options:
+  -h, --help   Show this help message and exit
+  --debug      Print raw SSE lines to stderr while streaming
+
+Environment:
+  ASK_URL            Base URL for the chat service (default: http://localhost:8080)
+  ASK_TOKEN          Bearer token for OpenAI-compatible endpoints
+  ASK_MODEL          Model name for OpenAI-compatible chat completions
+  ASK_SYSTEM_PROMPT  System prompt sent with the request
+  ASK_MAX_TOKENS     Max tokens for the request
+  ASK_TEMPERATURE    Sampling temperature for the request
+  ASK_DEBUG          Set to 1 to enable raw SSE debug output
+
+Input:
+  Pass the user prompt as arguments or pipe it on stdin.
+EOF
+}
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -21,25 +46,19 @@ require_command python3
 
 build_curl_args() {
   curl_args=(-sS -N)
-  if [[ -n "$CACHE_AUTH" ]]; then
-    curl_args+=(-u "$CACHE_AUTH")
+  if [[ -n "$ASK_TOKEN" ]]; then
+    curl_args+=(-H "Authorization: Bearer $ASK_TOKEN")
   fi
 }
-
-if [[ -z "$CACHE_AUTH" && -t 0 ]]; then
-  read -r -p "Cache username: " cache_auth_user
-  read -r -s -p "Cache password: " cache_auth_password
-  printf '\n'
-
-  if [[ -n "$cache_auth_user" && -n "$cache_auth_password" ]]; then
-    export CACHE_AUTH="$cache_auth_user:$cache_auth_password"
-  fi
-fi
 
 build_curl_args
 
 user_args=()
 for arg in "$@"; do
+  if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+    usage
+    exit 0
+  fi
   if [[ "$arg" == "--debug" ]]; then
     ASK_DEBUG=1
     continue
@@ -55,6 +74,10 @@ else
   read -r -p "User context: " user_context
 fi
 
+if [[ "$ASK_URL" == "https://api.openai.com" || "$ASK_URL" == "https://api.openai.com/" ]]; then
+  ASK_MODEL=gpt-4.1
+fi
+
 export ASK_DEBUG
 
 if [[ -z "$user_context" ]]; then
@@ -64,11 +87,13 @@ fi
 
 start_ms=$(date +%s%3N)
 request_body=$(jq -n \
-  --arg system_prompt "$CACHE_SYSTEM_PROMPT" \
+  --arg model "$ASK_MODEL" \
+  --arg system_prompt "$ASK_SYSTEM_PROMPT" \
   --arg user_context "$user_context" \
-  --argjson temperature "$CACHE_TEMPERATURE" \
-  --argjson max_tokens "$CACHE_MAX_TOKENS" \
+  --argjson temperature "$ASK_TEMPERATURE" \
+  --argjson max_tokens "$ASK_MAX_TOKENS" \
   '{
+    model: $model,
     messages: [
       {role: "system", content: $system_prompt},
       {role: "user", content: $user_context}
@@ -128,7 +153,7 @@ curl "${curl_args[@]}" \
   -w '%{http_code}' \
   -H 'Content-Type: application/json' \
   -d "$request_body" \
-  "$CACHE_URL/v1/chat/completions" > "$http_code_file"
+  "$ASK_URL/v1/chat/completions" > "$http_code_file"
 
 if ! wait "$consumer_pid"; then
   echo "Failed to process streamed response." >&2
@@ -140,7 +165,7 @@ elapsed_ms=$((end_ms - start_ms))
 http_code=$(cat "$http_code_file")
 
 if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
-  echo "Request was rejected by the cache service. Set CACHE_AUTH to 'user:password' or rerun interactively." >&2
+  echo "Request was rejected by the chat service. Set ASK_TOKEN to a valid bearer token and retry." >&2
   exit 1
 fi
 
