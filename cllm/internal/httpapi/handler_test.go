@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"regexp"
 	"sync"
@@ -18,7 +19,7 @@ import (
 
 func TestRoutes(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: "You are a detailed assistant.", maxTokens: 2500, temperature: defaultTemperature}).Routes()
 
 	tests := []struct {
 		name       string
@@ -29,7 +30,7 @@ func TestRoutes(t *testing.T) {
 	}{
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, body: "{\"system_prompt\":\"You are a detailed assistant.\",\"max_tokens\":2500,\"temperature\":0.2,\"stream\":false,\"replay_delay\":\"0s\",\"models_cache_ttl\":\"1h0m0s\"}\n"},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, body: "{\"downstream_url\":\"" + vllmServer.URL + "\",\"downstream_model\":\"\",\"system_prompt\":\"You are a detailed assistant.\",\"max_tokens\":2500,\"temperature\":0.2,\"stream\":false,\"replay_delay\":\"0s\",\"models_cache_ttl\":\"1h0m0s\"}\n"},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
 		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
@@ -82,6 +83,34 @@ func TestChatCompletionsDefaultsMissingModelFromVLLM(t *testing.T) {
 	}
 	if (*captured)[0].Model != "test-model" {
 		t.Fatalf("model = %q, want %q", (*captured)[0].Model, "test-model")
+	}
+}
+
+func TestChatCompletionsUsesConfiguredDownstreamModelAndToken(t *testing.T) {
+	vllmServer, captured := newCapturingTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	handler.SetDownstreamModel("gpt-4.1")
+	handler.SetDownstreamToken("secret-token")
+	router := handler.Routes()
+
+	body := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("captured requests = %d, want 1", len(*captured))
+	}
+	if (*captured)[0].Model != "gpt-4.1" {
+		t.Fatalf("model = %q, want %q", (*captured)[0].Model, "gpt-4.1")
+	}
+	if (*captured)[0].Authorization != "Bearer secret-token" {
+		t.Fatalf("authorization = %q, want %q", (*captured)[0].Authorization, "Bearer secret-token")
 	}
 }
 
@@ -532,7 +561,7 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 
 	configRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&replay-delay=5ms&models-cache-ttl=30m", nil))
+	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?downstream-url="+url.QueryEscape(vllmServer.URL)+"&downstream-model=gpt-4.1&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&replay-delay=5ms&models-cache-ttl=30m", nil))
 
 	if configRecorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", configRecorder.Code, http.StatusOK)
@@ -544,6 +573,12 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	}
 	if got.SystemPrompt != "Be precise" {
 		t.Fatalf("system prompt = %q, want %q", got.SystemPrompt, "Be precise")
+	}
+	if got.DownstreamURL != vllmServer.URL {
+		t.Fatalf("downstream url = %q, want %q", got.DownstreamURL, vllmServer.URL)
+	}
+	if got.DownstreamModel != "gpt-4.1" {
+		t.Fatalf("downstream model = %q, want %q", got.DownstreamModel, "gpt-4.1")
 	}
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
@@ -571,6 +606,9 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 		t.Fatalf("captured requests = %d, want 1", len(*captured))
 	}
 	request := (*captured)[0]
+	if request.Model != "gpt-4.1" {
+		t.Fatalf("captured model = %q, want %q", request.Model, "gpt-4.1")
+	}
 	if request.SystemPrompt != "Be precise" {
 		t.Fatalf("captured system prompt = %q, want %q", request.SystemPrompt, "Be precise")
 	}
@@ -586,9 +624,10 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 }
 
 func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
-	handler := NewHandler().Routes()
+	vllmServer := newTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?system_prompt=Be%20precise&max_tokens=700&replay_delay=100ms&models_cache_ttl=30m", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&replay_delay=100ms&models_cache_ttl=30m", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -600,6 +639,12 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	}
 	if got.SystemPrompt != "Be precise" {
 		t.Fatalf("system prompt = %q, want %q", got.SystemPrompt, "Be precise")
+	}
+	if got.DownstreamURL != vllmServer.URL {
+		t.Fatalf("downstream url = %q, want %q", got.DownstreamURL, vllmServer.URL)
+	}
+	if got.DownstreamModel != "gpt-4.1" {
+		t.Fatalf("downstream model = %q, want %q", got.DownstreamModel, "gpt-4.1")
 	}
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
@@ -907,6 +952,9 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
+	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
+	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "secret-token")
+	t.Setenv("CACHE_DOWNSTREAM_MODEL", "gpt-4.1")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -921,18 +969,30 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	if cfg.Temperature != 0.7 {
 		t.Fatalf("Temperature = %v, want 0.7", cfg.Temperature)
 	}
+	if cfg.DownstreamURL != "https://api.openai.com" {
+		t.Fatalf("DownstreamURL = %q, want %q", cfg.DownstreamURL, "https://api.openai.com")
+	}
+	if cfg.DownstreamToken != "secret-token" {
+		t.Fatalf("DownstreamToken = %q, want %q", cfg.DownstreamToken, "secret-token")
+	}
+	if cfg.DownstreamModel != "gpt-4.1" {
+		t.Fatalf("DownstreamModel = %q, want %q", cfg.DownstreamModel, "gpt-4.1")
+	}
 }
 
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
+	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
+	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
+	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "env-token")
+	t.Setenv("CACHE_DOWNSTREAM_MODEL", "env-model")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -946,6 +1006,15 @@ func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	}
 	if cfg.Temperature != 0.9 {
 		t.Fatalf("Temperature = %v, want 0.9", cfg.Temperature)
+	}
+	if cfg.DownstreamURL != "https://example.test" {
+		t.Fatalf("DownstreamURL = %q, want %q", cfg.DownstreamURL, "https://example.test")
+	}
+	if cfg.DownstreamToken != "flag-token" {
+		t.Fatalf("DownstreamToken = %q, want %q", cfg.DownstreamToken, "flag-token")
+	}
+	if cfg.DownstreamModel != "flag-model" {
+		t.Fatalf("DownstreamModel = %q, want %q", cfg.DownstreamModel, "flag-model")
 	}
 }
 
@@ -1041,6 +1110,7 @@ type capturedChatRequest struct {
 	Temperature  float64
 	UserContent  string
 	Stream       bool
+	Authorization string
 }
 
 func newCountingTestVLLMServer(t *testing.T) (*httptest.Server, *vllmCounters) {
@@ -1121,6 +1191,7 @@ func newCapturingTestVLLMServer(t *testing.T) (*httptest.Server, *[]capturedChat
 				Temperature:  requestBody.Temperature,
 				MaxTokens:    requestBody.MaxTokens,
 				Stream:       requestBody.Stream,
+				Authorization: r.Header.Get("Authorization"),
 			})
 			mu.Unlock()
 

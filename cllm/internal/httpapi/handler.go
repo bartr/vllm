@@ -39,6 +39,10 @@ type askOptions struct {
 	stream       bool
 }
 
+func trimTrailingSlash(rawURL string) string {
+	return strings.TrimRight(rawURL, "/")
+}
+
 func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askOptions {
 	return askOptions{
 		systemPrompt: systemPrompt,
@@ -54,6 +58,8 @@ type Handler struct {
 	defaults   askOptions
 	replayDelay time.Duration
 	vllmURL    string
+	downstreamToken string
+	downstreamModel string
 	httpClient *http.Client
 	sleep      func(time.Duration)
 	now        func() time.Time
@@ -67,7 +73,7 @@ func NewHandler() *Handler {
 	handler.ready.Store(true)
 	handler.cache = newLRUCache(defaultCacheSize)
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
-	handler.vllmURL = defaultVLLMURL
+	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
 	handler.sleep = time.Sleep
 	handler.now = time.Now
@@ -92,10 +98,31 @@ func (h *Handler) SetReplayDelay(delay time.Duration) {
 	h.replayDelay = delay
 }
 
+func (h *Handler) SetDownstreamToken(token string) {
+	h.modelsMu.Lock()
+	h.downstreamToken = token
+	h.modelsCache = nil
+	h.modelsMu.Unlock()
+}
+
+func (h *Handler) SetDownstreamURL(rawURL string) {
+	h.modelsMu.Lock()
+	h.vllmURL = trimTrailingSlash(rawURL)
+	h.modelsCache = nil
+	h.modelsMu.Unlock()
+}
+
+func (h *Handler) SetDownstreamModel(model string) {
+	h.modelsMu.Lock()
+	h.downstreamModel = model
+	h.modelsCache = nil
+	h.modelsMu.Unlock()
+}
+
 func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
 	handler := NewHandler()
 	if vllmURL != "" {
-		handler.vllmURL = vllmURL
+		handler.vllmURL = trimTrailingSlash(vllmURL)
 	}
 	if httpClient != nil {
 		handler.httpClient = httpClient
@@ -112,6 +139,13 @@ func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSi
 	return handler
 }
 
+func (h *Handler) applyDownstreamAuth(request *http.Request) {
+	if h.downstreamToken == "" {
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+h.downstreamToken)
+}
+
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /config", h.config)
@@ -124,6 +158,8 @@ func (h *Handler) Routes() http.Handler {
 }
 
 type runtimeConfig struct {
+	DownstreamURL string  `json:"downstream_url"`
+	DownstreamModel string `json:"downstream_model"`
 	SystemPrompt   string  `json:"system_prompt"`
 	MaxTokens      int     `json:"max_tokens"`
 	Temperature    float64 `json:"temperature"`
@@ -159,7 +195,7 @@ func (h *Handler) config(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	body, statusCode, contentType, err := h.fetchModels(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf("fetch vllm models: %v", err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("fetch downstream models: %v", err), http.StatusBadGateway)
 		return
 	}
 
@@ -214,7 +250,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if requestPayload.Stream {
 		cachedResponse, err := h.streamChatCompletion(r.Context(), w, requestPayload)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+			http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 			return
 		}
 
@@ -226,7 +262,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 		return
 	}
 
@@ -278,7 +314,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 
 	model, err := h.fetchModel(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf("fetch vllm model: %v", err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("fetch downstream model: %v", err), http.StatusBadGateway)
 		return
 	}
 
@@ -299,7 +335,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 	if options.stream {
 		cachedResponse, err := h.streamChatCompletion(r.Context(), w, requestPayload)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+			http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 			return
 		}
 
@@ -311,7 +347,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 
 	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 		return
 	}
 
@@ -380,10 +416,14 @@ func (h *Handler) currentConfig() runtimeConfig {
 	replayDelay := h.getReplayDelay()
 
 	h.modelsMu.RLock()
+	downstreamURL := h.vllmURL
+	downstreamModel := h.downstreamModel
 	modelsCacheTTL := h.modelsCacheTTL
 	h.modelsMu.RUnlock()
 
 	return runtimeConfig{
+		DownstreamURL: downstreamURL,
+		DownstreamModel: downstreamModel,
 		SystemPrompt:   defaults.systemPrompt,
 		MaxTokens:      defaults.maxTokens,
 		Temperature:    defaults.temperature,
@@ -445,8 +485,16 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	}
 
 	h.modelsMu.RLock()
+	downstreamURL := h.vllmURL
+	downstreamModel := h.downstreamModel
 	modelsCacheTTL := h.modelsCacheTTL
 	h.modelsMu.RUnlock()
+	if downstreamURLRaw := configQueryValue(queryValues, "downstream-url", "downstream_url"); downstreamURLRaw != "" {
+		downstreamURL = downstreamURLRaw
+	}
+	if downstreamModelRaw := configQueryValue(queryValues, "downstream-model", "downstream_model"); downstreamModelRaw != "" {
+		downstreamModel = downstreamModelRaw
+	}
 	if modelsCacheTTLRaw := configQueryValue(queryValues, "models-cache-ttl", "models_cache_ttl"); modelsCacheTTLRaw != "" {
 		parsed, err := time.ParseDuration(modelsCacheTTLRaw)
 		if err != nil {
@@ -462,6 +510,8 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.defaults = defaults
 	h.replayDelay = replayDelay
 	h.configMu.Unlock()
+	h.SetDownstreamURL(downstreamURL)
+	h.SetDownstreamModel(downstreamModel)
 	h.SetModelsCacheTTL(modelsCacheTTL)
 
 	return true, nil
@@ -531,6 +581,10 @@ type chatCompletionMessage struct {
 }
 
 func (h *Handler) fetchModel(ctx context.Context) (string, error) {
+	if h.downstreamModel != "" {
+		return h.downstreamModel, nil
+	}
+
 	models, err := h.getOrFetchModels(ctx)
 	if err != nil {
 		return "", err
@@ -567,6 +621,7 @@ func (h *Handler) getOrFetchModels(ctx context.Context) (cachedModelsResponse, e
 	if err != nil {
 		return cachedModelsResponse{}, fmt.Errorf("build models request: %w", err)
 	}
+	h.applyDownstreamAuth(request)
 
 	response, err := h.httpClient.Do(request)
 	if err != nil {
@@ -633,6 +688,7 @@ func (h *Handler) createChatCompletion(ctx context.Context, requestPayload chatC
 		return nil, 0, "", fmt.Errorf("build chat request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	h.applyDownstreamAuth(request)
 
 	response, err := h.httpClient.Do(request)
 	if err != nil {
@@ -665,6 +721,7 @@ func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWrite
 		return cachedVLLMResponse{}, fmt.Errorf("build chat request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	h.applyDownstreamAuth(request)
 
 	response, err := h.httpClient.Do(request)
 	if err != nil {
@@ -719,6 +776,11 @@ func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWrite
 }
 
 func (h *Handler) populateChatCompletionDefaults(ctx context.Context, requestPayload chatCompletionRequest) (chatCompletionRequest, error) {
+	if requestPayload.Model == "" && h.downstreamModel != "" {
+		requestPayload.Model = h.downstreamModel
+		return requestPayload, nil
+	}
+
 	if requestPayload.Model == "" {
 		model, err := h.fetchModel(ctx)
 		if err != nil {

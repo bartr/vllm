@@ -40,7 +40,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
+	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
+	handler.SetDownstreamToken(cfg.DownstreamToken)
+	handler.SetDownstreamModel(cfg.DownstreamModel)
 	handler.SetModelsCacheTTL(cfg.ModelsCacheTTL)
 	handler.SetReplayDelay(cfg.ReplayDelay)
 	server := newServer(cfg, handler.Routes())
@@ -51,6 +53,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"server starting",
 			"addr", cfg.Addr,
 			"cache_size", cfg.CacheSize,
+			"downstream_url", cfg.DownstreamURL,
+			"downstream_model", cfg.DownstreamModel,
 			"models_cache_ttl", cfg.ModelsCacheTTL,
 			"replay_delay", cfg.ReplayDelay,
 			"system_prompt", cfg.SystemPrompt,

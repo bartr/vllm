@@ -33,6 +33,9 @@ go run ./cmd/cllm --version
 The server supports these runtime settings:
 
 - `CACHE_CACHE_SIZE` or `--cache-size` / `-c`: maximum number of cached chat responses
+- `CACHE_DOWNSTREAM_URL` or `--downstream-url`: downstream OpenAI-compatible base URL, default `http://127.0.0.1:32080`
+- `CACHE_DOWNSTREAM_TOKEN` or `--downstream-token`: bearer token sent to the downstream API
+- `CACHE_DOWNSTREAM_MODEL` or `--downstream-model`: default downstream model when incoming requests omit `model`
 - `CACHE_MODELS_CACHE_TTL` or `--models-cache-ttl`: how long to keep the upstream `/v1/models` response cached, default `1h`
 - `CACHE_REPLAY_DELAY` or `--replay-delay`: delay cached replay output to simulate load, default `0s`
 - `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for `/ask`
@@ -44,14 +47,32 @@ The server supports these runtime settings:
 Example:
 
 ```bash
-CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_MODELS_CACHE_TTL=30m CACHE_REPLAY_DELAY=20ms go run ./cmd/cllm --cache-size 200 --models-cache-ttl 15m --replay-delay 10ms
+CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_DOWNSTREAM_URL=https://api.openai.com CACHE_DOWNSTREAM_TOKEN=your-token CACHE_DOWNSTREAM_MODEL=gpt-4.1 CACHE_MODELS_CACHE_TTL=30m CACHE_REPLAY_DELAY=20ms go run ./cmd/cllm --cache-size 200 --models-cache-ttl 15m --replay-delay 10ms
 ```
+
+For a local vLLM source, omit the downstream token and model settings and keep the default downstream URL of `http://127.0.0.1:32080`.
 
 You can inspect or update the live handler config at runtime:
 
 ```bash
 curl 'http://127.0.0.1:8080/config?system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&replay-delay=5ms&models-cache-ttl=30m'
 ```
+
+`/config` now also returns `downstream_url` and `downstream_model`, and you can update them live with either hyphenated or snake_case query params.
+
+Example switching the downstream source to OpenAI-compatible settings at runtime:
+
+```bash
+curl 'http://127.0.0.1:8080/config?downstream-url=https%3A%2F%2Fapi.openai.com&downstream-model=gpt-4.1'
+```
+
+Equivalent snake_case form:
+
+```bash
+curl 'http://127.0.0.1:8080/config?downstream_url=https%3A%2F%2Fapi.openai.com&downstream_model=gpt-4.1'
+```
+
+The downstream token is intentionally not returned by `/config`.
 
 ## Build
 

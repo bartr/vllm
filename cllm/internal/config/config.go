@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	defaultCacheSize     = 100
+	defaultCacheSize      = 100
+	defaultDownstreamURL  = "http://127.0.0.1:32080"
 	defaultMaxTokens     = 4000
 	defaultModelsCacheTTL = time.Hour
 	defaultReplayDelay   = 0 * time.Millisecond
@@ -25,6 +26,9 @@ const (
 type Config struct {
 	Addr            string
 	CacheSize       int
+	DownstreamURL   string
+	DownstreamToken string
+	DownstreamModel string
 	ModelsCacheTTL  time.Duration
 	ReplayDelay     time.Duration
 	SystemPrompt    string
@@ -58,6 +62,9 @@ func LoadFromArgs(args []string) (Config, error) {
 	return Config{
 		Addr:            net.JoinHostPort("", strconv.Itoa(portNumber)),
 		CacheSize:       runtimeOptions.cacheSize,
+		DownstreamURL:   runtimeOptions.downstreamURL,
+		DownstreamToken: runtimeOptions.downstreamToken,
+		DownstreamModel: runtimeOptions.downstreamModel,
 		ModelsCacheTTL:  runtimeOptions.modelsCacheTTL,
 		ReplayDelay:     runtimeOptions.replayDelay,
 		SystemPrompt:    runtimeOptions.systemPrompt,
@@ -74,6 +81,9 @@ func Usage() string {
 	builder.WriteString("  -h, --help                  Show this help message and exit\n")
 	builder.WriteString("      --version               Show version information and exit\n")
 	builder.WriteString("  -c, --cache-size int        Maximum number of cached chat responses\n")
+	builder.WriteString("      --downstream-url string Downstream OpenAI-compatible base URL (default http://127.0.0.1:32080)\n")
+	builder.WriteString("      --downstream-token str  Bearer token for downstream requests\n")
+	builder.WriteString("      --downstream-model str  Default downstream model when requests omit model\n")
 	builder.WriteString("      --models-cache-ttl d    How long to keep the upstream /v1/models response cached (default 1h)\n")
 	builder.WriteString("      --replay-delay d        Delay between cached replay chunks and tokens (default 0s)\n")
 	builder.WriteString(fmt.Sprintf("      --system-prompt string  Default system prompt for /ask (default %q)\n", defaultSystemPrompt))
@@ -83,6 +93,9 @@ func Usage() string {
 	builder.WriteString("  CACHE_PORT\n")
 	builder.WriteString("  CACHE_SHUTDOWN_TIMEOUT\n")
 	builder.WriteString("  CACHE_CACHE_SIZE\n")
+	builder.WriteString("  CACHE_DOWNSTREAM_URL\n")
+	builder.WriteString("  CACHE_DOWNSTREAM_TOKEN\n")
+	builder.WriteString("  CACHE_DOWNSTREAM_MODEL\n")
 	builder.WriteString("  CACHE_MODELS_CACHE_TTL\n")
 	builder.WriteString("  CACHE_REPLAY_DELAY\n")
 	builder.WriteString("  CACHE_SYSTEM_PROMPT\n")
@@ -92,7 +105,10 @@ func Usage() string {
 }
 
 type runtimeOptions struct {
-	cacheSize    int
+	cacheSize      int
+	downstreamURL  string
+	downstreamToken string
+	downstreamModel string
 	modelsCacheTTL time.Duration
 	replayDelay  time.Duration
 	systemPrompt string
@@ -102,7 +118,8 @@ type runtimeOptions struct {
 
 func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	options := runtimeOptions{
-		cacheSize:    defaultCacheSize,
+		cacheSize:      defaultCacheSize,
+		downstreamURL:  defaultDownstreamURL,
 		modelsCacheTTL: defaultModelsCacheTTL,
 		replayDelay:  defaultReplayDelay,
 		systemPrompt: defaultSystemPrompt,
@@ -116,6 +133,18 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 			return runtimeOptions{}, fmt.Errorf("invalid CACHE_CACHE_SIZE %q", envValue)
 		}
 		options.cacheSize = parsedValue
+	}
+
+	if envValue := os.Getenv("CACHE_DOWNSTREAM_URL"); envValue != "" {
+		options.downstreamURL = envValue
+	}
+
+	if envValue := os.Getenv("CACHE_DOWNSTREAM_TOKEN"); envValue != "" {
+		options.downstreamToken = envValue
+	}
+
+	if envValue := os.Getenv("CACHE_DOWNSTREAM_MODEL"); envValue != "" {
+		options.downstreamModel = envValue
 	}
 
 	if envValue := os.Getenv("CACHE_SYSTEM_PROMPT"); envValue != "" {
@@ -167,6 +196,9 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	flagSet.SetOutput(io.Discard)
 	flagSet.IntVar(&options.cacheSize, "cache-size", options.cacheSize, "maximum number of cached ask responses")
 	flagSet.IntVar(&options.cacheSize, "c", options.cacheSize, "maximum number of cached ask responses")
+	flagSet.StringVar(&options.downstreamURL, "downstream-url", options.downstreamURL, "downstream OpenAI-compatible base URL")
+	flagSet.StringVar(&options.downstreamToken, "downstream-token", options.downstreamToken, "bearer token for downstream requests")
+	flagSet.StringVar(&options.downstreamModel, "downstream-model", options.downstreamModel, "default downstream model when model is omitted")
 	flagSet.DurationVar(&options.modelsCacheTTL, "models-cache-ttl", options.modelsCacheTTL, "how long to keep the upstream models list cached")
 	flagSet.DurationVar(&options.replayDelay, "replay-delay", options.replayDelay, "delay between cached replay chunks and tokens")
 	flagSet.StringVar(&options.systemPrompt, "system-prompt", options.systemPrompt, "default system prompt for ask requests")
@@ -180,6 +212,18 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 			normalizedArgs = append(normalizedArgs, "-cache-size")
 		case len(arg) > len("--cache-size=") && arg[:len("--cache-size=")] == "--cache-size=":
 			normalizedArgs = append(normalizedArgs, "-cache-size="+arg[len("--cache-size="):])
+		case arg == "--downstream-url":
+			normalizedArgs = append(normalizedArgs, "-downstream-url")
+		case len(arg) > len("--downstream-url=") && arg[:len("--downstream-url=")] == "--downstream-url=":
+			normalizedArgs = append(normalizedArgs, "-downstream-url="+arg[len("--downstream-url="):])
+		case arg == "--downstream-token":
+			normalizedArgs = append(normalizedArgs, "-downstream-token")
+		case len(arg) > len("--downstream-token=") && arg[:len("--downstream-token=")] == "--downstream-token=":
+			normalizedArgs = append(normalizedArgs, "-downstream-token="+arg[len("--downstream-token="):])
+		case arg == "--downstream-model":
+			normalizedArgs = append(normalizedArgs, "-downstream-model")
+		case len(arg) > len("--downstream-model=") && arg[:len("--downstream-model=")] == "--downstream-model=":
+			normalizedArgs = append(normalizedArgs, "-downstream-model="+arg[len("--downstream-model="):])
 		case arg == "--system-prompt":
 			normalizedArgs = append(normalizedArgs, "-system-prompt")
 		case len(arg) > len("--system-prompt=") && arg[:len("--system-prompt=")] == "--system-prompt=":
