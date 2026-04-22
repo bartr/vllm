@@ -1,13 +1,13 @@
 GO ?= go
-BINARY ?= cplane
+BINARY ?= cache
 
 .PHONY: build run test fmt clean
 
 build:
-	$(GO) build -o bin/$(BINARY) ./cmd/cplane
+	$(GO) build -o bin/$(BINARY) ./cmd/cache
 
 run:
-	$(GO) run ./cmd/cplane
+	$(GO) run ./cmd/cache
 
 test:
 	$(GO) test ./...

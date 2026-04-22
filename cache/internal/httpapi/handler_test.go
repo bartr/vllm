@@ -2,7 +2,7 @@ package httpapi
 
 import (
 	"bytes"
-	"cplane/internal/config"
+	"cache/internal/config"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -305,11 +305,11 @@ func TestAskUsesCustomVLLMOptions(t *testing.T) {
 func TestLoadConfigCacheSize(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cplane"}
+	os.Args = []string{"cache"}
 
 	t.Setenv("PORT", "8080")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CPLANE_CACHE_SIZE", "123")
+	t.Setenv("CACHE_CACHE_SIZE", "123")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -323,11 +323,11 @@ func TestLoadConfigCacheSize(t *testing.T) {
 func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cplane", "--cache-size", "7"}
+	os.Args = []string{"cache", "--cache-size", "7"}
 
 	t.Setenv("PORT", "8080")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CPLANE_CACHE_SIZE", "123")
+	t.Setenv("CACHE_CACHE_SIZE", "123")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -341,11 +341,11 @@ func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 func TestLoadConfigShortCacheSizeFlag(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cplane", "-c", "0"}
+	os.Args = []string{"cache", "-c", "0"}
 
 	t.Setenv("PORT", "8080")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CPLANE_CACHE_SIZE", "123")
+	t.Setenv("CACHE_CACHE_SIZE", "123")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -363,10 +363,10 @@ func TestLoadConfigInvalidCacheSize(t *testing.T) {
 		env     string
 		wantErr string
 	}{
-		{name: "negative flag", args: []string{"cplane", "--cache-size", "-1"}, wantErr: "invalid cache size -1"},
-		{name: "non integer flag", args: []string{"cplane", "--cache-size", "abc"}, wantErr: "invalid runtime flag"},
-		{name: "negative env", args: []string{"cplane"}, env: "-1", wantErr: "invalid CPLANE_CACHE_SIZE \"-1\""},
-		{name: "non integer env", args: []string{"cplane"}, env: "abc", wantErr: "invalid CPLANE_CACHE_SIZE \"abc\""},
+		{name: "negative flag", args: []string{"cache", "--cache-size", "-1"}, wantErr: "invalid cache size -1"},
+		{name: "non integer flag", args: []string{"cache", "--cache-size", "abc"}, wantErr: "invalid runtime flag"},
+		{name: "negative env", args: []string{"cache"}, env: "-1", wantErr: "invalid CACHE_CACHE_SIZE \"-1\""},
+		{name: "non integer env", args: []string{"cache"}, env: "abc", wantErr: "invalid CACHE_CACHE_SIZE \"abc\""},
 	}
 
 	for _, test := range tests {
@@ -377,7 +377,7 @@ func TestLoadConfigInvalidCacheSize(t *testing.T) {
 
 			t.Setenv("PORT", "8080")
 			t.Setenv("SHUTDOWN_TIMEOUT", "10s")
-			t.Setenv("CPLANE_CACHE_SIZE", test.env)
+			t.Setenv("CACHE_CACHE_SIZE", test.env)
 
 			_, err := config.Load()
 			if err == nil {
@@ -416,13 +416,13 @@ func TestAskWithCacheDisabled(t *testing.T) {
 func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cplane"}
+	os.Args = []string{"cache"}
 
 	t.Setenv("PORT", "8080")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CPLANE_SYSTEM_PROMPT", "Be concise")
-	t.Setenv("CPLANE_MAX_TOKENS", "700")
-	t.Setenv("CPLANE_TEMPERATURE", "0.7")
+	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
+	t.Setenv("CACHE_MAX_TOKENS", "700")
+	t.Setenv("CACHE_TEMPERATURE", "0.7")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -442,13 +442,13 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cplane", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
+	os.Args = []string{"cache", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
 
 	t.Setenv("PORT", "8080")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10s")
-	t.Setenv("CPLANE_SYSTEM_PROMPT", "Be concise")
-	t.Setenv("CPLANE_MAX_TOKENS", "700")
-	t.Setenv("CPLANE_TEMPERATURE", "0.7")
+	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
+	t.Setenv("CACHE_MAX_TOKENS", "700")
+	t.Setenv("CACHE_TEMPERATURE", "0.7")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -473,11 +473,11 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 		envVal  string
 		wantErr string
 	}{
-		{name: "invalid env max tokens", args: []string{"cplane"}, envKey: "CPLANE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CPLANE_MAX_TOKENS "nope"`},
-		{name: "env max tokens out of range", args: []string{"cplane"}, envKey: "CPLANE_MAX_TOKENS", envVal: "99", wantErr: "CPLANE_MAX_TOKENS must be between 100 and 10000"},
-		{name: "invalid env temperature", args: []string{"cplane"}, envKey: "CPLANE_TEMPERATURE", envVal: "nope", wantErr: `invalid CPLANE_TEMPERATURE "nope"`},
-		{name: "flag max tokens out of range", args: []string{"cplane", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 10000"},
-		{name: "invalid flag temperature", args: []string{"cplane", "--temperature", "nope"}, wantErr: "invalid runtime flag"},
+		{name: "invalid env max tokens", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
+		{name: "env max tokens out of range", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 10000"},
+		{name: "invalid env temperature", args: []string{"cache"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
+		{name: "flag max tokens out of range", args: []string{"cache", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 10000"},
+		{name: "invalid flag temperature", args: []string{"cache", "--temperature", "nope"}, wantErr: "invalid runtime flag"},
 	}
 
 	for _, test := range tests {

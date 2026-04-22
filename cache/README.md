@@ -1,6 +1,6 @@
-# cplane
+# cache
 
-`cplane` is a small Go web server that listens on port `8080` by default.
+`cache` is a small Go web server that listens on port `8080` by default.
 
 ## Endpoints
 
@@ -11,19 +11,19 @@
 ## Run locally
 
 ```bash
-go run ./cmd/cplane
+go run ./cmd/cache
 ```
 
 Or with an explicit port:
 
 ```bash
-PORT=8081 go run ./cmd/cplane
+PORT=8081 go run ./cmd/cache
 ```
 
 ## Build
 
 ```bash
-go build -o bin/cplane ./cmd/cplane
+go build -o bin/cache ./cmd/cache
 ```
 
 ## Test
@@ -35,6 +35,6 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cplane .
-docker run --rm -p 8080:8080 cplane
+docker build -t cache .
+docker run --rm -p 8080:8080 cache
 ```

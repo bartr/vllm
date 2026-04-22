@@ -71,38 +71,38 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 		temperature:  defaultTemperature,
 	}
 
-	if envValue := os.Getenv("CPLANE_CACHE_SIZE"); envValue != "" {
+	if envValue := os.Getenv("CACHE_CACHE_SIZE"); envValue != "" {
 		parsedValue, err := strconv.Atoi(envValue)
 		if err != nil || parsedValue < 0 {
-			return runtimeOptions{}, fmt.Errorf("invalid CPLANE_CACHE_SIZE %q", envValue)
+			return runtimeOptions{}, fmt.Errorf("invalid CACHE_CACHE_SIZE %q", envValue)
 		}
 		options.cacheSize = parsedValue
 	}
 
-	if envValue := os.Getenv("CPLANE_SYSTEM_PROMPT"); envValue != "" {
+	if envValue := os.Getenv("CACHE_SYSTEM_PROMPT"); envValue != "" {
 		options.systemPrompt = envValue
 	}
 
-	if envValue := os.Getenv("CPLANE_MAX_TOKENS"); envValue != "" {
+	if envValue := os.Getenv("CACHE_MAX_TOKENS"); envValue != "" {
 		parsedValue, err := strconv.Atoi(envValue)
 		if err != nil {
-			return runtimeOptions{}, fmt.Errorf("invalid CPLANE_MAX_TOKENS %q", envValue)
+			return runtimeOptions{}, fmt.Errorf("invalid CACHE_MAX_TOKENS %q", envValue)
 		}
 		if parsedValue < minMaxTokens || parsedValue > maxMaxTokens {
-			return runtimeOptions{}, fmt.Errorf("CPLANE_MAX_TOKENS must be between %d and %d", minMaxTokens, maxMaxTokens)
+			return runtimeOptions{}, fmt.Errorf("CACHE_MAX_TOKENS must be between %d and %d", minMaxTokens, maxMaxTokens)
 		}
 		options.maxTokens = parsedValue
 	}
 
-	if envValue := os.Getenv("CPLANE_TEMPERATURE"); envValue != "" {
+	if envValue := os.Getenv("CACHE_TEMPERATURE"); envValue != "" {
 		parsedValue, err := strconv.ParseFloat(envValue, 64)
 		if err != nil {
-			return runtimeOptions{}, fmt.Errorf("invalid CPLANE_TEMPERATURE %q", envValue)
+			return runtimeOptions{}, fmt.Errorf("invalid CACHE_TEMPERATURE %q", envValue)
 		}
 		options.temperature = parsedValue
 	}
 
-	flagSet := flag.NewFlagSet("cplane", flag.ContinueOnError)
+	flagSet := flag.NewFlagSet("cache", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 	flagSet.IntVar(&options.cacheSize, "cache-size", options.cacheSize, "maximum number of cached ask responses")
 	flagSet.IntVar(&options.cacheSize, "c", options.cacheSize, "maximum number of cached ask responses")
