@@ -12,11 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"cache/internal/buildinfo"
 	"cache/internal/config"
 	"cache/internal/httpapi"
 )
-
-var version = "dev"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -28,7 +27,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if hasVersionFlag(args) {
-		_, _ = fmt.Fprintf(stdout, "cache %s\n", version)
+		_, _ = fmt.Fprintf(stdout, "cache %s\n", buildinfo.Version)
 		return 0
 	}
 

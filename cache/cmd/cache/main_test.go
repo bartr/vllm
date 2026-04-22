@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"cache/internal/buildinfo"
 )
 
 func TestRunHelp(t *testing.T) {
@@ -46,9 +48,9 @@ func TestRunVersion(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	originalVersion := version
-	version = "1.2.3"
-	defer func() { version = originalVersion }()
+	originalVersion := buildinfo.Version
+	buildinfo.Version = "1.2.3"
+	defer func() { buildinfo.Version = originalVersion }()
 
 	exitCode := run([]string{"--version"}, &stdout, &stderr)
 
