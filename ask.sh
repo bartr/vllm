@@ -4,8 +4,8 @@ set -euo pipefail
 
 VLLM_URL=${VLLM_URL:-http://localhost:32080}
 VLLM_AUTH=${VLLM_AUTH:-}
-VLLM_SYSTEM_PROMPT=${VLLM_SYSTEM_PROMPT:-You are a concise assistant.}
-VLLM_MAX_TOKENS=${VLLM_MAX_TOKENS:-500}
+VLLM_SYSTEM_PROMPT=${VLLM_SYSTEM_PROMPT:-You are a helpful assistant.}
+VLLM_MAX_TOKENS=${VLLM_MAX_TOKENS:-4000}
 VLLM_TEMPERATURE=${VLLM_TEMPERATURE:-0.2}
 
 require_command() {
