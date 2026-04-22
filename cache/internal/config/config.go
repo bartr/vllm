@@ -13,12 +13,12 @@ import (
 
 const (
 	defaultCacheSize     = 100
-	defaultMaxTokens     = 500
+	defaultMaxTokens     = 4000
 	defaultModelsCacheTTL = time.Hour
 	defaultTemperature   = 0.2
-	defaultSystemPrompt  = "You are a concise assistant."
+	defaultSystemPrompt  = "You are a helpful assistant."
 	minMaxTokens         = 100
-	maxMaxTokens         = 10000
+	maxMaxTokens         = 4000
 )
 
 type Config struct {

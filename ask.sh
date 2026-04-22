@@ -2,11 +2,11 @@
 
 set -euo pipefail
 
-VLLM_URL=${VLLM_URL:-http://localhost:32080}
-VLLM_AUTH=${VLLM_AUTH:-}
-VLLM_SYSTEM_PROMPT=${VLLM_SYSTEM_PROMPT:-You are a detailed assistant.}
-VLLM_MAX_TOKENS=${VLLM_MAX_TOKENS:-4000}
-VLLM_TEMPERATURE=${VLLM_TEMPERATURE:-0.2}
+CACHE_URL=${CACHE_URL:-${VLLM_URL:-http://localhost:8080}}
+CACHE_AUTH=${CACHE_AUTH:-${VLLM_AUTH:-}}
+CACHE_SYSTEM_PROMPT=${CACHE_SYSTEM_PROMPT:-${VLLM_SYSTEM_PROMPT:-You are a detailed assistant.}}
+CACHE_MAX_TOKENS=${CACHE_MAX_TOKENS:-${VLLM_MAX_TOKENS:-4000}}
+CACHE_TEMPERATURE=${CACHE_TEMPERATURE:-${VLLM_TEMPERATURE:-0.2}}
 ASK_DEBUG=0
 
 require_command() {
@@ -17,59 +17,26 @@ require_command() {
 }
 
 require_command curl
-require_command jq
 require_command python3
-
-model_response=''
 
 build_curl_args() {
   curl_args=(-sS -N)
-  if [[ -n "$VLLM_AUTH" ]]; then
-    curl_args+=(-u "$VLLM_AUTH")
+  if [[ -n "$CACHE_AUTH" ]]; then
+    curl_args+=(-u "$CACHE_AUTH")
   fi
 }
 
-if [[ -z "$VLLM_AUTH" && -t 0 ]]; then
-  read -r -p "Ingress username: " vllm_auth_user
-  read -r -s -p "Ingress password: " vllm_auth_password
+if [[ -z "$CACHE_AUTH" && -t 0 ]]; then
+  read -r -p "Cache username: " cache_auth_user
+  read -r -s -p "Cache password: " cache_auth_password
   printf '\n'
 
-  if [[ -n "$vllm_auth_user" && -n "$vllm_auth_password" ]]; then
-    export VLLM_AUTH="$vllm_auth_user:$vllm_auth_password"
+  if [[ -n "$cache_auth_user" && -n "$cache_auth_password" ]]; then
+    export CACHE_AUTH="$cache_auth_user:$cache_auth_password"
   fi
 fi
 
 build_curl_args
-
-curl_json() {
-  local endpoint=$1
-  local response_body
-  local http_code
-
-  response_body=$(mktemp)
-  http_code=$(curl "${curl_args[@]}" -o "$response_body" -w '%{http_code}' "$VLLM_URL$endpoint")
-
-  if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
-    rm -f "$response_body"
-    echo "Request was rejected by the ingress. Set VLLM_AUTH to 'user:password' or rerun interactively." >&2
-    exit 1
-  fi
-
-  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-    cat "$response_body" >&2
-    rm -f "$response_body"
-    echo "Request to $endpoint failed with HTTP $http_code." >&2
-    exit 1
-  fi
-
-  cat "$response_body"
-  rm -f "$response_body"
-}
-
-if [[ -z "${VLLM_MODEL:-}" ]]; then
-  model_response=$(curl_json /v1/models)
-  VLLM_MODEL=$(printf '%s\n' "$model_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
-fi
 
 user_args=()
 for arg in "$@"; do
@@ -97,13 +64,11 @@ fi
 
 start_ms=$(date +%s%3N)
 request_body=$(jq -n \
-  --arg model "$VLLM_MODEL" \
-  --arg system_prompt "$VLLM_SYSTEM_PROMPT" \
+  --arg system_prompt "$CACHE_SYSTEM_PROMPT" \
   --arg user_context "$user_context" \
-  --argjson temperature "$VLLM_TEMPERATURE" \
-  --argjson max_tokens "$VLLM_MAX_TOKENS" \
+  --argjson temperature "$CACHE_TEMPERATURE" \
+  --argjson max_tokens "$CACHE_MAX_TOKENS" \
   '{
-    model: $model,
     messages: [
       {role: "system", content: $system_prompt},
       {role: "user", content: $user_context}
@@ -154,13 +119,13 @@ for raw_line in sys.stdin:
   -w '%{http_code}' \
   -H 'Content-Type: application/json' \
   -d "$request_body" \
-  "$VLLM_URL/v1/chat/completions" > "$http_code_file"
+  "$CACHE_URL/v1/chat/completions" > "$http_code_file"
 end_ms=$(date +%s%3N)
 elapsed_ms=$((end_ms - start_ms))
 http_code=$(cat "$http_code_file")
 
 if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
-  echo "Request was rejected by the ingress. Set VLLM_AUTH to 'user:password' or rerun interactively." >&2
+  echo "Request was rejected by the cache service. Set CACHE_AUTH to 'user:password' or rerun interactively." >&2
   exit 1
 fi
 
