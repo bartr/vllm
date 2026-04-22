@@ -794,12 +794,17 @@ func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cache
 			return
 		}
 		return
-func (h *Handler) replayCachedResponse(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
-		}
 	}
 
+	return
+}
+
+
+func (h *Handler) replayCachedResponse(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
 	body := rewriteJSONCacheField(cachedResponse.body, true)
 	w.Header().Set("Content-Type", cachedResponse.contentType)
+	w.WriteHeader(cachedResponse.statusCode)
+	_, _ = w.Write(body)
 }
 
 func readSSELine(reader io.Reader) ([]byte, error) {
