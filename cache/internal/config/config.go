@@ -13,6 +13,7 @@ import (
 const (
 	defaultCacheSize     = 100
 	defaultMaxTokens     = 500
+	defaultModelsCacheTTL = time.Hour
 	defaultTemperature   = 0.2
 	defaultSystemPrompt  = "You are a concise assistant."
 	minMaxTokens         = 100
@@ -22,6 +23,7 @@ const (
 type Config struct {
 	Addr            string
 	CacheSize       int
+	ModelsCacheTTL  time.Duration
 	SystemPrompt    string
 	MaxTokens       int
 	Temperature     float64
@@ -49,6 +51,7 @@ func Load() (Config, error) {
 	return Config{
 		Addr:            net.JoinHostPort("", strconv.Itoa(portNumber)),
 		CacheSize:       runtimeOptions.cacheSize,
+		ModelsCacheTTL:  runtimeOptions.modelsCacheTTL,
 		SystemPrompt:    runtimeOptions.systemPrompt,
 		MaxTokens:       runtimeOptions.maxTokens,
 		Temperature:     runtimeOptions.temperature,
@@ -58,6 +61,7 @@ func Load() (Config, error) {
 
 type runtimeOptions struct {
 	cacheSize    int
+	modelsCacheTTL time.Duration
 	systemPrompt string
 	maxTokens    int
 	temperature  float64
@@ -66,6 +70,7 @@ type runtimeOptions struct {
 func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	options := runtimeOptions{
 		cacheSize:    defaultCacheSize,
+		modelsCacheTTL: defaultModelsCacheTTL,
 		systemPrompt: defaultSystemPrompt,
 		maxTokens:    defaultMaxTokens,
 		temperature:  defaultTemperature,
@@ -81,6 +86,17 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 
 	if envValue := os.Getenv("CACHE_SYSTEM_PROMPT"); envValue != "" {
 		options.systemPrompt = envValue
+	}
+
+	if envValue := os.Getenv("CACHE_MODELS_CACHE_TTL"); envValue != "" {
+		parsedValue, err := time.ParseDuration(envValue)
+		if err != nil {
+			return runtimeOptions{}, fmt.Errorf("invalid CACHE_MODELS_CACHE_TTL %q: %w", envValue, err)
+		}
+		if parsedValue < 0 {
+			return runtimeOptions{}, fmt.Errorf("CACHE_MODELS_CACHE_TTL must be non-negative")
+		}
+		options.modelsCacheTTL = parsedValue
 	}
 
 	if envValue := os.Getenv("CACHE_MAX_TOKENS"); envValue != "" {
@@ -106,6 +122,7 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	flagSet.SetOutput(io.Discard)
 	flagSet.IntVar(&options.cacheSize, "cache-size", options.cacheSize, "maximum number of cached ask responses")
 	flagSet.IntVar(&options.cacheSize, "c", options.cacheSize, "maximum number of cached ask responses")
+	flagSet.DurationVar(&options.modelsCacheTTL, "models-cache-ttl", options.modelsCacheTTL, "how long to keep the upstream models list cached")
 	flagSet.StringVar(&options.systemPrompt, "system-prompt", options.systemPrompt, "default system prompt for ask requests")
 	flagSet.IntVar(&options.maxTokens, "max-tokens", options.maxTokens, "default max tokens for ask requests")
 	flagSet.Float64Var(&options.temperature, "temperature", options.temperature, "default temperature for ask requests")
@@ -121,6 +138,10 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 			normalizedArgs = append(normalizedArgs, "-system-prompt")
 		case len(arg) > len("--system-prompt=") && arg[:len("--system-prompt=")] == "--system-prompt=":
 			normalizedArgs = append(normalizedArgs, "-system-prompt="+arg[len("--system-prompt="):])
+		case arg == "--models-cache-ttl":
+			normalizedArgs = append(normalizedArgs, "-models-cache-ttl")
+		case len(arg) > len("--models-cache-ttl=") && arg[:len("--models-cache-ttl=")] == "--models-cache-ttl=":
+			normalizedArgs = append(normalizedArgs, "-models-cache-ttl="+arg[len("--models-cache-ttl="):])
 		case arg == "--max-tokens":
 			normalizedArgs = append(normalizedArgs, "-max-tokens")
 		case len(arg) > len("--max-tokens=") && arg[:len("--max-tokens=")] == "--max-tokens=":
@@ -139,6 +160,9 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	}
 	if options.cacheSize < 0 {
 		return runtimeOptions{}, fmt.Errorf("invalid cache size %d", options.cacheSize)
+	}
+	if options.modelsCacheTTL < 0 {
+		return runtimeOptions{}, fmt.Errorf("models-cache-ttl must be non-negative")
 	}
 	if options.maxTokens < minMaxTokens || options.maxTokens > maxMaxTokens {
 		return runtimeOptions{}, fmt.Errorf("max-tokens must be between %d and %d", minMaxTokens, maxMaxTokens)

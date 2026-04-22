@@ -22,12 +22,13 @@ import (
 const (
 	defaultVLLMURL          = "http://127.0.0.1:32080"
 	defaultCacheSize        = 100
-	defaultSystemPrompt     = "You are a concise assistant."
+	defaultModelsCacheTTL   = time.Hour
+	defaultSystemPrompt     = "You are a detailed assistant."
 	minMaxTokens            = 100
-	maxMaxTokens            = 10000
-	defaultMaxTokens        = 500
+	maxMaxTokens            = 4000
+	defaultMaxTokens        = 2500
 	defaultTemperature      = 0.2
-	defaultVLLMHTTPTimeout  = 30 * time.Second
+	defaultVLLMHTTPTimeout  = 60 * time.Second
 )
 
 type askOptions struct {
@@ -51,6 +52,11 @@ type Handler struct {
 	defaults   askOptions
 	vllmURL    string
 	httpClient *http.Client
+	sleep      func(time.Duration)
+	now        func() time.Time
+	modelsMu   sync.RWMutex
+	modelsCache *cachedModelsResponse
+	modelsCacheTTL time.Duration
 }
 
 func NewHandler() *Handler {
@@ -60,7 +66,19 @@ func NewHandler() *Handler {
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = defaultVLLMURL
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
+	handler.sleep = time.Sleep
+	handler.now = time.Now
+	handler.modelsCacheTTL = defaultModelsCacheTTL
 	return handler
+}
+
+func (h *Handler) SetModelsCacheTTL(ttl time.Duration) {
+	if ttl < 0 {
+		ttl = 0
+	}
+	h.modelsMu.Lock()
+	h.modelsCacheTTL = ttl
+	h.modelsMu.Unlock()
 }
 
 func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
@@ -88,6 +106,8 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
 	mux.HandleFunc("GET /ask", h.ask)
+	mux.HandleFunc("GET /v1/models", h.models)
+	mux.HandleFunc("POST /v1/chat/completions", h.chatCompletions)
 	return requestLogger(mux)
 }
 
@@ -102,6 +122,96 @@ func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writePlainText(w, http.StatusOK, "ready\n")
+}
+
+func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	body, statusCode, contentType, err := h.fetchModels(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("fetch vllm models: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(body)
+}
+
+func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	var requestPayload chatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&requestPayload); err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v\n", err))
+		return
+	}
+
+	if len(requestPayload.Messages) == 0 {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, "missing messages\n")
+		return
+	}
+
+	replayDelay, err := parseReplayDelay(r)
+	if err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
+		return
+	}
+
+	requestPayload, err = h.populateChatCompletionDefaults(r.Context(), requestPayload)
+	if err != nil {
+		markCacheHit(w, false)
+		http.Error(w, fmt.Sprintf("prepare chat completion: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	cacheKey, err := buildChatCompletionCacheKey(requestPayload)
+	if err != nil {
+		markCacheHit(w, false)
+		http.Error(w, fmt.Sprintf("cache chat completion request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if h.cache != nil {
+		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
+			markCacheHit(w, true)
+			if cachedResponse.streaming {
+				h.replayCachedStream(r.Context(), w, cachedResponse, replayDelay)
+				return
+			}
+
+			h.replayCachedResponse(r.Context(), w, cachedResponse, replayDelay)
+			return
+		}
+	}
+
+	markCacheHit(w, false)
+
+	if requestPayload.Stream {
+		cachedResponse, err := h.streamChatCompletion(r.Context(), w, requestPayload)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+			return
+		}
+
+		if h.cache != nil {
+			h.cache.Add(cacheKey, cachedResponse)
+		}
+		return
+	}
+
+	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	if h.cache != nil {
+		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody, contentType: contentType})
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(responseBody)
 }
 
 func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
@@ -126,17 +236,22 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	replayDelay, err := parseReplayDelay(r)
+	if err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
+		return
+	}
+
 	if h.cache != nil {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(w, cachedResponse)
+				h.replayCachedStream(r.Context(), w, cachedResponse, replayDelay)
 				return
 			}
 
-			w.Header().Set("Content-Type", cachedResponse.contentType)
-			w.WriteHeader(cachedResponse.statusCode)
-			_, _ = w.Write(cachedResponse.body)
+			h.replayCachedResponse(r.Context(), w, cachedResponse, replayDelay)
 			return
 		}
 	}
@@ -149,8 +264,22 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requestPayload := chatCompletionRequest{
+		Model: model,
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: options.systemPrompt},
+			{Role: "user", Content: query},
+		},
+		Temperature: options.temperature,
+		MaxTokens:   options.maxTokens,
+		Stream:      options.stream,
+	}
 	if options.stream {
-		cachedResponse, err := h.streamChatCompletion(r.Context(), w, model, query, options)
+		requestPayload.StreamOptions = &chatCompletionStreamOptions{IncludeUsage: true}
+	}
+
+	if options.stream {
+		cachedResponse, err := h.streamChatCompletion(r.Context(), w, requestPayload)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
 			return
@@ -162,7 +291,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), model, query, options)
+	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
 		return
@@ -216,6 +345,23 @@ func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
 	return options, nil
 }
 
+func parseReplayDelay(r *http.Request) (time.Duration, error) {
+	replayDelayRaw := r.URL.Query().Get("replay-delay-ms")
+	if replayDelayRaw == "" {
+		return 0, nil
+	}
+
+	replayDelayMS, err := strconv.Atoi(replayDelayRaw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid replay-delay-ms %q", replayDelayRaw)
+	}
+	if replayDelayMS < 0 {
+		return 0, fmt.Errorf("replay-delay-ms must be non-negative")
+	}
+
+	return time.Duration(replayDelayMS) * time.Millisecond, nil
+}
+
 func buildCacheKey(query string, options askOptions) string {
 	queryKey := standardizeCacheKey(query)
 	if queryKey == "" {
@@ -244,12 +390,20 @@ type modelsResponse struct {
 	} `json:"data"`
 }
 
+type cachedModelsResponse struct {
+	body        []byte
+	statusCode  int
+	contentType string
+	defaultModel string
+	cachedAt    time.Time
+}
+
 type chatCompletionRequest struct {
-	Model       string                   `json:"model"`
-	Messages    []chatCompletionMessage  `json:"messages"`
-	Temperature float64                  `json:"temperature"`
-	MaxTokens   int                      `json:"max_tokens"`
-	Stream      bool                     `json:"stream,omitempty"`
+	Model         string                      `json:"model"`
+	Messages      []chatCompletionMessage     `json:"messages"`
+	Temperature   float64                     `json:"temperature"`
+	MaxTokens     int                         `json:"max_tokens"`
+	Stream        bool                        `json:"stream,omitempty"`
 	StreamOptions *chatCompletionStreamOptions `json:"stream_options,omitempty"`
 }
 
@@ -263,44 +417,98 @@ type chatCompletionMessage struct {
 }
 
 func (h *Handler) fetchModel(ctx context.Context) (string, error) {
+	models, err := h.getOrFetchModels(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	return models.defaultModel, nil
+}
+
+func (h *Handler) fetchModels(ctx context.Context) ([]byte, int, string, error) {
+	models, err := h.getOrFetchModels(ctx)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	return append([]byte(nil), models.body...), models.statusCode, models.contentType, nil
+}
+
+func (h *Handler) getOrFetchModels(ctx context.Context) (cachedModelsResponse, error) {
+	h.modelsMu.RLock()
+	if h.modelsCache != nil && h.modelsCacheFreshLocked() {
+		cached := cloneCachedModelsResponse(*h.modelsCache)
+		h.modelsMu.RUnlock()
+		return cached, nil
+	}
+	h.modelsMu.RUnlock()
+
+	h.modelsMu.Lock()
+	defer h.modelsMu.Unlock()
+	if h.modelsCache != nil && h.modelsCacheFreshLocked() {
+		return cloneCachedModelsResponse(*h.modelsCache), nil
+	}
+
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, h.vllmURL+"/v1/models", nil)
 	if err != nil {
-		return "", fmt.Errorf("build models request: %w", err)
+		return cachedModelsResponse{}, fmt.Errorf("build models request: %w", err)
 	}
 
 	response, err := h.httpClient.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("send models request: %w", err)
+		return cachedModelsResponse{}, fmt.Errorf("send models request: %w", err)
 	}
 	defer response.Body.Close()
 
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return cachedModelsResponse{}, fmt.Errorf("read models response: %w", err)
+	}
+
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(response.Body)
-		return "", fmt.Errorf("models request failed with HTTP %d: %s", response.StatusCode, bytes.TrimSpace(body))
+		return cachedModelsResponse{}, fmt.Errorf("models request failed with HTTP %d: %s", response.StatusCode, bytes.TrimSpace(body))
 	}
 
-	var models modelsResponse
-	if err := json.NewDecoder(response.Body).Decode(&models); err != nil {
-		return "", fmt.Errorf("decode models response: %w", err)
+	var modelsResponseBody modelsResponse
+	if err := json.Unmarshal(body, &modelsResponseBody); err != nil {
+		return cachedModelsResponse{}, fmt.Errorf("decode models response: %w", err)
 	}
-	if len(models.Data) == 0 || models.Data[0].ID == "" {
-		return "", fmt.Errorf("models response did not include a model id")
+	if len(modelsResponseBody.Data) == 0 || modelsResponseBody.Data[0].ID == "" {
+		return cachedModelsResponse{}, fmt.Errorf("models response did not include a model id")
 	}
 
-	return models.Data[0].ID, nil
+	h.modelsCache = &cachedModelsResponse{
+		body:         append([]byte(nil), body...),
+		statusCode:   response.StatusCode,
+		contentType:  contentTypeOrDefault(response.Header.Get("Content-Type"), "application/json"),
+		defaultModel: modelsResponseBody.Data[0].ID,
+		cachedAt:     h.now(),
+	}
+
+	return cloneCachedModelsResponse(*h.modelsCache), nil
 }
 
-func (h *Handler) createChatCompletion(ctx context.Context, model, query string, options askOptions) ([]byte, int, string, error) {
-	requestPayload := chatCompletionRequest{
-		Model: model,
-		Messages: []chatCompletionMessage{
-			{Role: "system", Content: options.systemPrompt},
-			{Role: "user", Content: query},
-		},
-		Temperature: options.temperature,
-		MaxTokens:   options.maxTokens,
+func cloneCachedModelsResponse(models cachedModelsResponse) cachedModelsResponse {
+	return cachedModelsResponse{
+		body:         append([]byte(nil), models.body...),
+		statusCode:   models.statusCode,
+		contentType:  models.contentType,
+		defaultModel: models.defaultModel,
+		cachedAt:     models.cachedAt,
 	}
+}
 
+func (h *Handler) modelsCacheFreshLocked() bool {
+	if h.modelsCache == nil {
+		return false
+	}
+	if h.modelsCacheTTL == 0 {
+		return false
+	}
+	return h.now().Sub(h.modelsCache.cachedAt) < h.modelsCacheTTL
+}
+
+func (h *Handler) createChatCompletion(ctx context.Context, requestPayload chatCompletionRequest) ([]byte, int, string, error) {
 	requestBody, err := json.Marshal(requestPayload)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("marshal chat request: %w", err)
@@ -330,21 +538,7 @@ func (h *Handler) createChatCompletion(ctx context.Context, model, query string,
 	return responseBody, response.StatusCode, contentTypeOrDefault(response.Header.Get("Content-Type"), "application/json"), nil
 }
 
-func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWriter, model, query string, options askOptions) (cachedVLLMResponse, error) {
-	requestPayload := chatCompletionRequest{
-		Model: model,
-		Messages: []chatCompletionMessage{
-			{Role: "system", Content: options.systemPrompt},
-			{Role: "user", Content: query},
-		},
-		Temperature: options.temperature,
-		MaxTokens:   options.maxTokens,
-		Stream:      true,
-		StreamOptions: &chatCompletionStreamOptions{
-			IncludeUsage: true,
-		},
-	}
-
+func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWriter, requestPayload chatCompletionRequest) (cachedVLLMResponse, error) {
 	requestBody, err := json.Marshal(requestPayload)
 	if err != nil {
 		return cachedVLLMResponse{}, fmt.Errorf("marshal chat request: %w", err)
@@ -407,7 +601,28 @@ func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWrite
 	}, nil
 }
 
-func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
+func (h *Handler) populateChatCompletionDefaults(ctx context.Context, requestPayload chatCompletionRequest) (chatCompletionRequest, error) {
+	if requestPayload.Model == "" {
+		model, err := h.fetchModel(ctx)
+		if err != nil {
+			return chatCompletionRequest{}, err
+		}
+		requestPayload.Model = model
+	}
+
+	return requestPayload, nil
+}
+
+func buildChatCompletionCacheKey(requestPayload chatCompletionRequest) (string, error) {
+	requestBody, err := json.Marshal(requestPayload)
+	if err != nil {
+		return "", fmt.Errorf("marshal chat completion cache key: %w", err)
+	}
+
+	return string(requestBody), nil
+}
+
+func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, replayDelay time.Duration) {
 	w.Header().Set("Content-Type", contentTypeOrDefault(cachedResponse.contentType, "text/event-stream"))
 	w.WriteHeader(cachedResponse.statusCode)
 
@@ -415,15 +630,22 @@ func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cache
 	reader := bytes.NewReader(cachedResponse.body)
 	streamID := newChatCompletionID()
 	createdAt := time.Now().UnixMilli()
+	firstLine := true
 
 	for {
 		line, err := readSSELine(reader)
 		if len(line) > 0 {
+			if !firstLine && replayDelay > 0 {
+				if !sleepWithContext(ctx, replayDelay, h.sleep) {
+					return
+				}
+			}
 			rewritten := rewriteSSEDataLine(line, streamID, createdAt)
 			_, _ = w.Write(rewritten)
 			if flusher != nil {
 				flusher.Flush()
 			}
+			firstLine = false
 		}
 
 		if err == nil {
@@ -434,6 +656,51 @@ func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cache
 		}
 		return
 	}
+}
+
+func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, replayDelay time.Duration) {
+	completionTokens := cachedCompletionTokens(cachedResponse.body)
+	if completionTokens > 0 && replayDelay > 0 {
+		totalDelay := replayDelay * time.Duration(completionTokens)
+		if !sleepWithContext(ctx, totalDelay, h.sleep) {
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", cachedResponse.contentType)
+	w.WriteHeader(cachedResponse.statusCode)
+	_, _ = w.Write(cachedResponse.body)
+}
+
+func cachedCompletionTokens(body []byte) int {
+	var response struct {
+		Usage struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0
+	}
+	if response.Usage.CompletionTokens < 0 {
+		return 0
+	}
+	return response.Usage.CompletionTokens
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration, sleepFn func(time.Duration)) bool {
+	if delay <= 0 {
+		return true
+	}
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+	if sleepFn == nil {
+		time.Sleep(delay)
+		return ctx.Err() == nil
+	}
+	sleepFn(delay)
+	return ctx.Err() == nil
 }
 
 func readSSELine(reader io.Reader) ([]byte, error) {
