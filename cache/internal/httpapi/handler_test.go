@@ -29,6 +29,7 @@ func TestRoutes(t *testing.T) {
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"success"}}]}`},
+		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"success\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
 		{name: "ask example query", method: http.MethodGet, path: "/ask?q=what%20is%20the%20capital%20of%20Texas%3F", statusCode: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"what is the capital of Texas?"}}]}`},
 		{name: "ask custom options", method: http.MethodGet, path: "/ask?q=success&system-prompt=Be%20precise&max-tokens=700&temperature=0.7", statusCode: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"success"}}]}`},
 		{name: "ask missing q", method: http.MethodGet, path: "/ask", statusCode: http.StatusBadRequest, body: "missing q\n"},
@@ -150,6 +151,59 @@ func TestAskCachesNormalizedQueries(t *testing.T) {
 	}
 }
 
+func TestAskStreamsAndReplaysCachedStreamWithFreshMetadata(t *testing.T) {
+	vllmServer, counters := newCountingTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
+
+	firstRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil)
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, firstRequest)
+
+	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil)
+	secondRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondRecorder, secondRequest)
+
+	if firstRecorder.Code != http.StatusOK || secondRecorder.Code != http.StatusOK {
+		t.Fatalf("status codes = %d, %d, want both 200", firstRecorder.Code, secondRecorder.Code)
+	}
+	if got := counters.chat.Load(); got != 1 {
+		t.Fatalf("chat requests = %d, want 1", got)
+	}
+	if contentType := secondRecorder.Header().Get("Content-Type"); contentType != "text/event-stream" {
+		t.Fatalf("content type = %q, want %q", contentType, "text/event-stream")
+	}
+	if !strings.Contains(secondRecorder.Body.String(), "data: [DONE]") {
+		t.Fatalf("cached stream %q does not contain done marker", secondRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"content":"hello"`) {
+		t.Fatalf("cached stream %q does not contain assistant content", secondRecorder.Body.String())
+	}
+
+	firstID, firstCreated := extractFirstStreamMetadata(t, firstRecorder.Body.String())
+	secondID, secondCreated := extractFirstStreamMetadata(t, secondRecorder.Body.String())
+	if firstID == secondID {
+		t.Fatalf("cached replay id = %q, want a fresh value distinct from %q", secondID, firstID)
+	}
+	if firstCreated == secondCreated {
+		t.Fatalf("cached replay created = %d, want a fresh value distinct from %d", secondCreated, firstCreated)
+	}
+	if !strings.HasPrefix(secondID, "chatcmpl-") {
+		t.Fatalf("cached replay id = %q, want chatcmpl- prefix", secondID)
+	}
+}
+
+func TestAskDoesNotReuseCacheAcrossStreamMode(t *testing.T) {
+	vllmServer, counters := newCountingTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil))
+
+	if got := counters.chat.Load(); got != 2 {
+		t.Fatalf("chat requests = %d, want 2", got)
+	}
+}
+
 func TestAskDoesNotReuseCacheAcrossOptions(t *testing.T) {
 	vllmServer, counters := newCountingTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
@@ -213,17 +267,18 @@ func TestParseAskOptions(t *testing.T) {
 		{
 			name: "defaults",
 			path: "/ask?q=hello",
-			want: askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature},
+			want: askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature, stream: false},
 		},
 		{
 			name: "custom values",
-			path: "/ask?q=hello&system-prompt=Be%20precise&max-tokens=700&temperature=0.7",
-			want: askOptions{systemPrompt: "Be precise", maxTokens: 700, temperature: 0.7},
+			path: "/ask?q=hello&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true",
+			want: askOptions{systemPrompt: "Be precise", maxTokens: 700, temperature: 0.7, stream: true},
 		},
 		{name: "invalid max tokens low", path: "/ask?q=hello&max-tokens=99", wantErr: "max-tokens must be between 100 and 10000"},
 		{name: "invalid max tokens high", path: "/ask?q=hello&max-tokens=10001", wantErr: "max-tokens must be between 100 and 10000"},
 		{name: "invalid max tokens format", path: "/ask?q=hello&max-tokens=abc", wantErr: "invalid max-tokens \"abc\""},
 		{name: "invalid temperature format", path: "/ask?q=hello&temperature=abc", wantErr: "invalid temperature \"abc\""},
+		{name: "invalid stream format", path: "/ask?q=hello&stream=maybe", wantErr: "invalid stream \"maybe\""},
 	}
 
 	for _, test := range tests {
@@ -556,6 +611,7 @@ type capturedChatRequest struct {
 	SystemPrompt string
 	Temperature  float64
 	UserContent  string
+	Stream       bool
 }
 
 func newCountingTestVLLMServer(t *testing.T) (*httptest.Server, *vllmCounters) {
@@ -572,24 +628,25 @@ func newCountingTestVLLMServer(t *testing.T) (*httptest.Server, *vllmCounters) {
 			_, _ = w.Write([]byte(`{"data":[{"id":"test-model"}]}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 			counters.chat.Add(1)
-			var requestBody map[string]any
+			var requestBody chatCompletionRequest
 			if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
 				t.Fatalf("decode request body: %v", err)
 			}
 
-			messages, ok := requestBody["messages"].([]any)
-			if !ok || len(messages) < 2 {
-				t.Fatalf("messages = %#v, want at least two messages", requestBody["messages"])
+			if len(requestBody.Messages) < 2 {
+				t.Fatalf("messages = %#v, want at least two messages", requestBody.Messages)
 			}
-
-			userMessage, ok := messages[1].(map[string]any)
-			if !ok {
-				t.Fatalf("user message = %#v, want map", messages[1])
-			}
-
-			content, _ := userMessage["content"].(string)
+			content := requestBody.Messages[1].Content
 			mu.Lock()
 			defer mu.Unlock()
+			if requestBody.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + content + "\"},\"finish_reason\":null}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\n"))
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				return
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + content + `"}}]}`))
 		default:
@@ -634,8 +691,17 @@ func newCapturingTestVLLMServer(t *testing.T) (*httptest.Server, *[]capturedChat
 				UserContent:  requestBody.Messages[1].Content,
 				Temperature:  requestBody.Temperature,
 				MaxTokens:    requestBody.MaxTokens,
+				Stream:       requestBody.Stream,
 			})
 			mu.Unlock()
+
+			if requestBody.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + requestBody.Messages[1].Content + "\"},\"finish_reason\":null}]}\n\n"))
+				_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\n"))
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				return
+			}
 
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + requestBody.Messages[1].Content + `"}}]}`))
@@ -645,4 +711,26 @@ func newCapturingTestVLLMServer(t *testing.T) (*httptest.Server, *[]capturedChat
 	}))
 
 	return server, &captured
+}
+
+func extractFirstStreamMetadata(t *testing.T, body string) (string, int64) {
+	t.Helper()
+
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+
+		var chunk struct {
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
+			t.Fatalf("decode stream chunk %q: %v", line, err)
+		}
+		return chunk.ID, chunk.Created
+	}
+
+	t.Fatalf("stream body %q did not contain a data chunk", body)
+	return "", 0
 }

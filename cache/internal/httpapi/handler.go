@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"container/list"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +34,7 @@ type askOptions struct {
 	systemPrompt string
 	maxTokens    int
 	temperature  float64
+	stream       bool
 }
 
 func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askOptions {
@@ -126,7 +129,12 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 	if h.cache != nil {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
-			w.Header().Set("Content-Type", "application/json")
+			if cachedResponse.streaming {
+				h.replayCachedStream(w, cachedResponse)
+				return
+			}
+
+			w.Header().Set("Content-Type", cachedResponse.contentType)
 			w.WriteHeader(cachedResponse.statusCode)
 			_, _ = w.Write(cachedResponse.body)
 			return
@@ -141,17 +149,30 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseBody, statusCode, err := h.createChatCompletion(r.Context(), model, query, options)
+	if options.stream {
+		cachedResponse, err := h.streamChatCompletion(r.Context(), w, model, query, options)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
+			return
+		}
+
+		if h.cache != nil {
+			h.cache.Add(cacheKey, cachedResponse)
+		}
+		return
+	}
+
+	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), model, query, options)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("query vllm: %v", err), http.StatusBadGateway)
 		return
 	}
 
 	if h.cache != nil {
-		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody})
+		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody, contentType: contentType})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(responseBody)
 }
@@ -184,6 +205,14 @@ func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
 		options.temperature = temperature
 	}
 
+	if streamRaw := queryValues.Get("stream"); streamRaw != "" {
+		stream, err := strconv.ParseBool(streamRaw)
+		if err != nil {
+			return askOptions{}, fmt.Errorf("invalid stream %q", streamRaw)
+		}
+		options.stream = stream
+	}
+
 	return options, nil
 }
 
@@ -193,7 +222,7 @@ func buildCacheKey(query string, options askOptions) string {
 		return ""
 	}
 
-	return fmt.Sprintf("%s|%s|%d|%.6f", queryKey, standardizeCacheKey(options.systemPrompt), options.maxTokens, options.temperature)
+	return fmt.Sprintf("%s|%s|%d|%.6f|%t", queryKey, standardizeCacheKey(options.systemPrompt), options.maxTokens, options.temperature, options.stream)
 }
 
 func standardizeCacheKey(query string) string {
@@ -220,6 +249,12 @@ type chatCompletionRequest struct {
 	Messages    []chatCompletionMessage  `json:"messages"`
 	Temperature float64                  `json:"temperature"`
 	MaxTokens   int                      `json:"max_tokens"`
+	Stream      bool                     `json:"stream,omitempty"`
+	StreamOptions *chatCompletionStreamOptions `json:"stream_options,omitempty"`
+}
+
+type chatCompletionStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatCompletionMessage struct {
@@ -255,7 +290,7 @@ func (h *Handler) fetchModel(ctx context.Context) (string, error) {
 	return models.Data[0].ID, nil
 }
 
-func (h *Handler) createChatCompletion(ctx context.Context, model, query string, options askOptions) ([]byte, int, error) {
+func (h *Handler) createChatCompletion(ctx context.Context, model, query string, options askOptions) ([]byte, int, string, error) {
 	requestPayload := chatCompletionRequest{
 		Model: model,
 		Messages: []chatCompletionMessage{
@@ -268,31 +303,212 @@ func (h *Handler) createChatCompletion(ctx context.Context, model, query string,
 
 	requestBody, err := json.Marshal(requestPayload)
 	if err != nil {
-		return nil, 0, fmt.Errorf("marshal chat request: %w", err)
+		return nil, 0, "", fmt.Errorf("marshal chat request: %w", err)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, h.vllmURL+"/v1/chat/completions", bytes.NewReader(requestBody))
 	if err != nil {
-		return nil, 0, fmt.Errorf("build chat request: %w", err)
+		return nil, 0, "", fmt.Errorf("build chat request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := h.httpClient.Do(request)
 	if err != nil {
-		return nil, 0, fmt.Errorf("send chat request: %w", err)
+		return nil, 0, "", fmt.Errorf("send chat request: %w", err)
 	}
 	defer response.Body.Close()
 
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("read chat response: %w", err)
+		return nil, 0, "", fmt.Errorf("read chat response: %w", err)
 	}
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, 0, fmt.Errorf("chat request failed with HTTP %d: %s", response.StatusCode, bytes.TrimSpace(responseBody))
+		return nil, 0, "", fmt.Errorf("chat request failed with HTTP %d: %s", response.StatusCode, bytes.TrimSpace(responseBody))
 	}
 
-	return responseBody, response.StatusCode, nil
+	return responseBody, response.StatusCode, contentTypeOrDefault(response.Header.Get("Content-Type"), "application/json"), nil
+}
+
+func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWriter, model, query string, options askOptions) (cachedVLLMResponse, error) {
+	requestPayload := chatCompletionRequest{
+		Model: model,
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: options.systemPrompt},
+			{Role: "user", Content: query},
+		},
+		Temperature: options.temperature,
+		MaxTokens:   options.maxTokens,
+		Stream:      true,
+		StreamOptions: &chatCompletionStreamOptions{
+			IncludeUsage: true,
+		},
+	}
+
+	requestBody, err := json.Marshal(requestPayload)
+	if err != nil {
+		return cachedVLLMResponse{}, fmt.Errorf("marshal chat request: %w", err)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, h.vllmURL+"/v1/chat/completions", bytes.NewReader(requestBody))
+	if err != nil {
+		return cachedVLLMResponse{}, fmt.Errorf("build chat request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := h.httpClient.Do(request)
+	if err != nil {
+		return cachedVLLMResponse{}, fmt.Errorf("send chat request: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		responseBody, readErr := io.ReadAll(response.Body)
+		if readErr != nil {
+			return cachedVLLMResponse{}, fmt.Errorf("read chat response: %w", readErr)
+		}
+		return cachedVLLMResponse{}, fmt.Errorf("chat request failed with HTTP %d: %s", response.StatusCode, bytes.TrimSpace(responseBody))
+	}
+
+	contentType := contentTypeOrDefault(response.Header.Get("Content-Type"), "text/event-stream")
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(response.StatusCode)
+
+	flusher, _ := w.(http.Flusher)
+	reader := response.Body
+	var buffer bytes.Buffer
+
+	for {
+		line, readErr := readSSELine(reader)
+		if len(line) > 0 {
+			buffer.Write(line)
+			if _, writeErr := w.Write(line); writeErr != nil {
+				return cachedVLLMResponse{}, fmt.Errorf("write stream response: %w", writeErr)
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if readErr == io.EOF {
+			break
+		}
+		return cachedVLLMResponse{}, fmt.Errorf("read chat stream: %w", readErr)
+	}
+
+	return cachedVLLMResponse{
+		statusCode:  response.StatusCode,
+		body:        buffer.Bytes(),
+		contentType: contentType,
+		streaming:   true,
+	}, nil
+}
+
+func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
+	w.Header().Set("Content-Type", contentTypeOrDefault(cachedResponse.contentType, "text/event-stream"))
+	w.WriteHeader(cachedResponse.statusCode)
+
+	flusher, _ := w.(http.Flusher)
+	reader := bytes.NewReader(cachedResponse.body)
+	streamID := newChatCompletionID()
+	createdAt := time.Now().UnixMilli()
+
+	for {
+		line, err := readSSELine(reader)
+		if len(line) > 0 {
+			rewritten := rewriteSSEDataLine(line, streamID, createdAt)
+			_, _ = w.Write(rewritten)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		if err == nil {
+			continue
+		}
+		if err == io.EOF {
+			return
+		}
+		return
+	}
+}
+
+func readSSELine(reader io.Reader) ([]byte, error) {
+	if byteReader, ok := reader.(interface{ ReadBytes(byte) ([]byte, error) }); ok {
+		return byteReader.ReadBytes('\n')
+	}
+
+	buf := make([]byte, 1)
+	var line []byte
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			line = append(line, buf[:n]...)
+			if buf[0] == '\n' {
+				return line, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF && len(line) > 0 {
+				return line, io.EOF
+			}
+			return line, err
+		}
+	}
+}
+
+func rewriteSSEDataLine(line []byte, streamID string, createdAt int64) []byte {
+	trimmed := bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return line
+	}
+
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return line
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return line
+	}
+
+	body["id"] = streamID
+	body["created"] = createdAt
+	rewrittenPayload, err := json.Marshal(body)
+	if err != nil {
+		return line
+	}
+
+	return append(append([]byte("data: "), rewrittenPayload...), lineEnding(line)...)
+}
+
+func lineEnding(line []byte) []byte {
+	if bytes.HasSuffix(line, []byte("\r\n")) {
+		return []byte("\r\n")
+	}
+	if bytes.HasSuffix(line, []byte("\n")) {
+		return []byte("\n")
+	}
+	return nil
+}
+
+func newChatCompletionID() string {
+	randomBytes := make([]byte, 8)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	return "chatcmpl-" + hex.EncodeToString(randomBytes)
+}
+
+func contentTypeOrDefault(contentType, defaultValue string) string {
+	if strings.TrimSpace(contentType) == "" {
+		return defaultValue
+	}
+	return contentType
 }
 
 func writePlainText(w http.ResponseWriter, status int, body string) {
@@ -371,8 +587,10 @@ func requestLogger(next http.Handler) http.Handler {
 }
 
 type cachedVLLMResponse struct {
-	statusCode int
-	body       []byte
+	statusCode  int
+	body        []byte
+	contentType string
+	streaming   bool
 }
 
 type lruCache struct {
@@ -411,8 +629,10 @@ func (c *lruCache) Get(key string) (cachedVLLMResponse, bool) {
 	c.items.MoveToFront(element)
 	entry := element.Value.(*cacheEntry)
 	return cachedVLLMResponse{
-		statusCode: entry.value.statusCode,
-		body:       append([]byte(nil), entry.value.body...),
+		statusCode:  entry.value.statusCode,
+		body:        append([]byte(nil), entry.value.body...),
+		contentType: entry.value.contentType,
+		streaming:   entry.value.streaming,
 	}, true
 }
 
@@ -423,15 +643,17 @@ func (c *lruCache) Add(key string, value cachedVLLMResponse) {
 	if element, ok := c.entries[key]; ok {
 		c.items.MoveToFront(element)
 		entry := element.Value.(*cacheEntry)
-		entry.value = cachedVLLMResponse{statusCode: value.statusCode, body: append([]byte(nil), value.body...)}
+		entry.value = cachedVLLMResponse{statusCode: value.statusCode, body: append([]byte(nil), value.body...), contentType: value.contentType, streaming: value.streaming}
 		return
 	}
 
 	element := c.items.PushFront(&cacheEntry{
 		key: key,
 		value: cachedVLLMResponse{
-			statusCode: value.statusCode,
-			body:       append([]byte(nil), value.body...),
+			statusCode:  value.statusCode,
+			body:        append([]byte(nil), value.body...),
+			contentType: value.contentType,
+			streaming:   value.streaming,
 		},
 	})
 	c.entries[key] = element
