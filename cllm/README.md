@@ -1,6 +1,6 @@
-# cache
+# cllm
 
-`cache` is a small Go web server that listens on port `8080` by default.
+`cllm` is a small Go web server that listens on port `8080` by default.
 
 ## Endpoints
 
@@ -12,20 +12,20 @@
 ## Run locally
 
 ```bash
-go run ./cmd/cache
+go run ./cmd/cllm
 ```
 
 Or with an explicit port:
 
 ```bash
-CACHE_PORT=8081 go run ./cmd/cache
+CACHE_PORT=8081 go run ./cmd/cllm
 ```
 
 Show help or version:
 
 ```bash
-go run ./cmd/cache --help
-go run ./cmd/cache --version
+go run ./cmd/cllm --help
+go run ./cmd/cllm --version
 ```
 
 ## Runtime Configuration
@@ -44,7 +44,7 @@ The server supports these runtime settings:
 Example:
 
 ```bash
-CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_MODELS_CACHE_TTL=30m CACHE_REPLAY_DELAY=20ms go run ./cmd/cache --cache-size 200 --models-cache-ttl 15m --replay-delay 10ms
+CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_MODELS_CACHE_TTL=30m CACHE_REPLAY_DELAY=20ms go run ./cmd/cllm --cache-size 200 --models-cache-ttl 15m --replay-delay 10ms
 ```
 
 You can inspect or update the live handler config at runtime:
@@ -56,7 +56,7 @@ curl 'http://127.0.0.1:8080/config?system-prompt=Be%20precise&max-tokens=700&tem
 ## Build
 
 ```bash
-go build -o bin/cache ./cmd/cache
+go build -o bin/cllm ./cmd/cllm
 ```
 
 ## Test
@@ -68,6 +68,6 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cache .
-docker run --rm -p 8080:8080 cache
+docker build -t cllm .
+docker run --rm -p 8080:8080 cllm
 ```

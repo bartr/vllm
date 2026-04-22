@@ -69,7 +69,7 @@ func LoadFromArgs(args []string) (Config, error) {
 
 func Usage() string {
 	var builder strings.Builder
-	builder.WriteString("Usage: cache [options]\n\n")
+	builder.WriteString("Usage: cllm [options]\n\n")
 	builder.WriteString("Options:\n")
 	builder.WriteString("  -h, --help                  Show this help message and exit\n")
 	builder.WriteString("      --version               Show version information and exit\n")
@@ -163,7 +163,7 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 		options.temperature = parsedValue
 	}
 
-	flagSet := flag.NewFlagSet("cache", flag.ContinueOnError)
+	flagSet := flag.NewFlagSet("cllm", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 	flagSet.IntVar(&options.cacheSize, "cache-size", options.cacheSize, "maximum number of cached ask responses")
 	flagSet.IntVar(&options.cacheSize, "c", options.cacheSize, "maximum number of cached ask responses")

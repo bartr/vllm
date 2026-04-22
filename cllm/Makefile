@@ -1,13 +1,13 @@
 GO ?= go
-BINARY ?= cache
+BINARY ?= cllm
 
 .PHONY: build run test fmt clean
 
 build:
-	$(GO) build -o bin/$(BINARY) ./cmd/cache
+	$(GO) build -o bin/$(BINARY) ./cmd/cllm
 
 run:
-	$(GO) run ./cmd/cache
+	$(GO) run ./cmd/cllm
 
 test:
 	$(GO) test ./...

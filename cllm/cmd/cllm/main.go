@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"cache/internal/buildinfo"
-	"cache/internal/config"
-	"cache/internal/httpapi"
+	"cllm/internal/buildinfo"
+	"cllm/internal/config"
+	"cllm/internal/httpapi"
 )
 
 func main() {
@@ -27,7 +27,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if hasVersionFlag(args) {
-		_, _ = fmt.Fprintf(stdout, "cache %s\n", buildinfo.Version)
+		_, _ = fmt.Fprintf(stdout, "cllm %s\n", buildinfo.Version)
 		return 0
 	}
 

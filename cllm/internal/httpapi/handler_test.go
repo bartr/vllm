@@ -2,7 +2,7 @@ package httpapi
 
 import (
 	"bytes"
-	"cache/internal/config"
+	"cllm/internal/config"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -628,7 +628,7 @@ func TestConfigEndpointRejectsInvalidValues(t *testing.T) {
 func TestLoadConfigCacheSize(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache"}
+	os.Args = []string{"cllm"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -646,7 +646,7 @@ func TestLoadConfigCacheSize(t *testing.T) {
 func TestLoadConfigModelsCacheTTL(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache"}
+	os.Args = []string{"cllm"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -664,7 +664,7 @@ func TestLoadConfigModelsCacheTTL(t *testing.T) {
 func TestLoadConfigModelsCacheTTLFlagPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache", "--models-cache-ttl", "15m"}
+	os.Args = []string{"cllm", "--models-cache-ttl", "15m"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -682,7 +682,7 @@ func TestLoadConfigModelsCacheTTLFlagPrecedence(t *testing.T) {
 func TestLoadConfigReplayDelay(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache"}
+	os.Args = []string{"cllm"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -700,7 +700,7 @@ func TestLoadConfigReplayDelay(t *testing.T) {
 func TestLoadConfigReplayDelayFlagPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache", "--replay-delay", "15ms"}
+	os.Args = []string{"cllm", "--replay-delay", "15ms"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -718,7 +718,7 @@ func TestLoadConfigReplayDelayFlagPrecedence(t *testing.T) {
 func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache", "--cache-size", "7"}
+	os.Args = []string{"cllm", "--cache-size", "7"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -736,7 +736,7 @@ func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 func TestLoadConfigShortCacheSizeFlag(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache", "-c", "0"}
+	os.Args = []string{"cllm", "-c", "0"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -758,10 +758,10 @@ func TestLoadConfigInvalidCacheSize(t *testing.T) {
 		env     string
 		wantErr string
 	}{
-		{name: "negative flag", args: []string{"cache", "--cache-size", "-1"}, wantErr: "invalid cache size -1"},
-		{name: "non integer flag", args: []string{"cache", "--cache-size", "abc"}, wantErr: "invalid runtime flag"},
-		{name: "negative env", args: []string{"cache"}, env: "-1", wantErr: "invalid CACHE_CACHE_SIZE \"-1\""},
-		{name: "non integer env", args: []string{"cache"}, env: "abc", wantErr: "invalid CACHE_CACHE_SIZE \"abc\""},
+		{name: "negative flag", args: []string{"cllm", "--cache-size", "-1"}, wantErr: "invalid cache size -1"},
+		{name: "non integer flag", args: []string{"cllm", "--cache-size", "abc"}, wantErr: "invalid runtime flag"},
+		{name: "negative env", args: []string{"cllm"}, env: "-1", wantErr: "invalid CACHE_CACHE_SIZE \"-1\""},
+		{name: "non integer env", args: []string{"cllm"}, env: "abc", wantErr: "invalid CACHE_CACHE_SIZE \"abc\""},
 	}
 
 	for _, test := range tests {
@@ -792,9 +792,9 @@ func TestLoadConfigInvalidModelsCacheTTL(t *testing.T) {
 		env     string
 		wantErr string
 	}{
-		{name: "invalid flag", args: []string{"cache", "--models-cache-ttl", "nope"}, wantErr: "invalid runtime flag"},
-		{name: "invalid env", args: []string{"cache"}, env: "nope", wantErr: "invalid CACHE_MODELS_CACHE_TTL \"nope\""},
-		{name: "negative env", args: []string{"cache"}, env: "-1s", wantErr: "CACHE_MODELS_CACHE_TTL must be non-negative"},
+		{name: "invalid flag", args: []string{"cllm", "--models-cache-ttl", "nope"}, wantErr: "invalid runtime flag"},
+		{name: "invalid env", args: []string{"cllm"}, env: "nope", wantErr: "invalid CACHE_MODELS_CACHE_TTL \"nope\""},
+		{name: "negative env", args: []string{"cllm"}, env: "-1s", wantErr: "CACHE_MODELS_CACHE_TTL must be non-negative"},
 	}
 
 	for _, test := range tests {
@@ -827,9 +827,9 @@ func TestLoadConfigInvalidReplayDelay(t *testing.T) {
 		env     string
 		wantErr string
 	}{
-		{name: "invalid flag", args: []string{"cache", "--replay-delay", "nope"}, wantErr: "invalid runtime flag"},
-		{name: "invalid env", args: []string{"cache"}, env: "nope", wantErr: "invalid CACHE_REPLAY_DELAY \"nope\""},
-		{name: "negative env", args: []string{"cache"}, env: "-1s", wantErr: "CACHE_REPLAY_DELAY must be non-negative"},
+		{name: "invalid flag", args: []string{"cllm", "--replay-delay", "nope"}, wantErr: "invalid runtime flag"},
+		{name: "invalid env", args: []string{"cllm"}, env: "nope", wantErr: "invalid CACHE_REPLAY_DELAY \"nope\""},
+		{name: "negative env", args: []string{"cllm"}, env: "-1s", wantErr: "CACHE_REPLAY_DELAY must be non-negative"},
 	}
 
 	for _, test := range tests {
@@ -900,7 +900,7 @@ func TestAskWithCacheDisabled(t *testing.T) {
 func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache"}
+	os.Args = []string{"cllm"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -926,7 +926,7 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cache", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
+	os.Args = []string{"cllm", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
@@ -957,11 +957,11 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 		envVal  string
 		wantErr string
 	}{
-		{name: "invalid env max tokens", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
-		{name: "env max tokens out of range", args: []string{"cache"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
-		{name: "invalid env temperature", args: []string{"cache"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
-		{name: "flag max tokens out of range", args: []string{"cache", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
-		{name: "invalid flag temperature", args: []string{"cache", "--temperature", "nope"}, wantErr: "invalid runtime flag"},
+		{name: "invalid env max tokens", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
+		{name: "env max tokens out of range", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
+		{name: "invalid env temperature", args: []string{"cllm"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
+		{name: "flag max tokens out of range", args: []string{"cllm", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
+		{name: "invalid flag temperature", args: []string{"cllm", "--temperature", "nope"}, wantErr: "invalid runtime flag"},
 	}
 
 	for _, test := range tests {
