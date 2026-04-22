@@ -35,7 +35,14 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		logger.Info("server starting", "addr", cfg.Addr, "cache_size", cfg.CacheSize, "max_tokens", cfg.MaxTokens, "temperature", cfg.Temperature)
+		logger.Info(
+			"server starting",
+			"addr", cfg.Addr,
+			"cache_size", cfg.CacheSize,
+			"system_prompt", cfg.SystemPrompt,
+			"max_tokens", cfg.MaxTokens,
+			"temperature", cfg.Temperature,
+		)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrCh <- err
