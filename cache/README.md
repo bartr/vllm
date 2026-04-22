@@ -20,6 +20,13 @@ Or with an explicit port:
 PORT=8081 go run ./cmd/cache
 ```
 
+Show help or version:
+
+```bash
+go run ./cmd/cache --help
+go run ./cmd/cache --version
+```
+
 ## Runtime Configuration
 
 The server supports these runtime settings:
@@ -29,6 +36,8 @@ The server supports these runtime settings:
 - `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for `/ask`
 - `CACHE_MAX_TOKENS` or `--max-tokens`: default max tokens for `/ask`
 - `CACHE_TEMPERATURE` or `--temperature`: default temperature for `/ask`
+- `-h` or `--help`: show command usage and exit
+- `--version`: show the application version and exit
 
 Example:
 

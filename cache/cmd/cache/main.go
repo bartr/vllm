@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,14 +16,29 @@ import (
 	"cache/internal/httpapi"
 )
 
+var version = "dev"
+
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	if hasHelpFlag(args) {
+		_, _ = fmt.Fprint(stdout, config.Usage())
+		return 0
+	}
+	if hasVersionFlag(args) {
+		_, _ = fmt.Fprintf(stdout, "cache %s\n", version)
+		return 0
+	}
+
+	logger := slog.New(slog.NewTextHandler(stdout, nil))
 	slog.SetDefault(logger)
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadFromArgs(args)
 	if err != nil {
 		logger.Error("load config", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
@@ -60,9 +77,9 @@ func main() {
 	case err := <-serverErrCh:
 		if err != nil {
 			logger.Error("server stopped unexpectedly", "err", err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	case <-signalCtx.Done():
 		logger.Info("shutdown signal received")
 	}
@@ -72,13 +89,32 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	if err := <-serverErrCh; err != nil {
 		logger.Error("server returned an error during shutdown", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	logger.Info("server stopped")
+	return 0
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasVersionFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--version" {
+			return true
+		}
+	}
+	return false
 }

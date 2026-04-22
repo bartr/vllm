@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -31,7 +32,11 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	runtimeOptions, err := loadRuntimeOptions(os.Args[1:])
+	return LoadFromArgs(os.Args[1:])
+}
+
+func LoadFromArgs(args []string) (Config, error) {
+	runtimeOptions, err := loadRuntimeOptions(args)
 	if err != nil {
 		return Config{}, err
 	}
@@ -57,6 +62,28 @@ func Load() (Config, error) {
 		Temperature:     runtimeOptions.temperature,
 		ShutdownTimeout: shutdownTimeout,
 	}, nil
+}
+
+func Usage() string {
+	var builder strings.Builder
+	builder.WriteString("Usage: cache [options]\n\n")
+	builder.WriteString("Options:\n")
+	builder.WriteString("  -h, --help                  Show this help message and exit\n")
+	builder.WriteString("      --version               Show version information and exit\n")
+	builder.WriteString("  -c, --cache-size int        Maximum number of cached chat responses\n")
+	builder.WriteString("      --models-cache-ttl d    How long to keep the upstream /v1/models response cached (default 1h)\n")
+	builder.WriteString("      --system-prompt string  Default system prompt for /ask\n")
+	builder.WriteString("      --max-tokens int        Default max tokens for /ask\n")
+	builder.WriteString("      --temperature float     Default temperature for /ask\n\n")
+	builder.WriteString("Environment:\n")
+	builder.WriteString("  PORT\n")
+	builder.WriteString("  SHUTDOWN_TIMEOUT\n")
+	builder.WriteString("  CACHE_CACHE_SIZE\n")
+	builder.WriteString("  CACHE_MODELS_CACHE_TTL\n")
+	builder.WriteString("  CACHE_SYSTEM_PROMPT\n")
+	builder.WriteString("  CACHE_MAX_TOKENS\n")
+	builder.WriteString("  CACHE_TEMPERATURE\n")
+	return builder.String()
 }
 
 type runtimeOptions struct {
