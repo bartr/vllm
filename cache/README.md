@@ -7,6 +7,7 @@
 - `GET /healthz` returns `ok`
 - `GET /readyz` returns `ready`
 - `GET /ask` returns `success`
+- `GET /config` returns the live handler config and applies any supported query string updates before printing it
 
 ## Run locally
 
@@ -44,6 +45,12 @@ Example:
 
 ```bash
 CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_MODELS_CACHE_TTL=30m CACHE_REPLAY_DELAY=20ms go run ./cmd/cache --cache-size 200 --models-cache-ttl 15m --replay-delay 10ms
+```
+
+You can inspect or update the live handler config at runtime:
+
+```bash
+curl 'http://127.0.0.1:8080/config?system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true&replay-delay=5ms&models-cache-ttl=30m'
 ```
 
 ## Build

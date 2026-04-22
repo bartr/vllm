@@ -49,6 +49,7 @@ func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askO
 type Handler struct {
 	ready      atomic.Bool
 	cache      *lruCache
+	configMu   sync.RWMutex
 	defaults   askOptions
 	replayDelay time.Duration
 	vllmURL    string
@@ -112,12 +113,22 @@ func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSi
 
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /config", h.config)
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
 	mux.HandleFunc("GET /ask", h.ask)
 	mux.HandleFunc("GET /v1/models", h.models)
 	mux.HandleFunc("POST /v1/chat/completions", h.chatCompletions)
 	return requestLogger(mux)
+}
+
+type runtimeConfig struct {
+	SystemPrompt   string  `json:"system_prompt"`
+	MaxTokens      int     `json:"max_tokens"`
+	Temperature    float64 `json:"temperature"`
+	Stream         bool    `json:"stream"`
+	ReplayDelay    string  `json:"replay_delay"`
+	ModelsCacheTTL string  `json:"models_cache_ttl"`
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -131,6 +142,17 @@ func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writePlainText(w, http.StatusOK, "ready\n")
+}
+
+func (h *Handler) config(w http.ResponseWriter, r *http.Request) {
+	if _, err := h.applyConfigQuery(r); err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
+		return
+	}
+
+	markCacheHit(w, false)
+	writeJSON(w, http.StatusOK, h.currentConfig())
 }
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
@@ -177,11 +199,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse, h.replayDelay)
+				h.replayCachedStream(r.Context(), w, cachedResponse, h.getReplayDelay())
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse, h.replayDelay)
+			h.replayCachedResponse(r.Context(), w, cachedResponse, h.getReplayDelay())
 			return
 		}
 	}
@@ -224,7 +246,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	options, err := parseAskOptions(r, h.defaults)
+	options, err := parseAskOptions(r, h.getDefaults())
 	if err != nil {
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
@@ -242,11 +264,11 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse, h.replayDelay)
+				h.replayCachedStream(r.Context(), w, cachedResponse, h.getReplayDelay())
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse, h.replayDelay)
+			h.replayCachedResponse(r.Context(), w, cachedResponse, h.getReplayDelay())
 			return
 		}
 	}
@@ -338,6 +360,82 @@ func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
 	}
 
 	return options, nil
+}
+
+func (h *Handler) getDefaults() askOptions {
+	h.configMu.RLock()
+	defer h.configMu.RUnlock()
+	return h.defaults
+}
+
+func (h *Handler) getReplayDelay() time.Duration {
+	h.configMu.RLock()
+	defer h.configMu.RUnlock()
+	return h.replayDelay
+}
+
+func (h *Handler) currentConfig() runtimeConfig {
+	defaults := h.getDefaults()
+	replayDelay := h.getReplayDelay()
+
+	h.modelsMu.RLock()
+	modelsCacheTTL := h.modelsCacheTTL
+	h.modelsMu.RUnlock()
+
+	return runtimeConfig{
+		SystemPrompt:   defaults.systemPrompt,
+		MaxTokens:      defaults.maxTokens,
+		Temperature:    defaults.temperature,
+		Stream:         defaults.stream,
+		ReplayDelay:    replayDelay.String(),
+		ModelsCacheTTL: modelsCacheTTL.String(),
+	}
+}
+
+func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
+	queryValues := r.URL.Query()
+	if len(queryValues) == 0 {
+		return false, nil
+	}
+
+	defaults, err := parseAskOptions(r, h.getDefaults())
+	if err != nil {
+		return false, err
+	}
+
+	replayDelay := h.getReplayDelay()
+	if replayDelayRaw := queryValues.Get("replay-delay"); replayDelayRaw != "" {
+		parsed, err := time.ParseDuration(replayDelayRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid replay-delay %q: %w", replayDelayRaw, err)
+		}
+		if parsed < 0 {
+			return false, fmt.Errorf("replay-delay must be non-negative")
+		}
+		replayDelay = parsed
+	}
+
+	h.modelsMu.RLock()
+	modelsCacheTTL := h.modelsCacheTTL
+	h.modelsMu.RUnlock()
+	if modelsCacheTTLRaw := queryValues.Get("models-cache-ttl"); modelsCacheTTLRaw != "" {
+		parsed, err := time.ParseDuration(modelsCacheTTLRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid models-cache-ttl %q: %w", modelsCacheTTLRaw, err)
+		}
+		if parsed < 0 {
+			return false, fmt.Errorf("models-cache-ttl must be non-negative")
+		}
+		modelsCacheTTL = parsed
+	}
+
+	h.configMu.Lock()
+	h.defaults = defaults
+	h.replayDelay = replayDelay
+	h.configMu.Unlock()
+	h.SetModelsCacheTTL(modelsCacheTTL)
+
+	return true, nil
 }
 
 func buildCacheKey(query string, options askOptions) string {
@@ -760,6 +858,12 @@ func writePlainText(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(body))
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 type loggingResponseWriter struct {
