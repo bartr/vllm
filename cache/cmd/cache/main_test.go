@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"cache/internal/buildinfo"
+	"cache/internal/config"
 )
 
 func TestRunHelp(t *testing.T) {
@@ -62,5 +65,19 @@ func TestRunVersion(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestNewServerDisablesWriteTimeoutForStreaming(t *testing.T) {
+	server := newServer(config.Config{Addr: ":8080"}, http.NewServeMux())
+
+	if server.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %s, want 0", server.WriteTimeout)
+	}
+	if server.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s, want %s", server.ReadHeaderTimeout, 5*time.Second)
+	}
+	if server.IdleTimeout != 60*time.Second {
+		t.Fatalf("IdleTimeout = %s, want %s", server.IdleTimeout, 60*time.Second)
 	}
 }

@@ -82,13 +82,10 @@ request_body=$(jq -n \
   }')
 response_body=$(mktemp)
 http_code_file=$(mktemp)
-cleanup() {
-  rm -f "$response_body" "$http_code_file"
-}
-trap cleanup EXIT
+stream_fifo=$(mktemp -u)
+mkfifo "$stream_fifo"
 
-curl "${curl_args[@]}" \
-  -o >(tee "$response_body" | python3 -c '
+tee "$response_body" < "$stream_fifo" | python3 -c '
 import json
 import os
 import sys
@@ -115,11 +112,29 @@ for raw_line in sys.stdin:
         if content:
             sys.stdout.write(content)
             sys.stdout.flush()
-' ) \
+' &
+consumer_pid=$!
+
+cleanup() {
+  rm -f "$response_body" "$http_code_file"
+  if [[ -p "$stream_fifo" ]]; then
+    rm -f "$stream_fifo"
+  fi
+}
+trap cleanup EXIT
+
+curl "${curl_args[@]}" \
+  -o "$stream_fifo" \
   -w '%{http_code}' \
   -H 'Content-Type: application/json' \
   -d "$request_body" \
   "$CACHE_URL/v1/chat/completions" > "$http_code_file"
+
+if ! wait "$consumer_pid"; then
+  echo "Failed to process streamed response." >&2
+  exit 1
+fi
+
 end_ms=$(date +%s%3N)
 elapsed_ms=$((end_ms - start_ms))
 http_code=$(cat "$http_code_file")
@@ -144,6 +159,7 @@ import sys
 response_path = sys.argv[1]
 elapsed_ms = sys.argv[2]
 usage = None
+cache = "unknown"
 
 with open(response_path, encoding="utf-8") as handle:
     for raw_line in handle:
@@ -157,10 +173,13 @@ with open(response_path, encoding="utf-8") as handle:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        if "cache" in obj:
+            cache = str(obj["cache"]).lower()
         if obj.get("usage"):
             usage = obj["usage"]
 
 print(f"elapsed_ms: {elapsed_ms}")
+print(f"cache: {cache}")
 if usage is None:
     print("prompt_tokens: unknown")
     print("completion_tokens: unknown")

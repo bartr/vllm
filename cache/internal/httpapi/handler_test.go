@@ -31,10 +31,10 @@ func TestRoutes(t *testing.T) {
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, body: "{\"system_prompt\":\"You are a detailed assistant.\",\"max_tokens\":2500,\"temperature\":0.2,\"stream\":false,\"replay_delay\":\"0s\",\"models_cache_ttl\":\"1h0m0s\"}\n"},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
-		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"success"}}]}`},
-		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"success\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
-		{name: "ask example query", method: http.MethodGet, path: "/ask?q=what%20is%20the%20capital%20of%20Texas%3F", statusCode: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"what is the capital of Texas?"}}]}`},
-		{name: "ask custom options", method: http.MethodGet, path: "/ask?q=success&system-prompt=Be%20precise&max-tokens=700&temperature=0.7", statusCode: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"success"}}]}`},
+		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
+		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
+		{name: "ask example query", method: http.MethodGet, path: "/ask?q=what%20is%20the%20capital%20of%20Texas%3F", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"what is the capital of Texas?","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
+		{name: "ask custom options", method: http.MethodGet, path: "/ask?q=success&system-prompt=Be%20precise&max-tokens=700&temperature=0.7", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
 		{name: "ask missing q", method: http.MethodGet, path: "/ask", statusCode: http.StatusBadRequest, body: "missing q\n"},
 		{name: "ask invalid max-tokens", method: http.MethodGet, path: "/ask?q=success&max-tokens=99", statusCode: http.StatusBadRequest, body: "max-tokens must be between 100 and 4000\n"},
 		{name: "ask invalid max-tokens format", method: http.MethodGet, path: "/ask?q=success&max-tokens=nope", statusCode: http.StatusBadRequest, body: "invalid max-tokens \"nope\"\n"},
@@ -145,6 +145,12 @@ func TestChatCompletionsStreamCachesReplay(t *testing.T) {
 	if !strings.Contains(secondRecorder.Body.String(), "data: [DONE]") {
 		t.Fatalf("cached stream %q does not contain done marker", secondRecorder.Body.String())
 	}
+	if !strings.Contains(firstRecorder.Body.String(), `"cache":false`) {
+		t.Fatalf("live stream %q does not contain cache=false", firstRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
+		t.Fatalf("cached stream %q does not contain cache=true", secondRecorder.Body.String())
+	}
 	if !strings.Contains(secondRecorder.Body.String(), `"content":"hello"`) {
 		t.Fatalf("cached stream %q does not contain assistant content", secondRecorder.Body.String())
 	}
@@ -168,7 +174,7 @@ func TestRoutesRequestLogging(t *testing.T) {
 		"method=GET",
 		`path="/ask?q=success"`,
 		"status=200",
-		"bytes=114",
+		"bytes=128",
 		"cache=false",
 		"cache=true",
 	} {
@@ -230,8 +236,14 @@ func TestAskCachesNormalizedQueries(t *testing.T) {
 	if secondRecorder.Code != http.StatusOK {
 		t.Fatalf("second status = %d, want %d", secondRecorder.Code, http.StatusOK)
 	}
-	if firstRecorder.Body.String() != secondRecorder.Body.String() {
-		t.Fatalf("cached body = %q, want %q", secondRecorder.Body.String(), firstRecorder.Body.String())
+	if !strings.Contains(firstRecorder.Body.String(), `"cache":false`) {
+		t.Fatalf("live body %q does not contain cache=false", firstRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
+		t.Fatalf("cached body %q does not contain cache=true", secondRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `capital of Texas`) {
+		t.Fatalf("cached body %q does not contain assistant content", secondRecorder.Body.String())
 	}
 	if got := counters.models.Load(); got != 1 {
 		t.Fatalf("models requests = %d, want 1", got)
@@ -264,6 +276,12 @@ func TestAskStreamsAndReplaysCachedStreamWithFreshMetadata(t *testing.T) {
 	}
 	if !strings.Contains(secondRecorder.Body.String(), "data: [DONE]") {
 		t.Fatalf("cached stream %q does not contain done marker", secondRecorder.Body.String())
+	}
+	if !strings.Contains(firstRecorder.Body.String(), `"cache":false`) {
+		t.Fatalf("live stream %q does not contain cache=false", firstRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
+		t.Fatalf("cached stream %q does not contain cache=true", secondRecorder.Body.String())
 	}
 	if !strings.Contains(secondRecorder.Body.String(), `"content":"hello"`) {
 		t.Fatalf("cached stream %q does not contain assistant content", secondRecorder.Body.String())
@@ -335,6 +353,9 @@ func TestAskCachedNonStreamReplayDelayUsesCompletionTokens(t *testing.T) {
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(recorder.Body.String(), `"cache":true`) {
+		t.Fatalf("cached response body %q does not contain cache=true", recorder.Body.String())
 	}
 	if recorder.Body.String() == "" {
 		t.Fatal("expected cached response body")
@@ -561,6 +582,33 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	}
 	if !request.Stream {
 		t.Fatal("captured stream = false, want true")
+	}
+}
+
+func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
+	handler := NewHandler().Routes()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?system_prompt=Be%20precise&max_tokens=700&replay_delay=100ms&models_cache_ttl=30m", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var got runtimeConfig
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal config response: %v", err)
+	}
+	if got.SystemPrompt != "Be precise" {
+		t.Fatalf("system prompt = %q, want %q", got.SystemPrompt, "Be precise")
+	}
+	if got.MaxTokens != 700 {
+		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
+	}
+	if got.ReplayDelay != "100ms" {
+		t.Fatalf("replay delay = %q, want %q", got.ReplayDelay, "100ms")
+	}
+	if got.ModelsCacheTTL != "30m0s" {
+		t.Fatalf("models cache ttl = %q, want %q", got.ModelsCacheTTL, "30m0s")
 	}
 }
 

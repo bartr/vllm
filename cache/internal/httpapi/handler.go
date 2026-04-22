@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"unicode"
 	"strings"
@@ -398,13 +399,41 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 		return false, nil
 	}
 
-	defaults, err := parseAskOptions(r, h.getDefaults())
-	if err != nil {
-		return false, err
+	defaults := h.getDefaults()
+
+	if systemPrompt := configQueryValue(queryValues, "system-prompt", "system_prompt"); systemPrompt != "" {
+		defaults.systemPrompt = systemPrompt
+	}
+
+	if maxTokensRaw := configQueryValue(queryValues, "max-tokens", "max_tokens"); maxTokensRaw != "" {
+		maxTokens, err := strconv.Atoi(maxTokensRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid max-tokens %q", maxTokensRaw)
+		}
+		if maxTokens < minMaxTokens || maxTokens > maxMaxTokens {
+			return false, fmt.Errorf("max-tokens must be between %d and %d", minMaxTokens, maxMaxTokens)
+		}
+		defaults.maxTokens = maxTokens
+	}
+
+	if temperatureRaw := configQueryValue(queryValues, "temperature"); temperatureRaw != "" {
+		temperature, err := strconv.ParseFloat(temperatureRaw, 64)
+		if err != nil {
+			return false, fmt.Errorf("invalid temperature %q", temperatureRaw)
+		}
+		defaults.temperature = temperature
+	}
+
+	if streamRaw := configQueryValue(queryValues, "stream"); streamRaw != "" {
+		stream, err := strconv.ParseBool(streamRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid stream %q", streamRaw)
+		}
+		defaults.stream = stream
 	}
 
 	replayDelay := h.getReplayDelay()
-	if replayDelayRaw := queryValues.Get("replay-delay"); replayDelayRaw != "" {
+	if replayDelayRaw := configQueryValue(queryValues, "replay-delay", "replay_delay"); replayDelayRaw != "" {
 		parsed, err := time.ParseDuration(replayDelayRaw)
 		if err != nil {
 			return false, fmt.Errorf("invalid replay-delay %q: %w", replayDelayRaw, err)
@@ -418,7 +447,7 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.modelsMu.RLock()
 	modelsCacheTTL := h.modelsCacheTTL
 	h.modelsMu.RUnlock()
-	if modelsCacheTTLRaw := queryValues.Get("models-cache-ttl"); modelsCacheTTLRaw != "" {
+	if modelsCacheTTLRaw := configQueryValue(queryValues, "models-cache-ttl", "models_cache_ttl"); modelsCacheTTLRaw != "" {
 		parsed, err := time.ParseDuration(modelsCacheTTLRaw)
 		if err != nil {
 			return false, fmt.Errorf("invalid models-cache-ttl %q: %w", modelsCacheTTLRaw, err)
@@ -436,6 +465,15 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.SetModelsCacheTTL(modelsCacheTTL)
 
 	return true, nil
+}
+
+func configQueryValue(values url.Values, keys ...string) string {
+	for _, key := range keys {
+		if value := values.Get(key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func buildCacheKey(query string, options askOptions) string {
@@ -611,6 +649,8 @@ func (h *Handler) createChatCompletion(ctx context.Context, requestPayload chatC
 		return nil, 0, "", fmt.Errorf("chat request failed with HTTP %d: %s", response.StatusCode, bytes.TrimSpace(responseBody))
 	}
 
+	responseBody = rewriteJSONCacheField(responseBody, false)
+
 	return responseBody, response.StatusCode, contentTypeOrDefault(response.Header.Get("Content-Type"), "application/json"), nil
 }
 
@@ -651,8 +691,9 @@ func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWrite
 	for {
 		line, readErr := readSSELine(reader)
 		if len(line) > 0 {
-			buffer.Write(line)
-			if _, writeErr := w.Write(line); writeErr != nil {
+			rewritten := rewriteSSECacheField(line, false)
+			buffer.Write(rewritten)
+			if _, writeErr := w.Write(rewritten); writeErr != nil {
 				return cachedVLLMResponse{}, fmt.Errorf("write stream response: %w", writeErr)
 			}
 			if flusher != nil {
@@ -716,7 +757,7 @@ func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter,
 					return
 				}
 			}
-			rewritten := rewriteSSEDataLine(line, streamID, createdAt)
+			rewritten := rewriteSSEDataLine(line, true, streamID, createdAt)
 			_, _ = w.Write(rewritten)
 			if flusher != nil {
 				flusher.Flush()
@@ -743,9 +784,10 @@ func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWrite
 		}
 	}
 
+	body := rewriteJSONCacheField(cachedResponse.body, true)
 	w.Header().Set("Content-Type", cachedResponse.contentType)
 	w.WriteHeader(cachedResponse.statusCode)
-	_, _ = w.Write(cachedResponse.body)
+	_, _ = w.Write(body)
 }
 
 func cachedCompletionTokens(body []byte) int {
@@ -803,7 +845,7 @@ func readSSELine(reader io.Reader) ([]byte, error) {
 	}
 }
 
-func rewriteSSEDataLine(line []byte, streamID string, createdAt int64) []byte {
+func rewriteSSEDataLine(line []byte, cacheHit bool, streamID string, createdAt int64) []byte {
 	trimmed := bytes.TrimRight(line, "\r\n")
 	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
 		return line
@@ -821,12 +863,53 @@ func rewriteSSEDataLine(line []byte, streamID string, createdAt int64) []byte {
 
 	body["id"] = streamID
 	body["created"] = createdAt
+	body["cache"] = cacheHit
 	rewrittenPayload, err := json.Marshal(body)
 	if err != nil {
 		return line
 	}
 
 	return append(append([]byte("data: "), rewrittenPayload...), lineEnding(line)...)
+}
+
+func rewriteSSECacheField(line []byte, cacheHit bool) []byte {
+	trimmed := bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return line
+	}
+
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return line
+	}
+
+	rewrittenPayload, ok := rewriteJSONCacheFieldBytes(payload, cacheHit)
+	if !ok {
+		return line
+	}
+
+	return append(append([]byte("data: "), rewrittenPayload...), lineEnding(line)...)
+}
+
+func rewriteJSONCacheField(body []byte, cacheHit bool) []byte {
+	rewritten, ok := rewriteJSONCacheFieldBytes(body, cacheHit)
+	if !ok {
+		return body
+	}
+	return rewritten
+}
+
+func rewriteJSONCacheFieldBytes(body []byte, cacheHit bool) ([]byte, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	payload["cache"] = cacheHit
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	return rewritten, true
 }
 
 func lineEnding(line []byte) []byte {

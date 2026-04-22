@@ -43,13 +43,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler := httpapi.NewHandlerWithDependencies("", nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetModelsCacheTTL(cfg.ModelsCacheTTL)
 	handler.SetReplayDelay(cfg.ReplayDelay)
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           handler.Routes(),
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	server := newServer(cfg, handler.Routes())
 
 	serverErrCh := make(chan error, 1)
 	go func() {
@@ -100,6 +94,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	logger.Info("server stopped")
 	return 0
+}
+
+func newServer(cfg config.Config, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       60 * time.Second,
+	}
 }
 
 func hasHelpFlag(args []string) bool {
