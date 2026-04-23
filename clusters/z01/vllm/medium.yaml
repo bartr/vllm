@@ -54,6 +54,12 @@ spec:
             - "8000"
             - --gpu-memory-utilization
             - "0.90"
+            - --performance-mode
+            - throughput
+            - --max-num-seqs
+            - "256"
+            - --max-num-batched-tokens
+            - "2048"
             - --max-model-len
             - "4096"
           ports:

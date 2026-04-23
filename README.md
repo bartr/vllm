@@ -205,6 +205,44 @@ ASK_MODEL='gpt-4.1' \
 ./ask.sh "Give me three uses for an edge-hosted LLM."
 ```
 
+Benchmark the local vLLM instance directly with [scripts/benchmark-vllm.sh](/home/bartr/vllm/scripts/benchmark-vllm.sh):
+
+```bash
+./scripts/benchmark-vllm.sh
+```
+
+By default it targets `http://127.0.0.1:32080`, auto-detects the active model from `/v1/models`, sends long non-streaming completion requests, starts its concurrency sweep at `VLLM_BENCH_START=20`, and runs through `VLLM_BENCH_MAX_CONCURRENCY=50`.
+
+For each concurrency level it reports:
+
+- aggregate completion tokens/sec
+- average request latency in milliseconds
+- average per-request completion tokens/sec
+- average TTFT in milliseconds when `VLLM_BENCH_STREAM=1`
+
+At the end it prints both the highest-throughput concurrency and a latency-balanced recommendation that stays within `2x` the minimum observed average latency.
+
+Example with smaller test settings:
+
+```bash
+VLLM_BENCH_START=2 \
+VLLM_BENCH_MAX_CONCURRENCY=2 \
+VLLM_BENCH_REQUESTS_PER_WORKER=1 \
+VLLM_BENCH_MAX_TOKENS=64 \
+./scripts/benchmark-vllm.sh
+```
+
+Example with streaming enabled so TTFT is measured:
+
+```bash
+VLLM_BENCH_STREAM=1 \
+VLLM_BENCH_START=2 \
+VLLM_BENCH_MAX_CONCURRENCY=8 \
+./scripts/benchmark-vllm.sh
+```
+
+Use `./scripts/benchmark-vllm.sh --help` for all options, including an explicit model, bearer token, custom prompt, and concurrency controls.
+
 It will:
 
 - prompt for the user context
