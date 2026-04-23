@@ -6,11 +6,9 @@ metadata:
   labels:
     app.kubernetes.io/name: vllm
 spec:
-  type: NodePort
   selector:
     app: vllm
   ports:
     - name: http
       port: 8000
       targetPort: http
-      nodePort: 32080

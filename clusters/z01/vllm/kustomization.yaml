@@ -4,6 +4,7 @@ resources:
   - ns.yaml
   - pvc.yaml
   - service.yaml
+  - ingress.yaml
 #  - small.yaml
   - medium.yaml
 #  - large.yaml
