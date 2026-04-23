@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: monitoring
+resources:
+  - namespace.yaml
+  - prometheus-serviceaccount.yaml
+  - prometheus-clusterrole.yaml
+  - prometheus-clusterrolebinding.yaml
+  - prometheus.yaml
+  - prometheus-service.yaml
+  - ingress.yaml
+  - vllm-servicemonitor.yaml
+  - cllm-servicemonitor.yaml

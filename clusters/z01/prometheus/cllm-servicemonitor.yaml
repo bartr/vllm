@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cllm
+  labels:
+    app.kubernetes.io/name: cllm
+    monitoring.coreos.com/instance: prometheus
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - cllm
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cllm
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
