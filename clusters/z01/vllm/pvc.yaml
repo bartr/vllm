@@ -2,7 +2,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: vllm-model-cache
-  namespace: llm
+  namespace: vllm
 spec:
   accessModes:
     - ReadWriteOnce

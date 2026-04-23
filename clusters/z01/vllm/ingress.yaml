@@ -2,7 +2,7 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: vllm
-  namespace: llm
+  namespace: vllm
 spec:
   entryPoints:
     - vllm

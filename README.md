@@ -83,8 +83,8 @@ kubectl apply -f manifests/vllm-medium.yaml
 # or
 kubectl apply -f manifests/vllm-large.yaml
 
-kubectl -n llm get pods -o wide
-kubectl -n llm rollout status deploy/vllm
+kubectl -n vllm get pods -o wide
+kubectl -n vllm rollout status deploy/vllm
 ```
 
 The deployment uses:
@@ -102,7 +102,7 @@ The cache claim requests `20Gi` from the `local-path` storage class so model wei
 If your model download is rate-limited, add a Hugging Face token before starting the deployment:
 
 ```bash
-kubectl -n llm create secret generic huggingface-token \
+kubectl -n vllm create secret generic huggingface-token \
 	--from-literal=HF_TOKEN='<your-token>'
 ```
 
@@ -120,7 +120,7 @@ If you want to switch models later, apply a different manifest over the same `vl
 
 ```bash
 kubectl apply -f manifests/vllm-medium.yaml
-kubectl -n llm rollout status deploy/vllm
+kubectl -n vllm rollout status deploy/vllm
 ```
 
 This keeps the same service name, same ingress route target, and same PVC cache.
@@ -138,19 +138,19 @@ Do not apply multiple model manifests and expect them to run side by side on thi
 Get the node IP that is hosting the pod:
 
 ```bash
-kubectl -n llm get pods -o wide
+kubectl -n vllm get pods -o wide
 ```
 
 This setup uses the Traefik ingress as the primary endpoint. The service itself stays internal to the cluster.
 
-Create the basic-auth secret in the `llm` namespace:
+Create the basic-auth secret in the `vllm` namespace:
 
 ```bash
 VLLM_BASIC_AUTH_USER=admin
 VLLM_BASIC_AUTH_PASSWORD='change-me'
 HASH=$(openssl passwd -apr1 "$VLLM_BASIC_AUTH_PASSWORD")
 printf '%s:%s\n' "$VLLM_BASIC_AUTH_USER" "$HASH" > users
-kubectl -n llm create secret generic vllm-basic-auth --from-file=users=./users
+kubectl -n vllm create secret generic vllm-basic-auth --from-file=users=./users
 rm -f users
 ```
 
@@ -322,7 +322,7 @@ Once the starter deployment works, the next tuning knobs are:
 
 1. Deploy the starter manifest unchanged.
 2. Choose one of `vllm-small.yaml`, `vllm-medium.yaml`, or `vllm-large.yaml`.
-3. Confirm `kubectl logs -n llm deploy/vllm` shows the model loaded successfully.
+3. Confirm `kubectl logs -n vllm deploy/vllm` shows the model loaded successfully.
 4. Test the authenticated ingress endpoint with `/v1/chat/completions`.
 
 ## Add Observability

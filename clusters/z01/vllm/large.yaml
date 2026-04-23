@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vllm
-  namespace: llm
+  namespace: vllm
   labels:
     app.kubernetes.io/name: vllm
 spec:
