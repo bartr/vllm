@@ -12,5 +12,8 @@ sudo rm -rf /etc/rancher/k3s
 
 curl -sfL https://get.k3s.io | sh -
 ./config.sh
+
+cd ../cllm
+make deploy
+
 kubectl get nodes
-kubectl get pods -A --watch
