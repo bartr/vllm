@@ -1,10 +1,16 @@
 GO ?= go
 BINARY ?= cllm
+DOCKER ?= docker
+IMAGE ?= cllm:0.1.0
+K3S ?= sudo k3s
 
-.PHONY: build run test fmt clean
+.PHONY: build run test fmt clean import
 
 build:
-	$(GO) build -o bin/$(BINARY) ./cmd/cllm
+	$(DOCKER) build -t $(IMAGE) .
+
+import: build
+	$(DOCKER) save $(IMAGE) | $(K3S) ctr images import -
 
 run:
 	$(GO) run ./cmd/cllm
