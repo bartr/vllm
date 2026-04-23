@@ -20,6 +20,8 @@ import (
 	"cllm/internal/httpapi"
 )
 
+const queueDepthLogInterval = 30 * time.Second
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -55,10 +57,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
+	handler.SetRequestProcessingLimits(cfg.MaxTokensPerSecond, cfg.MaxConcurrentRequests, cfg.MaxWaitingRequests, cfg.MaxDegradation)
 	server := newServer(cfg, handler.Routes())
+	queueLogCtx, stopQueueLogger := context.WithCancel(context.Background())
+	defer stopQueueLogger()
+	go startQueueDepthLogger(queueLogCtx, logger, handler, queueDepthLogInterval)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
+		_, concurrentRequests, _, waitingRequests := handler.RequestQueueStats()
 		logger.Info(
 			"server starting",
 			"addr", cfg.Addr,
@@ -67,6 +74,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"downstream_model", cfg.DownstreamModel,
 			"system_prompt", cfg.SystemPrompt,
 			"max_tokens", cfg.MaxTokens,
+			"max_tokens_per_second", cfg.MaxTokensPerSecond,
+			"max_concurrent_requests", cfg.MaxConcurrentRequests,
+			"concurrent_requests", concurrentRequests,
+			"max_waiting_requests", cfg.MaxWaitingRequests,
+			"waiting_requests", waitingRequests,
+			"max_degradation", cfg.MaxDegradation,
 			"temperature", cfg.Temperature,
 		)
 		err := server.ListenAndServe()
@@ -106,6 +119,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	logger.Info("server stopped")
 	return 0
+}
+
+func startQueueDepthLogger(ctx context.Context, logger *slog.Logger, handler *httpapi.Handler, interval time.Duration) {
+	if interval <= 0 {
+		interval = queueDepthLogInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests := handler.RequestQueueStats()
+			logger.Info(
+				"queue depth",
+				"concurrent_requests", concurrentRequests,
+				"max_concurrent_requests", maxConcurrentRequests,
+				"waiting_requests", waitingRequests,
+				"max_waiting_requests", maxWaitingRequests,
+			)
+		}
+	}
 }
 
 func newServer(cfg config.Config, handler http.Handler) *http.Server {

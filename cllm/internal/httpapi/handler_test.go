@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"cllm/internal/config"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRoutes(t *testing.T) {
@@ -26,10 +28,11 @@ func TestRoutes(t *testing.T) {
 		path       string
 		statusCode int
 		body       string
+		bodyContains []string
 	}{
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, body: "{\"cache_size\":100,\"cache_entries\":0,\"downstream_url\":\"" + vllmServer.URL + "\",\"downstream_model\":\"\",\"system_prompt\":\"You are a detailed assistant.\",\"max_tokens\":2500,\"temperature\":0.2,\"stream\":false}\n"},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"temperature":0.2`, `"stream":false`}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
 		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
@@ -45,8 +48,6 @@ func TestRoutes(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
 			req := httptest.NewRequest(test.method, test.path, nil)
 			recorder := httptest.NewRecorder()
 
@@ -56,8 +57,13 @@ func TestRoutes(t *testing.T) {
 				t.Fatalf("status code = %d, want %d", recorder.Code, test.statusCode)
 			}
 
-			if recorder.Body.String() != test.body {
+			if test.body != "" && recorder.Body.String() != test.body {
 				t.Fatalf("body = %q, want %q", recorder.Body.String(), test.body)
+			}
+			for _, want := range test.bodyContains {
+				if !strings.Contains(recorder.Body.String(), want) {
+					t.Fatalf("body = %q, want substring %q", recorder.Body.String(), want)
+				}
 			}
 		})
 	}
@@ -181,6 +187,168 @@ func TestChatCompletionsStreamCachesReplay(t *testing.T) {
 	}
 	if !strings.Contains(secondRecorder.Body.String(), `"content":"hello"`) {
 		t.Fatalf("cached stream %q does not contain assistant content", secondRecorder.Body.String())
+	}
+}
+
+func TestAskCachedReplayThrottlesNonStreamResponses(t *testing.T) {
+	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"test-model"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"one two three four"}}],"usage":{"completion_tokens":4}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer vllmServer.Close()
+
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	handler.SetRequestProcessingLimits(2, 10, 10, 0)
+	var sleeps []time.Duration
+	handler.sleep = func(_ context.Context, duration time.Duration) error {
+		sleeps = append(sleeps, duration)
+		return nil
+	}
+	router := handler.Routes()
+
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
+	secondRecorder := httptest.NewRecorder()
+	router.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
+
+	if secondRecorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
+		t.Fatalf("cached body %q does not contain cache=true", secondRecorder.Body.String())
+	}
+	if len(sleeps) != 1 {
+		t.Fatalf("sleep calls = %d, want 1", len(sleeps))
+	}
+	if sleeps[0] != 2*time.Second {
+		t.Fatalf("sleep duration = %s, want %s", sleeps[0], 2*time.Second)
+	}
+}
+
+func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
+	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"test-model"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one two three four\"},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test-stream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4,\"total_tokens\":9}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer vllmServer.Close()
+
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	handler.SetRequestProcessingLimits(2, 10, 10, 0)
+	var sleeps []time.Duration
+	handler.sleep = func(_ context.Context, duration time.Duration) error {
+		sleeps = append(sleeps, duration)
+		return nil
+	}
+	router := handler.Routes()
+	body := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700,"stream":true,"stream_options":{"include_usage":true}}`
+
+	firstRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	firstRequest.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(httptest.NewRecorder(), firstRequest)
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	secondRequest.Header.Set("Content-Type", "application/json")
+	secondRecorder := httptest.NewRecorder()
+	router.ServeHTTP(secondRecorder, secondRequest)
+
+	if secondRecorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
+		t.Fatalf("cached stream %q does not contain cache=true", secondRecorder.Body.String())
+	}
+	if len(sleeps) != 1 {
+		t.Fatalf("sleep calls = %d, want 1", len(sleeps))
+	}
+	if sleeps[0] != 2*time.Second {
+		t.Fatalf("sleep duration = %s, want %s", sleeps[0], 2*time.Second)
+	}
+}
+
+func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(20, 10, 10, 50)
+
+	releaseOne, ok := handler.acquireRequestSlot(context.Background(), "/one")
+	if !ok {
+		t.Fatal("failed to acquire first request slot")
+	}
+	defer releaseOne()
+
+	if got := handler.cachedReplayDelay(2); got != 100*time.Millisecond {
+		t.Fatalf("delay below threshold = %s, want %s", got, 100*time.Millisecond)
+	}
+
+	releaseTwo, ok := handler.acquireRequestSlot(context.Background(), "/two")
+	if !ok {
+		t.Fatal("failed to acquire second request slot")
+	}
+	defer releaseTwo()
+
+	if got := handler.cachedReplayDelay(2); got != 200*time.Millisecond {
+		t.Fatalf("delay above threshold = %s, want %s", got, 200*time.Millisecond)
+	}
+}
+
+func TestAskReturnsOverCapacityWhenConcurrencyAndQueueAreFull(t *testing.T) {
+	releaseDownstream := make(chan struct{})
+	downstreamStarted := make(chan struct{}, 1)
+	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		downstreamStarted <- struct{}{}
+		<-releaseDownstream
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	defer vllmServer.Close()
+
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	handler.SetDownstreamModel("test-model")
+	handler.SetRequestProcessingLimits(32, 1, 0, 0)
+	router := handler.Routes()
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstRecorder := httptest.NewRecorder()
+		router.ServeHTTP(firstRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=first", nil))
+		firstDone <- firstRecorder
+	}()
+
+	<-downstreamStarted
+
+	secondRecorder := httptest.NewRecorder()
+	router.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=second", nil))
+
+	if secondRecorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusTooManyRequests)
+	}
+	if secondRecorder.Body.String() != "over capacity\n" {
+		t.Fatalf("body = %q, want %q", secondRecorder.Body.String(), "over capacity\n")
+	}
+
+	close(releaseDownstream)
+	firstRecorder := <-firstDone
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("first request status code = %d, want %d", firstRecorder.Code, http.StatusOK)
 	}
 }
 
@@ -498,7 +666,7 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 
 	configRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?cache-size=7&downstream-url="+url.QueryEscape(vllmServer.URL)+"&downstream-model=gpt-4.1&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true", nil))
+	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?cache-size=7&downstream-url="+url.QueryEscape(vllmServer.URL)+"&downstream-model=gpt-4.1&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=64&max-waiting-requests=96&max-degradation=25&temperature=0.7&stream=true", nil))
 
 	if configRecorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", configRecorder.Code, http.StatusOK)
@@ -525,6 +693,24 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	}
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
+	}
+	if got.MaxTokensPerSecond != 48 {
+		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
+	}
+	if got.MaxConcurrentRequests != 64 {
+		t.Fatalf("max concurrent requests = %d, want %d", got.MaxConcurrentRequests, 64)
+	}
+	if got.ConcurrentRequests != 0 {
+		t.Fatalf("concurrent requests = %d, want %d", got.ConcurrentRequests, 0)
+	}
+	if got.MaxWaitingRequests != 96 {
+		t.Fatalf("max waiting requests = %d, want %d", got.MaxWaitingRequests, 96)
+	}
+	if got.WaitingRequests != 0 {
+		t.Fatalf("waiting requests = %d, want %d", got.WaitingRequests, 0)
+	}
+	if got.MaxDegradation != 25 {
+		t.Fatalf("max degradation = %d, want %d", got.MaxDegradation, 25)
 	}
 	if got.Temperature != 0.7 {
 		t.Fatalf("temperature = %v, want %v", got.Temperature, 0.7)
@@ -575,7 +761,7 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_per_second=48&max_concurrent_requests=64&max_waiting_requests=96&max_degradation=25", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -602,6 +788,216 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	}
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
+	}
+	if got.MaxTokensPerSecond != 48 {
+		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
+	}
+	if got.MaxConcurrentRequests != 64 {
+		t.Fatalf("max concurrent requests = %d, want %d", got.MaxConcurrentRequests, 64)
+	}
+	if got.MaxWaitingRequests != 96 {
+		t.Fatalf("max waiting requests = %d, want %d", got.MaxWaitingRequests, 96)
+	}
+	if got.MaxDegradation != 25 {
+		t.Fatalf("max degradation = %d, want %d", got.MaxDegradation, 25)
+	}
+}
+
+func TestConfigEndpointRejectsInvalidQueueValues(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "concurrent below min", path: "/config?max-concurrent-requests=0", want: `max-concurrent-requests must be between 1 and 512`},
+		{name: "concurrent above max", path: "/config?max-concurrent-requests=513", want: `max-concurrent-requests must be between 1 and 512`},
+		{name: "waiting below min", path: "/config?max-waiting-requests=-1", want: `max-waiting-requests must be between 0 and 1024`},
+		{name: "waiting above max", path: "/config?max-waiting-requests=1025", want: `max-waiting-requests must be between 0 and 1024`},
+		{name: "waiting too large for concurrent", path: "/config?max-concurrent-requests=64&max-waiting-requests=128", want: `max-waiting-requests must be less than 128`},
+		{name: "tokens per second above max", path: "/config?max-tokens-per-second=1001", want: `max-tokens-per-second must be between 0 and 1000`},
+		{name: "degradation above max", path: "/config?max-concurrent-requests=64&max-waiting-requests=96&max-degradation=96", want: `max-degradation must be between 0 and 95`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := NewHandler().Routes()
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, test.path, nil))
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			if !strings.Contains(recorder.Body.String(), test.want) {
+				t.Fatalf("body = %q, want %q", recorder.Body.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testing.T) {
+	scheduler := newRequestScheduler(2, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	releaseOne, ok := scheduler.AcquirePath(ctx, "/one")
+	if !ok {
+		t.Fatal("failed to acquire first direct slot")
+	}
+	releaseTwo, ok := scheduler.AcquirePath(ctx, "/two")
+	if !ok {
+		t.Fatal("failed to acquire second direct slot")
+	}
+
+	type acquiredRelease struct {
+		path string
+		release func()
+	}
+	acquired := make(chan acquiredRelease, 2)
+	go func() {
+		release, ok := scheduler.AcquirePath(ctx, "/three")
+		if ok {
+			acquired <- acquiredRelease{path: "/three", release: release}
+		}
+	}()
+	go func() {
+		release, ok := scheduler.AcquirePath(ctx, "/four")
+		if ok {
+			acquired <- acquiredRelease{path: "/four", release: release}
+		}
+	}()
+
+	for {
+		_, _, _, waiting := scheduler.Stats()
+		if waiting == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	scheduler.Reconfigure(1, 1)
+	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 2 || maxWaiting != 1 || waiting != 2 {
+		t.Fatalf("stats after reconfigure = (%d,%d,%d,%d), want (1,2,1,2)", maxConcurrent, inFlight, maxWaiting, waiting)
+	}
+
+	if _, ok := scheduler.AcquirePath(ctx, "/five"); ok {
+		t.Fatal("expected new admission to be rejected while queue remains above max waiting")
+	}
+
+	releaseOne()
+	select {
+	case promoted := <-acquired:
+		promoted.release()
+		t.Fatal("queued request promoted before in-flight dropped below reconfigured max")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	releaseTwo()
+	firstPromoted := <-acquired
+	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 1 || maxWaiting != 1 || waiting != 1 {
+		t.Fatalf("stats after first promotion = (%d,%d,%d,%d), want (1,1,1,1)", maxConcurrent, inFlight, maxWaiting, waiting)
+	}
+	if _, ok := scheduler.AcquirePath(ctx, "/six"); ok {
+		t.Fatal("expected new admission to be rejected while waiting queue is still full")
+	}
+
+	firstPromoted.release()
+	secondPromoted := <-acquired
+	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 1 || maxWaiting != 1 || waiting != 0 {
+		t.Fatalf("stats after second promotion = (%d,%d,%d,%d), want (1,1,1,0)", maxConcurrent, inFlight, maxWaiting, waiting)
+	}
+	secondPromoted.release()
+	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 0 || maxWaiting != 1 || waiting != 0 {
+		t.Fatalf("final stats = (%d,%d,%d,%d), want (1,0,1,0)", maxConcurrent, inFlight, maxWaiting, waiting)
+	}
+	if release, ok := scheduler.AcquirePath(ctx, "/seven"); !ok {
+		t.Fatal("expected direct admission once both queues had space again")
+	} else {
+		release()
+	}
+}
+
+func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
+	var logBuffer bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
+	defer slog.SetDefault(originalLogger)
+
+	scheduler := newRequestScheduler(1, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	releaseOne, ok := scheduler.AcquirePath(ctx, "/one")
+	if !ok {
+		t.Fatal("failed to acquire direct slot")
+	}
+
+	queuedAcquired := make(chan func(), 1)
+	go func() {
+		release, ok := scheduler.AcquirePath(ctx, "/two")
+		if ok {
+			queuedAcquired <- release
+		}
+	}()
+
+	for {
+		_, _, _, waiting := scheduler.Stats()
+		if waiting == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	releaseOne()
+	queuedRelease := <-queuedAcquired
+	queuedRelease()
+
+	logOutput := logBuffer.String()
+	for _, want := range []string{
+		`msg="request admitted" path=/one source=direct`,
+		`msg="request admitted" path=/two source=waiting_queue`,
+		`msg="request admitted" path=/two source=waiting_to_concurrent`,
+		`msg="request completed" path=/one`,
+		`msg="request completed" path=/two`,
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("log output %q does not contain %q", logOutput, want)
+		}
+	}
+}
+
+func TestConfigEndpointLogsQueueLimitChanges(t *testing.T) {
+	var logBuffer bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
+	defer slog.SetDefault(originalLogger)
+
+	handler := NewHandler().Routes()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?max-concurrent-requests=64&max-waiting-requests=96", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	logOutput := logBuffer.String()
+	for _, want := range []string{
+		`msg="request queue limits updated"`,
+		`previous_max_concurrent_requests=512`,
+		`max_concurrent_requests=64`,
+		`previous_max_waiting_requests=1023`,
+		`max_waiting_requests=96`,
+		`concurrent_requests=0`,
+		`waiting_requests=0`,
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("log output %q does not contain %q", logOutput, want)
+		}
+	}
+}
+
+func TestCachedReplayDelayDisabledWhenTokensPerSecondZero(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(0, 10, 10, 10)
+	if got := handler.cachedReplayDelay(20); got != 0 {
+		t.Fatalf("cached replay delay = %s, want 0", got)
 	}
 }
 
@@ -774,6 +1170,10 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
+	t.Setenv("CACHE_MAX_TOKENS_PER_SECOND", "0")
+	t.Setenv("CACHE_MAX_CONCURRENT_REQUESTS", "64")
+	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
+	t.Setenv("CACHE_MAX_DEGRADATION", "25")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
 	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
 	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "secret-token")
@@ -788,6 +1188,18 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	}
 	if cfg.MaxTokens != 700 {
 		t.Fatalf("MaxTokens = %d, want 700", cfg.MaxTokens)
+	}
+	if cfg.MaxTokensPerSecond != 0 {
+		t.Fatalf("MaxTokensPerSecond = %d, want 0", cfg.MaxTokensPerSecond)
+	}
+	if cfg.MaxConcurrentRequests != 64 {
+		t.Fatalf("MaxConcurrentRequests = %d, want 64", cfg.MaxConcurrentRequests)
+	}
+	if cfg.MaxWaitingRequests != 95 {
+		t.Fatalf("MaxWaitingRequests = %d, want 95", cfg.MaxWaitingRequests)
+	}
+	if cfg.MaxDegradation != 25 {
+		t.Fatalf("MaxDegradation = %d, want 25", cfg.MaxDegradation)
 	}
 	if cfg.Temperature != 0.7 {
 		t.Fatalf("Temperature = %v, want 0.7", cfg.Temperature)
@@ -806,12 +1218,16 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
+	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--max-tokens-per-second", "64", "--max-concurrent-requests", "16", "--max-waiting-requests", "31", "--max-degradation", "15", "--temperature", "0.9"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
+	t.Setenv("CACHE_MAX_TOKENS_PER_SECOND", "0")
+	t.Setenv("CACHE_MAX_CONCURRENT_REQUESTS", "64")
+	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
+	t.Setenv("CACHE_MAX_DEGRADATION", "25")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
 	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
 	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "env-token")
@@ -826,6 +1242,18 @@ func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	}
 	if cfg.MaxTokens != 900 {
 		t.Fatalf("MaxTokens = %d, want 900", cfg.MaxTokens)
+	}
+	if cfg.MaxTokensPerSecond != 64 {
+		t.Fatalf("MaxTokensPerSecond = %d, want 64", cfg.MaxTokensPerSecond)
+	}
+	if cfg.MaxConcurrentRequests != 16 {
+		t.Fatalf("MaxConcurrentRequests = %d, want 16", cfg.MaxConcurrentRequests)
+	}
+	if cfg.MaxWaitingRequests != 31 {
+		t.Fatalf("MaxWaitingRequests = %d, want 31", cfg.MaxWaitingRequests)
+	}
+	if cfg.MaxDegradation != 15 {
+		t.Fatalf("MaxDegradation = %d, want 15", cfg.MaxDegradation)
 	}
 	if cfg.Temperature != 0.9 {
 		t.Fatalf("Temperature = %v, want 0.9", cfg.Temperature)
@@ -851,6 +1279,14 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 	}{
 		{name: "invalid env max tokens", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
 		{name: "env max tokens out of range", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
+		{name: "invalid env max tokens per second", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS_PER_SECOND", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS_PER_SECOND "nope"`},
+		{name: "flag max tokens per second above max", args: []string{"cllm", "--max-tokens-per-second", "1001"}, wantErr: "max-tokens-per-second must be between 0 and 1000"},
+		{name: "flag max concurrent requests too low", args: []string{"cllm", "--max-concurrent-requests", "0"}, wantErr: "max-concurrent-requests must be between 1 and 512"},
+		{name: "flag max concurrent requests too high", args: []string{"cllm", "--max-concurrent-requests", "513"}, wantErr: "max-concurrent-requests must be between 1 and 512"},
+		{name: "flag max waiting requests negative", args: []string{"cllm", "--max-waiting-requests", "-1"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
+		{name: "flag max waiting requests too high", args: []string{"cllm", "--max-waiting-requests", "1025"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
+		{name: "flag max waiting requests too large for concurrent", args: []string{"cllm", "--max-concurrent-requests", "64", "--max-waiting-requests", "128"}, wantErr: "max-waiting-requests must be less than 128"},
+		{name: "flag max degradation too high", args: []string{"cllm", "--max-degradation", "96"}, wantErr: "max-degradation must be between 0 and 95"},
 		{name: "invalid env temperature", args: []string{"cllm"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
 		{name: "flag max tokens out of range", args: []string{"cllm", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
 		{name: "invalid flag temperature", args: []string{"cllm", "--temperature", "nope"}, wantErr: "invalid runtime flag"},

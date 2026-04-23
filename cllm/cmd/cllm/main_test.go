@@ -13,6 +13,7 @@ import (
 
 	"cllm/internal/buildinfo"
 	"cllm/internal/config"
+	"cllm/internal/httpapi"
 )
 
 func TestRunHelp(t *testing.T) {
@@ -24,7 +25,7 @@ func TestRunHelp(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exitCode = %d, want 0", exitCode)
 	}
-	for _, want := range []string{"Usage: cllm [options]", "--downstream-url", "--downstream-token", "--downstream-model", "--version", "-h, --help", `Default system prompt for /ask (default "You are a helpful assistant.")`, "Default max tokens for /ask (default 4000)", "Default temperature for /ask (default 0.2)"} {
+	for _, want := range []string{"Usage: cllm [options]", "--downstream-url", "--downstream-token", "--downstream-model", "--max-tokens-per-second", "--max-concurrent-requests", "--max-waiting-requests", "--max-degradation", "--version", "-h, --help", `Default system prompt for /ask (default "You are a helpful assistant.")`, "Default max tokens for /ask (default 4000)", "Default temperature for /ask (default 0.2)"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output %q does not contain %q", stdout.String(), want)
 		}
@@ -162,4 +163,45 @@ func TestResolveStartupDownstreamModelFailsWhenNoModelAvailable(t *testing.T) {
 	if !strings.Contains(err.Error(), "models response did not include a model id") {
 		t.Fatalf("error = %q, want models response error", err.Error())
 	}
+}
+
+func TestStartQueueDepthLoggerLogsQueueDepth(t *testing.T) {
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+	handler := httpapi.NewHandler()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		startQueueDepthLogger(ctx, logger, handler, time.Millisecond)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logBuffer.String(), `msg="queue depth"`) {
+			cancel()
+			<-done
+			logOutput := logBuffer.String()
+			for _, want := range []string{
+				`msg="queue depth"`,
+				`concurrent_requests=0`,
+				`max_concurrent_requests=512`,
+				`waiting_requests=0`,
+				`max_waiting_requests=1023`,
+			} {
+				if !strings.Contains(logOutput, want) {
+					t.Fatalf("log output %q does not contain %q", logOutput, want)
+				}
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	<-done
+	t.Fatalf("log output %q does not contain queue depth entry", logBuffer.String())
 }

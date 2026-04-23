@@ -10,14 +10,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
-	"unicode"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -26,9 +27,22 @@ const (
 	defaultSystemPrompt     = "You are a helpful assistant."
 	minMaxTokens            = 100
 	maxMaxTokens            = 4000
+	minMaxTokensPerSecond   = 0
+	maxMaxTokensPerSecond   = 1000
+	minMaxConcurrentRequests = 1
+	maxMaxConcurrentRequests = 512
+	minMaxWaitingRequests   = 0
+	maxMaxWaitingRequests   = 1024
+	minMaxDegradation       = 0
+	maxMaxDegradation       = 95
 	defaultMaxTokens        = 4000
 	defaultTemperature      = 0.2
 	defaultVLLMHTTPTimeout  = 120 * time.Second
+	defaultMaxTokensPerSecond = 32
+	defaultMaxConcurrentRequests = 512
+	defaultMaxWaitingRequests = 1023
+	defaultMaxDegradation = 10
+	degradationThreshold = 0.10
 )
 
 type askOptions struct {
@@ -61,6 +75,10 @@ type Handler struct {
 	httpClient *http.Client
 	modelsMu   sync.RWMutex
 	modelsCache *cachedModelsResponse
+	maxTokensPerSecond int
+	maxDegradation int
+	scheduler *requestScheduler
+	sleep func(context.Context, time.Duration) error
 }
 
 func NewHandler() *Handler {
@@ -70,7 +88,49 @@ func NewHandler() *Handler {
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
+	handler.maxTokensPerSecond = defaultMaxTokensPerSecond
+	handler.maxDegradation = defaultMaxDegradation
+	handler.scheduler = newRequestScheduler(defaultMaxConcurrentRequests, defaultMaxWaitingRequests)
+	handler.sleep = sleepWithContext
 	return handler
+}
+
+func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRequests, maxWaitingRequests, maxDegradation int) {
+	if maxTokensPerSecond < minMaxTokensPerSecond || maxTokensPerSecond > maxMaxTokensPerSecond {
+		maxTokensPerSecond = defaultMaxTokensPerSecond
+	}
+	if maxConcurrentRequests < minMaxConcurrentRequests || maxConcurrentRequests > maxMaxConcurrentRequests {
+		maxConcurrentRequests = defaultMaxConcurrentRequests
+	}
+	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests || maxWaitingRequests >= 2*maxConcurrentRequests {
+		maxWaitingRequests = defaultMaxWaitingRequests
+	}
+	if maxDegradation < minMaxDegradation {
+		maxDegradation = 0
+	}
+	if maxDegradation > maxMaxDegradation {
+		maxDegradation = maxMaxDegradation
+	}
+
+	h.configMu.Lock()
+	h.maxTokensPerSecond = maxTokensPerSecond
+	h.maxDegradation = maxDegradation
+	if h.scheduler == nil {
+		h.scheduler = newRequestScheduler(maxConcurrentRequests, maxWaitingRequests)
+	} else {
+		h.scheduler.Reconfigure(maxConcurrentRequests, maxWaitingRequests)
+	}
+	h.configMu.Unlock()
+}
+
+func (h *Handler) RequestQueueStats() (int, int, int, int) {
+	h.configMu.RLock()
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+	if scheduler == nil {
+		return 0, 0, 0, 0
+	}
+	return scheduler.Stats()
 }
 
 func (h *Handler) SetDownstreamToken(token string) {
@@ -159,6 +219,12 @@ type runtimeConfig struct {
 	DownstreamModel string `json:"downstream_model"`
 	SystemPrompt   string  `json:"system_prompt"`
 	MaxTokens      int     `json:"max_tokens"`
+	MaxTokensPerSecond int `json:"max_tokens_per_second"`
+	MaxConcurrentRequests int `json:"max_concurrent_requests"`
+	ConcurrentRequests int `json:"concurrent_requests"`
+	MaxWaitingRequests int `json:"max_waiting_requests"`
+	WaitingRequests int `json:"waiting_requests"`
+	MaxDegradation int `json:"max_degradation"`
 	Temperature    float64 `json:"temperature"`
 	Stream         bool    `json:"stream"`
 }
@@ -213,6 +279,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	release, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
+	if !ok {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
+		return
+	}
+	defer release()
+
 	requestPayload, err := h.populateChatCompletionDefaults(r.Context(), requestPayload)
 	if err != nil {
 		markCacheHit(w, false)
@@ -231,11 +305,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(w, cachedResponse)
+				h.replayCachedStream(r.Context(), w, cachedResponse)
 				return
 			}
 
-			h.replayCachedResponse(w, cachedResponse)
+			h.replayCachedResponse(r.Context(), w, cachedResponse)
 			return
 		}
 	}
@@ -292,15 +366,23 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	release, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
+	if !ok {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
+		return
+	}
+	defer release()
+
 	if h.cache != nil {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			markCacheHit(w, true)
 			if cachedResponse.streaming {
-				h.replayCachedStream(w, cachedResponse)
+				h.replayCachedStream(r.Context(), w, cachedResponse)
 				return
 			}
 
-			h.replayCachedResponse(w, cachedResponse)
+			h.replayCachedResponse(r.Context(), w, cachedResponse)
 			return
 		}
 	}
@@ -419,6 +501,17 @@ func (h *Handler) currentConfig() runtimeConfig {
 	downstreamModel := h.downstreamModel
 	h.modelsMu.RUnlock()
 
+	h.configMu.RLock()
+	maxTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+
+	maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests := 0, 0, 0, 0
+	if scheduler != nil {
+		maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests = scheduler.Stats()
+	}
+
 	return runtimeConfig{
 		CacheSize: cacheSize,
 		CacheEntries: cacheEntries,
@@ -426,6 +519,12 @@ func (h *Handler) currentConfig() runtimeConfig {
 		DownstreamModel: downstreamModel,
 		SystemPrompt:   defaults.systemPrompt,
 		MaxTokens:      defaults.maxTokens,
+		MaxTokensPerSecond: maxTokensPerSecond,
+		MaxConcurrentRequests: maxConcurrentRequests,
+		ConcurrentRequests: concurrentRequests,
+		MaxWaitingRequests: maxWaitingRequests,
+		WaitingRequests: waitingRequests,
+		MaxDegradation: maxDegradation,
 		Temperature:    defaults.temperature,
 		Stream:         defaults.stream,
 	}
@@ -452,6 +551,65 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 			return false, fmt.Errorf("max-tokens must be between %d and %d", minMaxTokens, maxMaxTokens)
 		}
 		defaults.maxTokens = maxTokens
+	}
+
+	h.configMu.RLock()
+	maxTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+	maxConcurrentRequests, _, maxWaitingRequests, _ := 0, 0, 0, 0
+	if scheduler != nil {
+		maxConcurrentRequests, _, maxWaitingRequests, _ = scheduler.Stats()
+	}
+	previousMaxConcurrentRequests := maxConcurrentRequests
+	previousMaxWaitingRequests := maxWaitingRequests
+
+	if maxTokensPerSecondRaw := configQueryValue(queryValues, "max-tokens-per-second", "max_tokens_per_second"); maxTokensPerSecondRaw != "" {
+		parsed, err := strconv.Atoi(maxTokensPerSecondRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid max-tokens-per-second %q", maxTokensPerSecondRaw)
+		}
+		if parsed < minMaxTokensPerSecond || parsed > maxMaxTokensPerSecond {
+			return false, fmt.Errorf("max-tokens-per-second must be between %d and %d", minMaxTokensPerSecond, maxMaxTokensPerSecond)
+		}
+		maxTokensPerSecond = parsed
+	}
+
+	if maxConcurrentRequestsRaw := configQueryValue(queryValues, "max-concurrent-requests", "max_concurrent_requests"); maxConcurrentRequestsRaw != "" {
+		parsed, err := strconv.Atoi(maxConcurrentRequestsRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid max-concurrent-requests %q", maxConcurrentRequestsRaw)
+		}
+		if parsed < minMaxConcurrentRequests || parsed > maxMaxConcurrentRequests {
+			return false, fmt.Errorf("max-concurrent-requests must be between %d and %d", minMaxConcurrentRequests, maxMaxConcurrentRequests)
+		}
+		maxConcurrentRequests = parsed
+	}
+
+	if maxWaitingRequestsRaw := configQueryValue(queryValues, "max-waiting-requests", "max_waiting_requests"); maxWaitingRequestsRaw != "" {
+		parsed, err := strconv.Atoi(maxWaitingRequestsRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid max-waiting-requests %q", maxWaitingRequestsRaw)
+		}
+		if parsed < minMaxWaitingRequests || parsed > maxMaxWaitingRequests {
+			return false, fmt.Errorf("max-waiting-requests must be between %d and %d", minMaxWaitingRequests, maxMaxWaitingRequests)
+		}
+		maxWaitingRequests = parsed
+	}
+	if maxWaitingRequests >= 2*maxConcurrentRequests {
+		return false, fmt.Errorf("max-waiting-requests must be less than %d", 2*maxConcurrentRequests)
+	}
+
+	if maxDegradationRaw := configQueryValue(queryValues, "max-degradation", "max_degradation"); maxDegradationRaw != "" {
+		parsed, err := strconv.Atoi(maxDegradationRaw)
+		if err != nil {
+			return false, fmt.Errorf("invalid max-degradation %q", maxDegradationRaw)
+		}
+		if parsed < minMaxDegradation || parsed > maxMaxDegradation {
+			return false, fmt.Errorf("max-degradation must be between %d and %d", minMaxDegradation, maxMaxDegradation)
+		}
+		maxDegradation = parsed
 	}
 
 	if temperatureRaw := configQueryValue(queryValues, "temperature"); temperatureRaw != "" {
@@ -499,6 +657,19 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.SetCacheSize(cacheSize)
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamModel(downstreamModel)
+	h.SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRequests, maxWaitingRequests, maxDegradation)
+	updatedMaxConcurrentRequests, updatedConcurrentRequests, updatedMaxWaitingRequests, updatedWaitingRequests := h.RequestQueueStats()
+	if updatedMaxConcurrentRequests != previousMaxConcurrentRequests || updatedMaxWaitingRequests != previousMaxWaitingRequests {
+		slog.Info(
+			"request queue limits updated",
+			"max_concurrent_requests", updatedMaxConcurrentRequests,
+			"previous_max_concurrent_requests", previousMaxConcurrentRequests,
+			"concurrent_requests", updatedConcurrentRequests,
+			"max_waiting_requests", updatedMaxWaitingRequests,
+			"previous_max_waiting_requests", previousMaxWaitingRequests,
+			"waiting_requests", updatedWaitingRequests,
+		)
+	}
 
 	return true, nil
 }
@@ -778,43 +949,408 @@ func buildChatCompletionCacheKey(requestPayload chatCompletionRequest) (string, 
 	return string(requestBody), nil
 }
 
-func (h *Handler) replayCachedStream(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
+func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
 	w.Header().Set("Content-Type", contentTypeOrDefault(cachedResponse.contentType, "text/event-stream"))
 	w.WriteHeader(cachedResponse.statusCode)
 
 	flusher, _ := w.(http.Flusher)
-	reader := bytes.NewReader(cachedResponse.body)
 	streamID := newChatCompletionID()
 	createdAt := time.Now().UnixMilli()
+	segments := parseCachedStreamReplaySegments(cachedResponse.body)
 
-	for {
-		line, err := readSSELine(reader)
-		if len(line) > 0 {
-			rewritten := rewriteSSEDataLine(line, true, streamID, createdAt)
+	for _, segment := range segments {
+		if err := h.throttleCachedReplay(ctx, segment.tokenCount); err != nil {
+			return
+		}
+		if len(segment.line) > 0 {
+			rewritten := rewriteSSEDataLine(segment.line, true, streamID, createdAt)
 			_, _ = w.Write(rewritten)
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
-
-		if err == nil {
-			continue
-		}
-		if err == io.EOF {
-			return
-		}
-		return
 	}
-
-	return
 }
 
-
-func (h *Handler) replayCachedResponse(w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
+func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
 	body := rewriteJSONCacheField(cachedResponse.body, true)
+	if err := h.throttleCachedReplay(ctx, cachedJSONTokenCount(cachedResponse.body)); err != nil {
+		return
+	}
 	w.Header().Set("Content-Type", cachedResponse.contentType)
 	w.WriteHeader(cachedResponse.statusCode)
 	_, _ = w.Write(body)
+}
+
+func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), bool) {
+	h.configMu.RLock()
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+	if scheduler == nil {
+		return func() {}, true
+	}
+	return scheduler.AcquirePath(ctx, path)
+}
+
+func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int) error {
+	if tokenCount < 1 {
+		return nil
+	}
+	if delay := h.cachedReplayDelay(tokenCount); delay > 0 {
+		return h.sleep(ctx, delay)
+	}
+	return nil
+}
+
+func (h *Handler) cachedReplayDelay(tokenCount int) time.Duration {
+	if tokenCount < 1 {
+		return 0
+	}
+
+	h.configMu.RLock()
+	baseTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+
+	effectiveTokensPerSecond := float64(baseTokensPerSecond)
+	if baseTokensPerSecond == 0 {
+		return 0
+	}
+	if scheduler != nil {
+		effectiveTokensPerSecond = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
+	}
+	if effectiveTokensPerSecond <= 0 {
+		effectiveTokensPerSecond = 1
+	}
+
+	return time.Duration(float64(tokenCount) * float64(time.Second) / effectiveTokensPerSecond)
+}
+
+func sleepWithContext(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type requestScheduler struct {
+	mu sync.Mutex
+	queue *list.List
+	maxConcurrent int
+	maxWaiting int
+	inFlight int
+	waiting int
+}
+
+type waitingRequest struct {
+	path string
+	ready chan struct{}
+	element *list.Element
+	admitted bool
+}
+
+func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *requestScheduler {
+	if maxConcurrentRequests < 1 {
+		maxConcurrentRequests = 1
+	}
+	if maxWaitingRequests < 0 {
+		maxWaitingRequests = 0
+	}
+	return &requestScheduler{
+		queue: list.New(),
+		maxConcurrent: maxConcurrentRequests,
+		maxWaiting: maxWaitingRequests,
+	}
+}
+
+func (s *requestScheduler) Acquire(ctx context.Context) (func(), bool) {
+	return s.AcquirePath(ctx, "")
+}
+
+func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func(), bool) {
+	s.mu.Lock()
+	if s.inFlight < s.maxConcurrent {
+		s.inFlight++
+		slog.Info("request admitted", "path", path, "source", "direct", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		s.mu.Unlock()
+		return s.releaseFunc(path), true
+	}
+	if s.waiting >= s.maxWaiting {
+		slog.Warn("request admission rejected", "path", path, "reason", "over_capacity", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		s.mu.Unlock()
+		return nil, false
+	}
+
+	request := &waitingRequest{path: path, ready: make(chan struct{})}
+	request.element = s.queue.PushBack(request)
+	s.waiting++
+	slog.Info("request admitted", "path", path, "source", "waiting_queue", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		s.mu.Unlock()
+
+	select {
+	case <-request.ready:
+		return s.releaseFunc(path), true
+	case <-ctx.Done():
+		s.mu.Lock()
+		if request.admitted {
+			s.mu.Unlock()
+			return s.releaseFunc(path), true
+		}
+		if request.element != nil {
+			s.queue.Remove(request.element)
+			request.element = nil
+			s.waiting--
+		}
+		s.mu.Unlock()
+		return nil, false
+	}
+}
+
+func (s *requestScheduler) Reconfigure(maxConcurrentRequests, maxWaitingRequests int) {
+	if maxConcurrentRequests < 1 {
+		maxConcurrentRequests = 1
+	}
+	if maxWaitingRequests < 0 {
+		maxWaitingRequests = 0
+	}
+
+	s.mu.Lock()
+	s.maxConcurrent = maxConcurrentRequests
+	s.maxWaiting = maxWaitingRequests
+	s.promoteWaitingLocked()
+	s.mu.Unlock()
+}
+
+func (s *requestScheduler) Stats() (int, int, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxConcurrent, s.inFlight, s.maxWaiting, s.waiting
+}
+
+func (s *requestScheduler) releaseFunc(path string) func() {
+	return func() {
+		s.mu.Lock()
+		if s.inFlight > 0 {
+			s.inFlight--
+		}
+		slog.Info("request completed", "path", path, "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		s.promoteWaitingLocked()
+		s.mu.Unlock()
+	}
+}
+
+func (s *requestScheduler) promoteWaitingLocked() {
+	for s.inFlight < s.maxConcurrent && s.queue.Len() > 0 {
+		front := s.queue.Front()
+		request := front.Value.(*waitingRequest)
+		s.queue.Remove(front)
+		request.element = nil
+		request.admitted = true
+		s.waiting--
+		s.inFlight++
+		slog.Info("request admitted", "path", request.path, "source", "waiting_to_concurrent", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		close(request.ready)
+	}
+}
+
+func (s *requestScheduler) effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation int) float64 {
+	if baseTokensPerSecond < 1 {
+		return 0
+	}
+	if maxDegradation == 0 {
+		return float64(baseTokensPerSecond)
+	}
+	s.mu.Lock()
+	capacity := s.maxConcurrent
+	inFlight := s.inFlight
+	s.mu.Unlock()
+	if capacity == 0 {
+		return float64(baseTokensPerSecond)
+	}
+	usage := float64(inFlight) / float64(capacity)
+	if usage <= degradationThreshold {
+		return float64(baseTokensPerSecond)
+	}
+	degraded := float64(baseTokensPerSecond) * (1 - float64(maxDegradation)/100)
+	if degraded < 1 {
+		return 1
+	}
+	return degraded
+}
+
+type replayStreamSegment struct {
+	line []byte
+	tokenCount int
+}
+
+func parseCachedStreamReplaySegments(body []byte) []replayStreamSegment {
+	reader := bytes.NewReader(body)
+	segments := make([]replayStreamSegment, 0)
+	contentIndexes := make([]int, 0)
+	contentWeights := make([]int, 0)
+	usageCompletionTokens := 0
+
+	for {
+		line, err := readSSELine(reader)
+		if len(line) > 0 {
+			segment := replayStreamSegment{line: append([]byte(nil), line...)}
+			content, completionTokens := inspectSSEChunk(line)
+			if completionTokens > 0 {
+				usageCompletionTokens = completionTokens
+			}
+			if content != "" {
+				segment.tokenCount = estimateTextTokens(content)
+				contentIndexes = append(contentIndexes, len(segments))
+				contentWeights = append(contentWeights, segment.tokenCount)
+			}
+			segments = append(segments, segment)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if usageCompletionTokens > 0 && len(contentIndexes) > 0 {
+		distributed := distributeTokenBudget(usageCompletionTokens, contentWeights)
+		for index, segmentIndex := range contentIndexes {
+			segments[segmentIndex].tokenCount = distributed[index]
+		}
+	}
+
+	return segments
+}
+
+func cachedJSONTokenCount(body []byte) int {
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0
+	}
+	if response.Usage.CompletionTokens > 0 {
+		return response.Usage.CompletionTokens
+	}
+	parts := make([]string, 0, len(response.Choices))
+	for _, choice := range response.Choices {
+		if choice.Message.Content != "" {
+			parts = append(parts, choice.Message.Content)
+		}
+	}
+	return estimateTextTokens(strings.Join(parts, " "))
+}
+
+func inspectSSEChunk(line []byte) (string, int) {
+	trimmed := bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return "", 0
+	}
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return "", 0
+	}
+
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+		Usage struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return "", 0
+	}
+	contentParts := make([]string, 0, len(chunk.Choices))
+	for _, choice := range chunk.Choices {
+		if choice.Delta.Content != "" {
+			contentParts = append(contentParts, choice.Delta.Content)
+		}
+	}
+	return strings.Join(contentParts, " "), chunk.Usage.CompletionTokens
+}
+
+func distributeTokenBudget(total int, weights []int) []int {
+	distributed := make([]int, len(weights))
+	if total <= 0 || len(weights) == 0 {
+		return distributed
+	}
+	weightSum := 0
+	for _, weight := range weights {
+		if weight > 0 {
+			weightSum += weight
+		}
+	}
+	if weightSum == 0 {
+		for index := 0; index < len(distributed) && total > 0; index++ {
+			distributed[index] = 1
+			total--
+		}
+		return distributed
+	}
+
+	allocated := 0
+	for index, weight := range weights {
+		if weight < 1 {
+			weight = 1
+		}
+		share := int(math.Floor(float64(total) * float64(weight) / float64(weightSum)))
+		if share < 1 && allocated < total {
+			share = 1
+		}
+		distributed[index] = share
+		allocated += share
+	}
+	for allocated > total {
+		for index := len(distributed) - 1; index >= 0 && allocated > total; index-- {
+			if distributed[index] > 0 {
+				distributed[index]--
+				allocated--
+			}
+		}
+	}
+	for allocated < total {
+		for index := range distributed {
+			distributed[index]++
+			allocated++
+			if allocated == total {
+				break
+			}
+		}
+	}
+	return distributed
+}
+
+func estimateTextTokens(text string) int {
+	fields := strings.Fields(text)
+	if len(fields) > 0 {
+		return len(fields)
+	}
+	if strings.TrimSpace(text) != "" {
+		return 1
+	}
+	return 0
 }
 
 func readSSELine(reader io.Reader) ([]byte, error) {
