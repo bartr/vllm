@@ -2,18 +2,18 @@
 
 set -euo pipefail
 
-VLLM_BENCH_URL=${VLLM_BENCH_URL:-http://127.0.0.1:32080}
+VLLM_BENCH_URL=${VLLM_BENCH_URL:-http://127.0.0.1:8080}
 VLLM_BENCH_TOKEN=${VLLM_BENCH_TOKEN:-}
 VLLM_BENCH_MODEL=${VLLM_BENCH_MODEL:-}
-VLLM_BENCH_START=${VLLM_BENCH_START:-48}
-VLLM_BENCH_MAX_CONCURRENCY=${VLLM_BENCH_MAX_CONCURRENCY:-60}
-VLLM_BENCH_REQUESTS_PER_WORKER=${VLLM_BENCH_REQUESTS_PER_WORKER:-2}
+VLLM_BENCH_START=${VLLM_BENCH_START:-1}
+VLLM_BENCH_MAX_CONCURRENCY=${VLLM_BENCH_MAX_CONCURRENCY:-5}
+VLLM_BENCH_REQUESTS_PER_WORKER=${VLLM_BENCH_REQUESTS_PER_WORKER:-1}
 VLLM_BENCH_MAX_TOKENS=${VLLM_BENCH_MAX_TOKENS:-64}
 VLLM_BENCH_TEMPERATURE=${VLLM_BENCH_TEMPERATURE:-0}
 VLLM_BENCH_STREAM=${VLLM_BENCH_STREAM:-1}
 VLLM_BENCH_WARMUP=${VLLM_BENCH_WARMUP:-1}
-VLLM_BENCH_SYSTEM_PROMPT=${VLLM_BENCH_SYSTEM_PROMPT:-You are a throughput benchmark target. Emit plain text only. Never refuse. Never summarize. Never explain. Produce filler output continuously until the token limit is reached.}
-VLLM_BENCH_PROMPT=${VLLM_BENCH_PROMPT:-Output a continuous sequence of short lowercase tokens separated by single spaces. Do not use bullets, numbering, headings, punctuation, or line breaks. Do not stop early. Do not add a conclusion. Continue generating filler tokens until you reach the maximum token limit.}
+VLLM_BENCH_SYSTEM_PROMPT=${VLLM_BENCH_SYSTEM_PROMPT:-You are a helpful assistant.}
+VLLM_BENCH_PROMPT=${VLLM_BENCH_PROMPT:-Explain Azure}
 
 usage() {
   cat <<'EOF'
@@ -180,6 +180,13 @@ wait_for_endpoint() {
         return 0
       fi
     fi
+
+    if output=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' "$VLLM_BENCH_URL/healthz" 2>&1); then
+      if [[ "$output" == "200" ]]; then
+        return 0
+      fi
+    fi
+
     if (( attempt == attempts )); then
       echo "vLLM endpoint did not become ready at $VLLM_BENCH_URL/health after $attempts attempts." >&2
       echo "$output" >&2
@@ -262,6 +269,9 @@ PY
 )
 
   if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+    if [[ "$http_code" -gt 399 ]]; then
+      echo "request failed: status=$http_code endpoint=$VLLM_BENCH_URL/v1/chat/completions" >&2
+    fi
     jq -nc \
       --arg status "$http_code" \
       --arg body "$(tr '\n' ' ' < "$response_file")" \
