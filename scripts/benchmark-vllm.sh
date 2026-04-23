@@ -34,7 +34,7 @@ Options:
       --max-tokens N         Max completion tokens per request (default: 1024)
       --temperature VALUE    Sampling temperature (default: 0)
       --stream               Use streaming chat completions and measure TTFT
-      --warmup N             Run one untimed warmup request when N=1, skip when N=0 (default: 1)
+      --warmup               Run one untimed warmup request
       --system-prompt TEXT   System prompt sent with each request
       --prompt TEXT          User prompt sent with each request
 
@@ -108,8 +108,8 @@ while [[ $# -gt 0 ]]; do
       shift 1
       ;;
     --warmup)
-      VLLM_BENCH_WARMUP=$2
-      shift 2
+      VLLM_BENCH_WARMUP=1
+      shift 1
       ;;
     --system-prompt)
       VLLM_BENCH_SYSTEM_PROMPT=$2
