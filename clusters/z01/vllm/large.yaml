@@ -25,25 +25,19 @@ spec:
           image: vllm/vllm-openai:v0.19.1@sha256:89c1d0629d377daa3f7f369cbea6167a7b48ea89aaacd12555e2b0b2f7f740d3
           args:
             - --model
-            - Qwen/Qwen2.5-3B-Instruct
+            - Qwen/Qwen2.5-7B-Instruct-AWQ
             - --revision
-            - aa8e72537993ba99e69dfaafa59ed015b17504d1
+            - b25037543e9394b818fdfca67ab2a00ecc7dd641
             - --served-model-name
-            - Qwen/Qwen2.5-3B-Instruct
+            - Qwen/Qwen2.5-7B-Instruct-AWQ
             - --host
             - 0.0.0.0
             - --port
             - "8000"
             - --gpu-memory-utilization
-            - "0.90"
-            - --performance-mode
-            - throughput
-            - --max-num-seqs
-            - "256"
-            - --max-num-batched-tokens
-            - "2048"
+            - "0.95"
             - --max-model-len
-            - "4096"
+            - "2048"
           ports:
             - containerPort: 8000
               name: http
@@ -76,11 +70,11 @@ spec:
             periodSeconds: 15
           resources:
             requests:
-              cpu: "4"
-              memory: 12Gi
-            limits:
-              cpu: "8"
+              cpu: "6"
               memory: 16Gi
+            limits:
+              cpu: "10"
+              memory: 20Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - mountPath: /cache

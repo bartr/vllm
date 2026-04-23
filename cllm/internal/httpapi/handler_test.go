@@ -34,7 +34,7 @@ func TestRoutes(t *testing.T) {
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":31.2`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
 		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
@@ -744,8 +744,8 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	if got.MaxTokensPerSecond != 48 {
 		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
 	}
-	if got.EffectiveTokensPerSecond != 46.8 {
-		t.Fatalf("effective tokens per second = %v, want %v", got.EffectiveTokensPerSecond, 46.8)
+	if got.EffectiveTokensPerSecond != 49.2 {
+		t.Fatalf("effective tokens per second = %v, want %v", got.EffectiveTokensPerSecond, 49.2)
 	}
 	if got.MaxConcurrentRequests != 64 {
 		t.Fatalf("max concurrent requests = %d, want %d", got.MaxConcurrentRequests, 64)
@@ -1070,7 +1070,7 @@ func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
 	for _, want := range []string{
 		`msg="computed degradation updated" source=limits_updated computed_degradation_percentage=0`,
 		`msg="computed degradation updated" source=request_admitted computed_degradation_percentage=5.556`,
-		`effective_tokens_per_second=18.417`,
+		`effective_tokens_per_second=19.361`,
 		`msg="computed degradation updated" source=request_completed computed_degradation_percentage=0`,
 	} {
 		if !strings.Contains(logOutput, want) {
@@ -1101,8 +1101,8 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 	if got.ComputedDegradationPercentage != 0.022 {
 		t.Fatalf("computed degradation percentage = %v, want 0.022", got.ComputedDegradationPercentage)
 	}
-	if got.EffectiveTokensPerSecond != 97.479 {
-		t.Fatalf("effective tokens per second = %v, want 97.479", got.EffectiveTokensPerSecond)
+	if got.EffectiveTokensPerSecond != 102.478 {
+		t.Fatalf("effective tokens per second = %v, want 102.478", got.EffectiveTokensPerSecond)
 	}
 }
 

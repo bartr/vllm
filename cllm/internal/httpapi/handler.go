@@ -44,7 +44,7 @@ const (
 	defaultMaxWaitingRequests = 1023
 	defaultMaxDegradation = 10
 	degradationThreshold = 0.10
-	replayTokensPerSecondEfficiency = 0.975
+	replayTokensPerSecondCompensation = 1.025
 )
 
 type askOptions struct {
@@ -1122,7 +1122,7 @@ func calibratedTokensPerSecond(configuredTokensPerSecond int) float64 {
 	if configuredTokensPerSecond < 1 {
 		return 0
 	}
-	calibrated := float64(configuredTokensPerSecond) * replayTokensPerSecondEfficiency
+	calibrated := float64(configuredTokensPerSecond) * replayTokensPerSecondCompensation
 	if calibrated < 1 {
 		return 1
 	}
