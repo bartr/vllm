@@ -30,8 +30,6 @@ Add a first-phase in-cluster observability stack on K3s using Prometheus and Gra
 - `/home/bartr/vllm/manifests/vllm-small.yaml` — template for any vLLM service annotations, metrics port exposure, or pod labels needed for scraping.
 - `/home/bartr/vllm/manifests/vllm-medium.yaml` — keep the shared deployment shape aligned with the small profile changes.
 - `/home/bartr/vllm/manifests/vllm-large.yaml` — keep the shared deployment shape aligned with the large profile changes.
-- `/home/bartr/vllm/scripts/install-nvidia-device-plugin.sh` — reference pattern for adding a reproducible Helm-based installer for observability components.
-- `/home/bartr/vllm/helm/nvidia-device-plugin-values.yaml` — reference pattern for storing chart values in-repo.
 
 **Verification**
 1. Install the monitoring stack and confirm all monitoring pods in the `monitoring` namespace become Ready.

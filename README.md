@@ -31,11 +31,11 @@ sudo ./scripts/install-nvidia-container-toolkit.sh
 
 ```
 
-The script installs chart version `0.19.0` with automatic GPU node labeling enabled and prints the GPU capacity discovered on each node.
+Apply the GitOps-managed NVIDIA device plugin manifests:
 
 ```bash
 
-./scripts/install-nvidia-device-plugin.sh --clean
+kubectl apply -k ./clusters/z01/nvidia-plugin
 
 ```
 
