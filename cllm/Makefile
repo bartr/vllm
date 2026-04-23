@@ -4,12 +4,12 @@ DOCKER ?= docker
 IMAGE ?= cllm:0.1.0
 K3S ?= sudo k3s
 
-.PHONY: build run test fmt clean import
+.PHONY: build run test fmt clean deploy
 
 build:
 	$(DOCKER) build -t $(IMAGE) .
 
-import: build
+deploy: build
 	$(DOCKER) save $(IMAGE) | $(K3S) ctr images import -
 	$(K3S) ctr images ls | grep $(BINARY)
 
