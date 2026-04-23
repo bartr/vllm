@@ -11,6 +11,7 @@ build:
 
 import: build
 	$(DOCKER) save $(IMAGE) | $(K3S) ctr images import -
+	$(K3S) ctr images ls | grep $(BINARY)
 
 run:
 	$(GO) run ./cmd/cllm
