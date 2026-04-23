@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +41,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		logger.Error("load config", "err", err)
 		return 1
+	}
+
+	resolvedModel, err := resolveStartupDownstreamModel(context.Background(), logger, cfg)
+	if err != nil {
+		logger.Error("resolve downstream model", "err", err, "downstream_url", cfg.DownstreamURL)
+		return 1
+	}
+	if resolvedModel != "" {
+		cfg.DownstreamModel = resolvedModel
 	}
 
 	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
@@ -104,6 +116,86 @@ func newServer(cfg config.Config, handler http.Handler) *http.Server {
 		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 	}
+}
+
+type modelsListResponse struct {
+	Data []struct {
+		ID        string `json:"id"`
+		Default   bool   `json:"default"`
+		IsDefault bool   `json:"is_default"`
+	} `json:"data"`
+}
+
+func resolveStartupDownstreamModel(ctx context.Context, logger *slog.Logger, cfg config.Config) (string, error) {
+	if cfg.DownstreamModel != "" {
+		return cfg.DownstreamModel, nil
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cfg.DownstreamURL, "/")+"/v1/models", nil)
+	if err != nil {
+		return "", fmt.Errorf("build models request: %w", err)
+	}
+	if cfg.DownstreamToken != "" {
+		request.Header.Set("Authorization", "Bearer "+cfg.DownstreamToken)
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("send models request: %w", err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return "", fmt.Errorf("read models response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", fmt.Errorf("models request failed with HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var modelsResponse modelsListResponse
+	if err := json.Unmarshal(body, &modelsResponse); err != nil {
+		return "", fmt.Errorf("decode models response: %w", err)
+	}
+
+	modelIDs := make([]string, 0, len(modelsResponse.Data))
+	defaultModel := ""
+	for _, model := range modelsResponse.Data {
+		if model.ID == "" {
+			continue
+		}
+		modelIDs = append(modelIDs, model.ID)
+		if defaultModel == "" && (model.Default || model.IsDefault) {
+			defaultModel = model.ID
+		}
+	}
+	if len(modelIDs) == 0 {
+		return "", fmt.Errorf("models response did not include a model id")
+	}
+
+	selectedModel := defaultModel
+	selectionSource := "default"
+	if selectedModel == "" {
+		selectedModel = modelIDs[0]
+		selectionSource = "first"
+	}
+
+	logger.Info(
+		"resolved downstream model from downstream /v1/models",
+		"selected_model", selectedModel,
+		"selection_source", selectionSource,
+		"downstream_url", cfg.DownstreamURL,
+	)
+	if len(modelIDs) > 1 {
+		logger.Info(
+			"multiple downstream models available",
+			"selected_model", selectedModel,
+			"available_models", slices.Clone(modelIDs),
+		)
+	}
+
+	return selectedModel, nil
 }
 
 func hasHelpFlag(args []string) bool {

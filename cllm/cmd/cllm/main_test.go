@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -79,5 +83,83 @@ func TestNewServerDisablesWriteTimeoutForStreaming(t *testing.T) {
 	}
 	if server.IdleTimeout != 60*time.Second {
 		t.Fatalf("IdleTimeout = %s, want %s", server.IdleTimeout, 60*time.Second)
+	}
+}
+
+func TestResolveStartupDownstreamModelUsesConfiguredModel(t *testing.T) {
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+
+	model, err := resolveStartupDownstreamModel(context.Background(), logger, config.Config{
+		DownstreamURL:   "http://127.0.0.1:32080",
+		DownstreamModel: "configured-model",
+	})
+	if err != nil {
+		t.Fatalf("resolveStartupDownstreamModel() error = %v", err)
+	}
+	if model != "configured-model" {
+		t.Fatalf("model = %q, want %q", model, "configured-model")
+	}
+	if logBuffer.Len() != 0 {
+		t.Fatalf("log output = %q, want empty", logBuffer.String())
+	}
+}
+
+func TestResolveStartupDownstreamModelFetchesAndLogsSelection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {
+			t.Fatalf("authorization = %q, want %q", got, "Bearer secret-token")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"fallback-model"},{"id":"preferred-model","default":true},{"id":"extra-model"}]}`))
+	}))
+	defer server.Close()
+
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+
+	model, err := resolveStartupDownstreamModel(context.Background(), logger, config.Config{
+		DownstreamURL:   server.URL,
+		DownstreamToken: "secret-token",
+	})
+	if err != nil {
+		t.Fatalf("resolveStartupDownstreamModel() error = %v", err)
+	}
+	if model != "preferred-model" {
+		t.Fatalf("model = %q, want %q", model, "preferred-model")
+	}
+
+	logOutput := logBuffer.String()
+	for _, want := range []string{
+		`msg="resolved downstream model from downstream /v1/models"`,
+		`selected_model=preferred-model`,
+		`selection_source=default`,
+		`msg="multiple downstream models available"`,
+		`available_models="[fallback-model preferred-model extra-model]"`,
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("log output %q does not contain %q", logOutput, want)
+		}
+	}
+}
+
+func TestResolveStartupDownstreamModelFailsWhenNoModelAvailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{}]}`))
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	_, err := resolveStartupDownstreamModel(context.Background(), logger, config.Config{DownstreamURL: server.URL})
+	if err == nil {
+		t.Fatal("resolveStartupDownstreamModel() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "models response did not include a model id") {
+		t.Fatalf("error = %q, want models response error", err.Error())
 	}
 }
