@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cllm
+  namespace: cllm
+  labels:
+    app.kubernetes.io/name: cllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cllm
+  template:
+    metadata:
+      labels:
+        app: cllm
+        app.kubernetes.io/name: cllm
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: cllm
+          image: cllm:0.1.0
+          imagePullPolicy: Never
+          env:
+            - name: CACHE_DOWNSTREAM_URL
+              value: http://vllm.llm.svc.cluster.local:8000
+          ports:
+            - containerPort: 8080
+              name: http
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

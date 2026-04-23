@@ -96,7 +96,22 @@ The downstream token is intentionally not returned by `/config`.
 ## Build
 
 ```bash
-go build -o bin/cllm ./cmd/cllm
+make build
+```
+
+This builds the local container image `cllm:0.1.0`.
+
+To import that image into the local k3s container runtime:
+
+```bash
+make import
+```
+
+That runs the equivalent of:
+
+```bash
+docker build -t cllm:0.1.0 .
+docker save cllm:0.1.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -108,6 +123,32 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm .
-docker run --rm -p 8080:8080 cllm
+docker build -t cllm:0.1.0 .
+docker run --rm -p 8080:8080 cllm:0.1.0
+```
+
+## Kubernetes
+
+The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters/z01/cllm).
+
+They:
+
+- deploy `cllm:0.1.0`
+- set `imagePullPolicy: Never` so the local image is never pulled from a registry
+- run `cllm` in the `cllm` namespace
+- expose it internally on service port `8080`
+- expose it through a dedicated Traefik `cllm` entrypoint on external port `8080`
+
+Apply the manifests with:
+
+```bash
+kubectl apply -k /home/bartr/vllm/clusters/z01/cllm
+kubectl -n kube-system rollout status deployment/traefik
+kubectl -n cllm rollout status deployment/cllm
+```
+
+Then call it through the Traefik external IP on port `8080`:
+
+```bash
+curl -i http://192.168.68.63:8080/healthz
 ```

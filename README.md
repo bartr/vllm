@@ -186,6 +186,29 @@ Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 
 By default, `ask.sh` targets `http://localhost:8080` through `ASK_URL`, which is expected to be the local `cllm` service.
 
+For an in-cluster `cllm` deployment, use the manifests in [clusters/z01/cllm](/home/bartr/vllm/clusters/z01/cllm). They deploy the local image `cllm:0.1.0` with `imagePullPolicy: Never` and expose it through a dedicated Traefik entrypoint on port `8080`.
+
+Local build and import flow:
+
+```bash
+cd /home/bartr/vllm/cllm
+make import
+```
+
+Apply the cluster manifests:
+
+```bash
+kubectl apply -k /home/bartr/vllm/clusters/z01/cllm
+kubectl -n kube-system rollout status deployment/traefik
+kubectl -n cllm rollout status deployment/cllm
+```
+
+Then call `cllm` through the Traefik external IP on port `8080`:
+
+```bash
+curl -i http://192.168.68.63:8080/healthz
+```
+
 If `ASK_TOKEN` is set, `ask.sh` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints.
 
 If you point `ASK_URL` at `https://api.openai.com`, set `ASK_MODEL` to a model you have access to, such as `gpt-4.1`.

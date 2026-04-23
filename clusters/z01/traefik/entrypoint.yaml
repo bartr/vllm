@@ -12,3 +12,9 @@ spec:
           default: true
         exposedPort: 8000
         protocol: TCP
+      cllm:
+        port: 8081
+        expose:
+          default: true
+        exposedPort: 8080
+        protocol: TCP

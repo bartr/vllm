@@ -1,0 +1,14 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: cllm
+  namespace: cllm
+spec:
+  entryPoints:
+    - cllm
+  routes:
+    - match: PathPrefix(`/`)
+      kind: Rule
+      services:
+        - name: cllm
+          port: 8080
