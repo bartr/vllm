@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"cllm/internal/buildinfo"
 	"cllm/internal/config"
 	"context"
 	"encoding/json"
@@ -32,6 +33,7 @@ func TestRoutes(t *testing.T) {
 	}{
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
+		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
 		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
@@ -48,6 +50,10 @@ func TestRoutes(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
+			originalVersion := buildinfo.Version
+			buildinfo.Version = "9.9.9"
+			defer func() { buildinfo.Version = originalVersion }()
+
 			req := httptest.NewRequest(test.method, test.path, nil)
 			recorder := httptest.NewRecorder()
 

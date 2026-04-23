@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"cllm/internal/buildinfo"
 	"context"
 	"container/list"
 	"crypto/rand"
@@ -244,6 +245,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /config", h.config)
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
+	mux.HandleFunc("GET /version", h.version)
 	mux.HandleFunc("GET /ask", h.ask)
 	mux.HandleFunc("GET /v1/models", h.models)
 	mux.HandleFunc("POST /v1/chat/completions", h.chatCompletions)
@@ -280,6 +282,13 @@ func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writePlainText(w, http.StatusOK, "ready\n")
+}
+
+func (h *Handler) version(w http.ResponseWriter, _ *http.Request) {
+	markCacheHit(w, false)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, buildinfo.Version)
 }
 
 func (h *Handler) config(w http.ResponseWriter, r *http.Request) {

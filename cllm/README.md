@@ -6,6 +6,7 @@
 
 - `GET /healthz` returns `ok`
 - `GET /readyz` returns `ready`
+- `GET /version` returns the current application version as plain text with no surrounding whitespace
 - `GET /ask` returns `success`
 - `GET /config` returns the live handler config and applies any supported query string updates before printing it
 
