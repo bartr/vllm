@@ -92,7 +92,7 @@ func TestResolveStartupDownstreamModelUsesConfiguredModel(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
 
 	model, err := resolveStartupDownstreamModel(context.Background(), logger, config.Config{
-		DownstreamURL:   "http://127.0.0.1:32080",
+		DownstreamURL:   "http://localhost:8000",
 		DownstreamModel: "configured-model",
 	})
 	if err != nil {

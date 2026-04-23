@@ -24,7 +24,7 @@ completion tokens/sec found across a concurrency sweep.
 
 Options:
   -h, --help                 Show this help message and exit
-      --url URL              Base URL for vLLM (default: http://127.0.0.1:32080)
+      --url URL              Base URL for vLLM (default: http://localhost:8000)
       --token TOKEN          Bearer token for authenticated endpoints
       --model MODEL          Model ID to benchmark; auto-detected from /v1/models if omitted
       --start N              Lowest concurrency level to test (default: 20)

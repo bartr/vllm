@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	defaultVLLMURL          = "http://127.0.0.1:32080"
+	defaultVLLMURL          = "http://localhost:8000"
 	defaultCacheSize        = 100
 	defaultSystemPrompt     = "You are a helpful assistant."
 	minMaxTokens            = 100

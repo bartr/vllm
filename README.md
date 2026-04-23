@@ -211,7 +211,7 @@ Benchmark the local vLLM instance directly with [scripts/benchmark-vllm.sh](/hom
 ./scripts/benchmark-vllm.sh
 ```
 
-By default it targets `http://127.0.0.1:32080`, auto-detects the active model from `/v1/models`, sends long non-streaming completion requests, starts its concurrency sweep at `VLLM_BENCH_START=20`, and runs through `VLLM_BENCH_MAX_CONCURRENCY=50`.
+By default it targets `http://localhost:8000`, auto-detects the active model from `/v1/models`, sends long non-streaming completion requests, starts its concurrency sweep at `VLLM_BENCH_START=20`, and runs through `VLLM_BENCH_MAX_CONCURRENCY=50`.
 
 For each concurrency level it reports:
 

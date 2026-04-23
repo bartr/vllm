@@ -13,7 +13,7 @@ import (
 
 const (
 	defaultCacheSize             = 100
-	defaultDownstreamURL         = "http://127.0.0.1:32080"
+	defaultDownstreamURL         = "http://localhost:8000"
 	defaultMaxTokens             = 4000
 	defaultTemperature           = 0.2
 	defaultSystemPrompt          = "You are a helpful assistant."
@@ -95,7 +95,7 @@ func Usage() string {
 	builder.WriteString("  -h, --help                  Show this help message and exit\n")
 	builder.WriteString("      --version               Show version information and exit\n")
 	builder.WriteString("  -c, --cache-size int        Maximum number of cached chat responses\n")
-	builder.WriteString("      --downstream-url string Downstream OpenAI-compatible base URL (default http://127.0.0.1:32080)\n")
+	builder.WriteString("      --downstream-url string Downstream OpenAI-compatible base URL (default http://localhost:8000)\n")
 	builder.WriteString("      --downstream-token str  Bearer token for downstream requests\n")
 	builder.WriteString("      --downstream-model str  Default downstream model when requests omit model\n")
 	builder.WriteString(fmt.Sprintf("      --system-prompt string  Default system prompt for /ask (default %q)\n", defaultSystemPrompt))
