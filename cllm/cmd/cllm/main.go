@@ -43,7 +43,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
-	handler.SetModelsCacheTTL(cfg.ModelsCacheTTL)
 	server := newServer(cfg, handler.Routes())
 
 	serverErrCh := make(chan error, 1)
@@ -54,7 +53,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"cache_size", cfg.CacheSize,
 			"downstream_url", cfg.DownstreamURL,
 			"downstream_model", cfg.DownstreamModel,
-			"models_cache_ttl", cfg.ModelsCacheTTL,
 			"system_prompt", cfg.SystemPrompt,
 			"max_tokens", cfg.MaxTokens,
 			"temperature", cfg.Temperature,

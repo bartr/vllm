@@ -23,7 +23,6 @@ import (
 const (
 	defaultVLLMURL          = "http://127.0.0.1:32080"
 	defaultCacheSize        = 100
-	defaultModelsCacheTTL   = time.Hour
 	defaultSystemPrompt     = "You are a helpful assistant."
 	minMaxTokens            = 100
 	maxMaxTokens            = 4000
@@ -60,10 +59,8 @@ type Handler struct {
 	downstreamToken string
 	downstreamModel string
 	httpClient *http.Client
-	now        func() time.Time
 	modelsMu   sync.RWMutex
 	modelsCache *cachedModelsResponse
-	modelsCacheTTL time.Duration
 }
 
 func NewHandler() *Handler {
@@ -73,18 +70,7 @@ func NewHandler() *Handler {
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
-	handler.now = time.Now
-	handler.modelsCacheTTL = defaultModelsCacheTTL
 	return handler
-}
-
-func (h *Handler) SetModelsCacheTTL(ttl time.Duration) {
-	if ttl < 0 {
-		ttl = 0
-	}
-	h.modelsMu.Lock()
-	h.modelsCacheTTL = ttl
-	h.modelsMu.Unlock()
 }
 
 func (h *Handler) SetDownstreamToken(token string) {
@@ -175,7 +161,6 @@ type runtimeConfig struct {
 	MaxTokens      int     `json:"max_tokens"`
 	Temperature    float64 `json:"temperature"`
 	Stream         bool    `json:"stream"`
-	ModelsCacheTTL string  `json:"models_cache_ttl"`
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -432,7 +417,6 @@ func (h *Handler) currentConfig() runtimeConfig {
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
 	downstreamModel := h.downstreamModel
-	modelsCacheTTL := h.modelsCacheTTL
 	h.modelsMu.RUnlock()
 
 	return runtimeConfig{
@@ -444,7 +428,6 @@ func (h *Handler) currentConfig() runtimeConfig {
 		MaxTokens:      defaults.maxTokens,
 		Temperature:    defaults.temperature,
 		Stream:         defaults.stream,
-		ModelsCacheTTL: modelsCacheTTL.String(),
 	}
 }
 
@@ -502,23 +485,12 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
 	downstreamModel := h.downstreamModel
-	modelsCacheTTL := h.modelsCacheTTL
 	h.modelsMu.RUnlock()
 	if downstreamURLRaw := configQueryValue(queryValues, "downstream-url", "downstream_url"); downstreamURLRaw != "" {
 		downstreamURL = downstreamURLRaw
 	}
 	if downstreamModelRaw := configQueryValue(queryValues, "downstream-model", "downstream_model"); downstreamModelRaw != "" {
 		downstreamModel = downstreamModelRaw
-	}
-	if modelsCacheTTLRaw := configQueryValue(queryValues, "models-cache-ttl", "models_cache_ttl"); modelsCacheTTLRaw != "" {
-		parsed, err := time.ParseDuration(modelsCacheTTLRaw)
-		if err != nil {
-			return false, fmt.Errorf("invalid models-cache-ttl %q: %w", modelsCacheTTLRaw, err)
-		}
-		if parsed < 0 {
-			return false, fmt.Errorf("models-cache-ttl must be non-negative")
-		}
-		modelsCacheTTL = parsed
 	}
 
 	h.configMu.Lock()
@@ -527,7 +499,6 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.SetCacheSize(cacheSize)
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamModel(downstreamModel)
-	h.SetModelsCacheTTL(modelsCacheTTL)
 
 	return true, nil
 }
@@ -574,7 +545,6 @@ type cachedModelsResponse struct {
 	statusCode  int
 	contentType string
 	defaultModel string
-	cachedAt    time.Time
 }
 
 type chatCompletionRequest struct {
@@ -666,7 +636,6 @@ func (h *Handler) getOrFetchModels(ctx context.Context) (cachedModelsResponse, e
 		statusCode:   response.StatusCode,
 		contentType:  contentTypeOrDefault(response.Header.Get("Content-Type"), "application/json"),
 		defaultModel: modelsResponseBody.Data[0].ID,
-		cachedAt:     h.now(),
 	}
 
 	return cloneCachedModelsResponse(*h.modelsCache), nil
@@ -678,18 +647,11 @@ func cloneCachedModelsResponse(models cachedModelsResponse) cachedModelsResponse
 		statusCode:   models.statusCode,
 		contentType:  models.contentType,
 		defaultModel: models.defaultModel,
-		cachedAt:     models.cachedAt,
 	}
 }
 
 func (h *Handler) modelsCacheFreshLocked() bool {
-	if h.modelsCache == nil {
-		return false
-	}
-	if h.modelsCacheTTL == 0 {
-		return false
-	}
-	return h.now().Sub(h.modelsCache.cachedAt) < h.modelsCacheTTL
+	return h.modelsCache != nil
 }
 
 func (h *Handler) createChatCompletion(ctx context.Context, requestPayload chatCompletionRequest) ([]byte, int, string, error) {

@@ -15,7 +15,6 @@ const (
 	defaultCacheSize      = 100
 	defaultDownstreamURL  = "http://127.0.0.1:32080"
 	defaultMaxTokens     = 4000
-	defaultModelsCacheTTL = time.Hour
 	defaultTemperature   = 0.2
 	defaultSystemPrompt  = "You are a helpful assistant."
 	minMaxTokens         = 100
@@ -28,7 +27,6 @@ type Config struct {
 	DownstreamURL   string
 	DownstreamToken string
 	DownstreamModel string
-	ModelsCacheTTL  time.Duration
 	SystemPrompt    string
 	MaxTokens       int
 	Temperature     float64
@@ -63,7 +61,6 @@ func LoadFromArgs(args []string) (Config, error) {
 		DownstreamURL:   runtimeOptions.downstreamURL,
 		DownstreamToken: runtimeOptions.downstreamToken,
 		DownstreamModel: runtimeOptions.downstreamModel,
-		ModelsCacheTTL:  runtimeOptions.modelsCacheTTL,
 		SystemPrompt:    runtimeOptions.systemPrompt,
 		MaxTokens:       runtimeOptions.maxTokens,
 		Temperature:     runtimeOptions.temperature,
@@ -81,7 +78,6 @@ func Usage() string {
 	builder.WriteString("      --downstream-url string Downstream OpenAI-compatible base URL (default http://127.0.0.1:32080)\n")
 	builder.WriteString("      --downstream-token str  Bearer token for downstream requests\n")
 	builder.WriteString("      --downstream-model str  Default downstream model when requests omit model\n")
-	builder.WriteString("      --models-cache-ttl d    How long to keep the upstream /v1/models response cached (default 1h)\n")
 	builder.WriteString(fmt.Sprintf("      --system-prompt string  Default system prompt for /ask (default %q)\n", defaultSystemPrompt))
 	builder.WriteString(fmt.Sprintf("      --max-tokens int        Default max tokens for /ask (default %d)\n", defaultMaxTokens))
 	builder.WriteString(fmt.Sprintf("      --temperature float     Default temperature for /ask (default %.1f)\n\n", defaultTemperature))
@@ -92,7 +88,6 @@ func Usage() string {
 	builder.WriteString("  CACHE_DOWNSTREAM_URL\n")
 	builder.WriteString("  CACHE_DOWNSTREAM_TOKEN\n")
 	builder.WriteString("  CACHE_DOWNSTREAM_MODEL\n")
-	builder.WriteString("  CACHE_MODELS_CACHE_TTL\n")
 	builder.WriteString("  CACHE_SYSTEM_PROMPT\n")
 	builder.WriteString("  CACHE_MAX_TOKENS\n")
 	builder.WriteString("  CACHE_TEMPERATURE\n")
@@ -104,7 +99,6 @@ type runtimeOptions struct {
 	downstreamURL  string
 	downstreamToken string
 	downstreamModel string
-	modelsCacheTTL time.Duration
 	systemPrompt string
 	maxTokens    int
 	temperature  float64
@@ -114,7 +108,6 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	options := runtimeOptions{
 		cacheSize:      defaultCacheSize,
 		downstreamURL:  defaultDownstreamURL,
-		modelsCacheTTL: defaultModelsCacheTTL,
 		systemPrompt: defaultSystemPrompt,
 		maxTokens:    defaultMaxTokens,
 		temperature:  defaultTemperature,
@@ -144,17 +137,6 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 		options.systemPrompt = envValue
 	}
 
-	if envValue := os.Getenv("CACHE_MODELS_CACHE_TTL"); envValue != "" {
-		parsedValue, err := time.ParseDuration(envValue)
-		if err != nil {
-			return runtimeOptions{}, fmt.Errorf("invalid CACHE_MODELS_CACHE_TTL %q: %w", envValue, err)
-		}
-		if parsedValue < 0 {
-			return runtimeOptions{}, fmt.Errorf("CACHE_MODELS_CACHE_TTL must be non-negative")
-		}
-		options.modelsCacheTTL = parsedValue
-	}
-
 	if envValue := os.Getenv("CACHE_MAX_TOKENS"); envValue != "" {
 		parsedValue, err := strconv.Atoi(envValue)
 		if err != nil {
@@ -181,7 +163,6 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	flagSet.StringVar(&options.downstreamURL, "downstream-url", options.downstreamURL, "downstream OpenAI-compatible base URL")
 	flagSet.StringVar(&options.downstreamToken, "downstream-token", options.downstreamToken, "bearer token for downstream requests")
 	flagSet.StringVar(&options.downstreamModel, "downstream-model", options.downstreamModel, "default downstream model when model is omitted")
-	flagSet.DurationVar(&options.modelsCacheTTL, "models-cache-ttl", options.modelsCacheTTL, "how long to keep the upstream models list cached")
 	flagSet.StringVar(&options.systemPrompt, "system-prompt", options.systemPrompt, "default system prompt for ask requests")
 	flagSet.IntVar(&options.maxTokens, "max-tokens", options.maxTokens, "default max tokens for ask requests")
 	flagSet.Float64Var(&options.temperature, "temperature", options.temperature, "default temperature for ask requests")
@@ -209,10 +190,6 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 			normalizedArgs = append(normalizedArgs, "-system-prompt")
 		case len(arg) > len("--system-prompt=") && arg[:len("--system-prompt=")] == "--system-prompt=":
 			normalizedArgs = append(normalizedArgs, "-system-prompt="+arg[len("--system-prompt="):])
-		case arg == "--models-cache-ttl":
-			normalizedArgs = append(normalizedArgs, "-models-cache-ttl")
-		case len(arg) > len("--models-cache-ttl=") && arg[:len("--models-cache-ttl=")] == "--models-cache-ttl=":
-			normalizedArgs = append(normalizedArgs, "-models-cache-ttl="+arg[len("--models-cache-ttl="):])
 		case arg == "--max-tokens":
 			normalizedArgs = append(normalizedArgs, "-max-tokens")
 		case len(arg) > len("--max-tokens=") && arg[:len("--max-tokens=")] == "--max-tokens=":
@@ -231,9 +208,6 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	}
 	if options.cacheSize < 0 {
 		return runtimeOptions{}, fmt.Errorf("invalid cache size %d", options.cacheSize)
-	}
-	if options.modelsCacheTTL < 0 {
-		return runtimeOptions{}, fmt.Errorf("models-cache-ttl must be non-negative")
 	}
 	if options.maxTokens < minMaxTokens || options.maxTokens > maxMaxTokens {
 		return runtimeOptions{}, fmt.Errorf("max-tokens must be between %d and %d", minMaxTokens, maxMaxTokens)
