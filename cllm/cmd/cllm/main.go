@@ -65,7 +65,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		_, concurrentRequests, _, waitingRequests := handler.RequestQueueStats()
+		processingStats := handler.RequestProcessingStats()
 		logger.Info(
 			"server starting",
 			"addr", cfg.Addr,
@@ -75,11 +75,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"system_prompt", cfg.SystemPrompt,
 			"max_tokens", cfg.MaxTokens,
 			"max_tokens_per_second", cfg.MaxTokensPerSecond,
-			"max_concurrent_requests", cfg.MaxConcurrentRequests,
-			"concurrent_requests", concurrentRequests,
-			"max_waiting_requests", cfg.MaxWaitingRequests,
-			"waiting_requests", waitingRequests,
+			"effective_tokens_per_second", processingStats.EffectiveTokensPerSecond,
+			"max_concurrent_requests", processingStats.MaxConcurrentRequests,
+			"concurrent_requests", processingStats.ConcurrentRequests,
+			"max_waiting_requests", processingStats.MaxWaitingRequests,
+			"waiting_requests", processingStats.WaitingRequests,
 			"max_degradation", cfg.MaxDegradation,
+			"computed_degradation_percentage", processingStats.ComputedDegradationPercentage,
 			"temperature", cfg.Temperature,
 		)
 		err := server.ListenAndServe()
@@ -133,13 +135,15 @@ func startQueueDepthLogger(ctx context.Context, logger *slog.Logger, handler *ht
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests := handler.RequestQueueStats()
+			processingStats := handler.RequestProcessingStats()
 			logger.Info(
 				"queue depth",
-				"concurrent_requests", concurrentRequests,
-				"max_concurrent_requests", maxConcurrentRequests,
-				"waiting_requests", waitingRequests,
-				"max_waiting_requests", maxWaitingRequests,
+				"concurrent_requests", processingStats.ConcurrentRequests,
+				"max_concurrent_requests", processingStats.MaxConcurrentRequests,
+				"waiting_requests", processingStats.WaitingRequests,
+				"max_waiting_requests", processingStats.MaxWaitingRequests,
+				"effective_tokens_per_second", processingStats.EffectiveTokensPerSecond,
+				"computed_degradation_percentage", processingStats.ComputedDegradationPercentage,
 			)
 		}
 	}

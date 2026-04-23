@@ -60,7 +60,7 @@ You can inspect or update the live handler config at runtime:
 curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=256&max-waiting-requests=512&max-degradation=15&temperature=0.7&stream=true'
 ```
 
-`/config` now also returns `downstream_url`, `downstream_model`, `max_tokens_per_second`, `max_concurrent_requests`, `concurrent_requests`, `max_waiting_requests`, `waiting_requests`, and `max_degradation`, and you can update the configurable values live with either hyphenated or snake_case query params.
+`/config` now also returns `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_concurrent_requests`, `concurrent_requests`, `max_waiting_requests`, `waiting_requests`, `max_degradation`, and `computed_degradation_percentage`, and you can update the configurable values live with either hyphenated or snake_case query params.
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
@@ -68,7 +68,7 @@ Request admission is limited by concurrent slots and a waiting queue for `GET /a
 
 If you lower `max-concurrent-requests` or `max-waiting-requests` below the current in-flight or queued counts, existing work is preserved. New admissions stay blocked until the live counts fall back within the new limits.
 
-Cached responses are replayed at the configured token rate. Once more than `10%` of concurrent slots are in use, cached replay throughput steps down by the configured degradation percentage. Live downstream responses still stream through once admitted.
+Cached responses are replayed at the configured token rate. Once more than `10%` of concurrent slots are in use, cached replay throughput degrades gradually up to the configured maximum. The live computed degradation percentage and effective token rate are exposed through `/config`, logged whenever they change, and included in the periodic queue-depth logs. Live downstream responses still stream through once admitted.
 
 It also returns `cache_size` and `cache_entries`. You can resize the cache live with `cache-size` or `cache_size`; if the new size is smaller than the current number of entries, the least recently used entries are evicted immediately.
 

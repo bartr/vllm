@@ -18,8 +18,8 @@ const (
 	defaultTemperature           = 0.2
 	defaultSystemPrompt          = "You are a helpful assistant."
 	defaultMaxTokensPerSecond    = 32
-	defaultMaxConcurrentRequests = 2
-	defaultMaxWaitingRequests    = 2
+	defaultMaxConcurrentRequests = 512
+	defaultMaxWaitingRequests    = 256
 	defaultMaxDegradation        = 10
 	minMaxTokens                 = 100
 	maxMaxTokens                 = 4000

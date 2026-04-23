@@ -79,6 +79,7 @@ type Handler struct {
 	maxDegradation int
 	scheduler *requestScheduler
 	sleep func(context.Context, time.Duration) error
+	lastLoggedComputedDegradationMilliPercent atomic.Int64
 }
 
 func NewHandler() *Handler {
@@ -92,6 +93,7 @@ func NewHandler() *Handler {
 	handler.maxDegradation = defaultMaxDegradation
 	handler.scheduler = newRequestScheduler(defaultMaxConcurrentRequests, defaultMaxWaitingRequests)
 	handler.sleep = sleepWithContext
+	handler.lastLoggedComputedDegradationMilliPercent.Store(-1)
 	return handler
 }
 
@@ -121,16 +123,52 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRe
 		h.scheduler.Reconfigure(maxConcurrentRequests, maxWaitingRequests)
 	}
 	h.configMu.Unlock()
+	h.logComputedDegradationIfChanged("limits_updated")
+}
+
+type ProcessingStats struct {
+	MaxTokensPerSecond            int
+	EffectiveTokensPerSecond      float64
+	MaxConcurrentRequests         int
+	ConcurrentRequests            int
+	MaxWaitingRequests            int
+	WaitingRequests               int
+	MaxDegradation                int
+	ComputedDegradationPercentage float64
+}
+
+func (h *Handler) RequestProcessingStats() ProcessingStats {
+	h.configMu.RLock()
+	baseTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+
+	stats := ProcessingStats{
+		MaxTokensPerSecond:       baseTokensPerSecond,
+		EffectiveTokensPerSecond: roundMetric(float64(baseTokensPerSecond)),
+		MaxDegradation:           maxDegradation,
+	}
+	if baseTokensPerSecond == 0 {
+		stats.EffectiveTokensPerSecond = 0
+	}
+	if scheduler == nil {
+		return stats
+	}
+
+	maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests, computedDegradationPercentage, effectiveTokensPerSecond := scheduler.processingStats(baseTokensPerSecond, maxDegradation)
+	stats.MaxConcurrentRequests = maxConcurrentRequests
+	stats.ConcurrentRequests = concurrentRequests
+	stats.MaxWaitingRequests = maxWaitingRequests
+	stats.WaitingRequests = waitingRequests
+	stats.ComputedDegradationPercentage = roundMetric(computedDegradationPercentage)
+	stats.EffectiveTokensPerSecond = roundMetric(effectiveTokensPerSecond)
+	return stats
 }
 
 func (h *Handler) RequestQueueStats() (int, int, int, int) {
-	h.configMu.RLock()
-	scheduler := h.scheduler
-	h.configMu.RUnlock()
-	if scheduler == nil {
-		return 0, 0, 0, 0
-	}
-	return scheduler.Stats()
+	stats := h.RequestProcessingStats()
+	return stats.MaxConcurrentRequests, stats.ConcurrentRequests, stats.MaxWaitingRequests, stats.WaitingRequests
 }
 
 func (h *Handler) SetDownstreamToken(token string) {
@@ -220,11 +258,13 @@ type runtimeConfig struct {
 	SystemPrompt   string  `json:"system_prompt"`
 	MaxTokens      int     `json:"max_tokens"`
 	MaxTokensPerSecond int `json:"max_tokens_per_second"`
+	EffectiveTokensPerSecond float64 `json:"effective_tokens_per_second"`
 	MaxConcurrentRequests int `json:"max_concurrent_requests"`
 	ConcurrentRequests int `json:"concurrent_requests"`
 	MaxWaitingRequests int `json:"max_waiting_requests"`
 	WaitingRequests int `json:"waiting_requests"`
 	MaxDegradation int `json:"max_degradation"`
+	ComputedDegradationPercentage float64 `json:"computed_degradation_percentage"`
 	Temperature    float64 `json:"temperature"`
 	Stream         bool    `json:"stream"`
 }
@@ -495,22 +535,12 @@ func (h *Handler) cacheStats() (int, int) {
 func (h *Handler) currentConfig() runtimeConfig {
 	defaults := h.getDefaults()
 	cacheSize, cacheEntries := h.cacheStats()
+	processingStats := h.RequestProcessingStats()
 
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
 	downstreamModel := h.downstreamModel
 	h.modelsMu.RUnlock()
-
-	h.configMu.RLock()
-	maxTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
-	scheduler := h.scheduler
-	h.configMu.RUnlock()
-
-	maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests := 0, 0, 0, 0
-	if scheduler != nil {
-		maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests = scheduler.Stats()
-	}
 
 	return runtimeConfig{
 		CacheSize: cacheSize,
@@ -519,12 +549,14 @@ func (h *Handler) currentConfig() runtimeConfig {
 		DownstreamModel: downstreamModel,
 		SystemPrompt:   defaults.systemPrompt,
 		MaxTokens:      defaults.maxTokens,
-		MaxTokensPerSecond: maxTokensPerSecond,
-		MaxConcurrentRequests: maxConcurrentRequests,
-		ConcurrentRequests: concurrentRequests,
-		MaxWaitingRequests: maxWaitingRequests,
-		WaitingRequests: waitingRequests,
-		MaxDegradation: maxDegradation,
+		MaxTokensPerSecond: processingStats.MaxTokensPerSecond,
+		EffectiveTokensPerSecond: processingStats.EffectiveTokensPerSecond,
+		MaxConcurrentRequests: processingStats.MaxConcurrentRequests,
+		ConcurrentRequests: processingStats.ConcurrentRequests,
+		MaxWaitingRequests: processingStats.MaxWaitingRequests,
+		WaitingRequests: processingStats.WaitingRequests,
+		MaxDegradation: processingStats.MaxDegradation,
+		ComputedDegradationPercentage: processingStats.ComputedDegradationPercentage,
 		Temperature:    defaults.temperature,
 		Stream:         defaults.stream,
 	}
@@ -670,6 +702,7 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 			"waiting_requests", updatedWaitingRequests,
 		)
 	}
+	h.logComputedDegradationIfChanged("config_updated")
 
 	return true, nil
 }
@@ -989,7 +1022,15 @@ func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), 
 	if scheduler == nil {
 		return func() {}, true
 	}
-	return scheduler.AcquirePath(ctx, path)
+	release, ok := scheduler.AcquirePath(ctx, path)
+	if !ok {
+		return nil, false
+	}
+	h.logComputedDegradationIfChanged("request_admitted")
+	return func() {
+		release()
+		h.logComputedDegradationIfChanged("request_completed")
+	}, true
 }
 
 func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int) error {
@@ -1041,6 +1082,30 @@ func sleepWithContext(ctx context.Context, duration time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (h *Handler) logComputedDegradationIfChanged(source string) {
+	stats := h.RequestProcessingStats()
+	currentMilliPercent := int64(math.Round(stats.ComputedDegradationPercentage * 1000))
+	if h.lastLoggedComputedDegradationMilliPercent.Load() == currentMilliPercent {
+		return
+	}
+	h.lastLoggedComputedDegradationMilliPercent.Store(currentMilliPercent)
+	slog.Info(
+		"computed degradation updated",
+		"source", source,
+		"computed_degradation_percentage", stats.ComputedDegradationPercentage,
+		"effective_tokens_per_second", stats.EffectiveTokensPerSecond,
+		"max_tokens_per_second", stats.MaxTokensPerSecond,
+		"concurrent_requests", stats.ConcurrentRequests,
+		"max_concurrent_requests", stats.MaxConcurrentRequests,
+		"waiting_requests", stats.WaitingRequests,
+		"max_waiting_requests", stats.MaxWaitingRequests,
+	)
+}
+
+func roundMetric(value float64) float64 {
+	return math.Round(value*1000) / 1000
 }
 
 type requestScheduler struct {
@@ -1164,28 +1229,52 @@ func (s *requestScheduler) promoteWaitingLocked() {
 }
 
 func (s *requestScheduler) effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation int) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, effectiveTokensPerSecond := s.degradationMetricsLocked(baseTokensPerSecond, maxDegradation)
+	return effectiveTokensPerSecond
+}
+
+func (s *requestScheduler) processingStats(baseTokensPerSecond, maxDegradation int) (int, int, int, int, float64, float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	computedDegradationPercentage, effectiveTokensPerSecond := s.degradationMetricsLocked(baseTokensPerSecond, maxDegradation)
+	return s.maxConcurrent, s.inFlight, s.maxWaiting, s.waiting, computedDegradationPercentage, effectiveTokensPerSecond
+}
+
+func (s *requestScheduler) degradationMetricsLocked(baseTokensPerSecond, maxDegradation int) (float64, float64) {
 	if baseTokensPerSecond < 1 {
-		return 0
+		return 0, 0
 	}
 	if maxDegradation == 0 {
-		return float64(baseTokensPerSecond)
+		return 0, float64(baseTokensPerSecond)
 	}
-	s.mu.Lock()
 	capacity := s.maxConcurrent
 	inFlight := s.inFlight
-	s.mu.Unlock()
 	if capacity == 0 {
-		return float64(baseTokensPerSecond)
+		return 0, float64(baseTokensPerSecond)
 	}
-	usage := float64(inFlight) / float64(capacity)
-	if usage <= degradationThreshold {
-		return float64(baseTokensPerSecond)
+	thresholdRequests := int(math.Floor(float64(capacity) * degradationThreshold))
+	if inFlight <= thresholdRequests {
+		return 0, float64(baseTokensPerSecond)
 	}
-	degraded := float64(baseTokensPerSecond) * (1 - float64(maxDegradation)/100)
-	if degraded < 1 {
-		return 1
+	degradationWindow := capacity - thresholdRequests
+	if degradationWindow <= 0 {
+		return 0, float64(baseTokensPerSecond)
 	}
-	return degraded
+	progress := float64(inFlight-thresholdRequests) / float64(degradationWindow)
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	computedDegradationPercentage := float64(maxDegradation) * progress
+	effectiveTokensPerSecond := float64(baseTokensPerSecond) * (1 - computedDegradationPercentage/100)
+	if effectiveTokensPerSecond < 1 {
+		effectiveTokensPerSecond = 1
+	}
+	return computedDegradationPercentage, effectiveTokensPerSecond
 }
 
 type replayStreamSegment struct {
