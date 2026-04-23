@@ -1,12 +1,11 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: gpu-observability-dashboard
-  namespace: monitoring
+  name: grafana-gpu-dashboards
   labels:
-    grafana_dashboard: "1"
+    app.kubernetes.io/name: grafana
 data:
-  gpu-observability.json: |
+  gpu-overview.json: |
     {
       "annotations": {
         "list": [
@@ -60,7 +59,7 @@ data:
           "targets": [
             {
               "editorMode": "code",
-              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_GPU_UTIL{namespace=~\"llm|monitoring\"})",
+              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_GPU_UTIL{namespace=~\"vllm|monitoring\"})",
               "legendFormat": "{{namespace}}/{{pod}}",
               "range": true,
               "refId": "A"
@@ -76,7 +75,7 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "unit": "none"
+              "unit": "decmbytes"
             },
             "overrides": []
           },
@@ -101,7 +100,7 @@ data:
           "targets": [
             {
               "editorMode": "code",
-              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_FB_USED{namespace=~\"llm|monitoring\"})",
+              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_FB_USED{namespace=~\"vllm|monitoring\"})",
               "legendFormat": "{{namespace}}/{{pod}}",
               "range": true,
               "refId": "A"
@@ -117,39 +116,40 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "unit": "watt"
+              "unit": "none"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 12,
+            "w": 8,
             "x": 0,
             "y": 8
           },
           "id": 3,
           "options": {
-            "legend": {
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "textMode": "value"
           },
           "targets": [
             {
               "editorMode": "code",
-              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_POWER_USAGE{namespace=~\"llm|monitoring\"})",
-              "legendFormat": "{{namespace}}/{{pod}}",
-              "range": true,
+              "expr": "count(count by (gpu) (DCGM_FI_DEV_GPU_UTIL))",
               "refId": "A"
             }
           ],
-          "title": "GPU Power Draw",
-          "type": "timeseries"
+          "title": "Visible GPUs",
+          "type": "stat"
         },
         {
           "datasource": {
@@ -158,39 +158,80 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "unit": "celsius"
+              "unit": "percent"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 12,
-            "x": 12,
+            "w": 8,
+            "x": 8,
             "y": 8
           },
           "id": 4,
           "options": {
-            "legend": {
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
           },
           "targets": [
             {
               "editorMode": "code",
-              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_GPU_TEMP{namespace=~\"llm|monitoring\"})",
-              "legendFormat": "{{namespace}}/{{pod}}",
-              "range": true,
+              "expr": "max(DCGM_FI_DEV_GPU_UTIL{namespace=~\"vllm|monitoring\"}) / 100",
               "refId": "A"
             }
           ],
-          "title": "GPU Temperature",
-          "type": "timeseries"
+          "title": "Peak GPU Utilization",
+          "type": "gauge"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "decmbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 8
+          },
+          "id": 5,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "editorMode": "code",
+              "expr": "max(DCGM_FI_DEV_FB_USED{namespace=~\"vllm|monitoring\"})",
+              "refId": "A"
+            }
+          ],
+          "title": "Peak GPU Memory Used",
+          "type": "stat"
         }
       ],
       "refresh": "15s",
@@ -210,21 +251,12 @@ data:
       },
       "timepicker": {},
       "timezone": "",
-      "title": "GPU Observability",
-      "uid": "gpu-observability",
+      "title": "GPU Overview",
+      "uid": "gpu-overview",
       "version": 1,
       "weekStart": ""
     }
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cost-observability-dashboard
-  namespace: monitoring
-  labels:
-    grafana_dashboard: "1"
-data:
-  cost-observability.json: |
+  gpu-power-thermals.json: |
     {
       "annotations": {
         "list": [
@@ -253,41 +285,39 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "decimals": 3,
-              "unit": "currencyUSD"
+              "unit": "watt"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 6,
+            "w": 12,
             "x": 0,
             "y": 0
           },
           "id": 1,
           "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
             },
-            "textMode": "auto"
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
             {
               "editorMode": "code",
-              "expr": "sum(node_total_hourly_cost)",
+              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_POWER_USAGE{namespace=~\"vllm|monitoring\"})",
+              "legendFormat": "{{namespace}}/{{pod}}",
+              "range": true,
               "refId": "A"
             }
           ],
-          "title": "Cluster Hourly Cost",
-          "type": "stat"
+          "title": "GPU Power Draw",
+          "type": "timeseries"
         },
         {
           "datasource": {
@@ -296,41 +326,39 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "decimals": 3,
-              "unit": "currencyUSD"
+              "unit": "celsius"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 6,
-            "x": 6,
+            "w": 12,
+            "x": 12,
             "y": 0
           },
           "id": 2,
           "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
             },
-            "textMode": "auto"
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
             {
               "editorMode": "code",
-              "expr": "sum(node_gpu_hourly_cost)",
+              "expr": "avg by (namespace, pod) (DCGM_FI_DEV_GPU_TEMP{namespace=~\"vllm|monitoring\"})",
+              "legendFormat": "{{namespace}}/{{pod}}",
+              "range": true,
               "refId": "A"
             }
           ],
-          "title": "GPU Hourly Cost",
-          "type": "stat"
+          "title": "GPU Temperature",
+          "type": "timeseries"
         },
         {
           "datasource": {
@@ -339,94 +367,7 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "decimals": 3,
-              "unit": "currencyUSD"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 12,
-            "y": 0
-          },
-          "id": 3,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
-            },
-            "textMode": "auto"
-          },
-          "targets": [
-            {
-              "editorMode": "code",
-              "expr": "sum(node_cpu_hourly_cost)",
-              "refId": "A"
-            }
-          ],
-          "title": "CPU Hourly Cost",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "decimals": 3,
-              "unit": "currencyUSD"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 18,
-            "y": 0
-          },
-          "id": 4,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
-            },
-            "textMode": "auto"
-          },
-          "targets": [
-            {
-              "editorMode": "code",
-              "expr": "sum(node_ram_hourly_cost)",
-              "refId": "A"
-            }
-          ],
-          "title": "RAM Hourly Cost",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "decimals": 3,
-              "unit": "currencyUSD"
+              "unit": "watt"
             },
             "overrides": []
           },
@@ -436,29 +377,30 @@ data:
             "x": 0,
             "y": 8
           },
-          "id": 5,
+          "id": 3,
           "options": {
-            "legend": {
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "textMode": "value"
           },
           "targets": [
             {
               "editorMode": "code",
-              "expr": "sum by (node) (node_total_hourly_cost)",
-              "legendFormat": "{{node}}",
-              "range": true,
+              "expr": "max(DCGM_FI_DEV_POWER_USAGE{namespace=~\"vllm|monitoring\"})",
               "refId": "A"
             }
           ],
-          "title": "Hourly Cost by Node",
-          "type": "timeseries"
+          "title": "Peak Power Draw",
+          "type": "stat"
         },
         {
           "datasource": {
@@ -467,8 +409,7 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "decimals": 3,
-              "unit": "currencyUSD"
+              "unit": "celsius"
             },
             "overrides": []
           },
@@ -478,49 +419,51 @@ data:
             "x": 12,
             "y": 8
           },
-          "id": 6,
+          "id": 4,
           "options": {
-            "legend": {
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "textMode": "value"
           },
           "targets": [
             {
               "editorMode": "code",
-              "expr": "sum(pv_hourly_cost)",
-              "legendFormat": "storage",
-              "range": true,
+              "expr": "max(DCGM_FI_DEV_GPU_TEMP{namespace=~\"vllm|monitoring\"})",
               "refId": "A"
             }
           ],
-          "title": "Persistent Volume Hourly Cost",
-          "type": "timeseries"
+          "title": "Peak Temperature",
+          "type": "stat"
         }
       ],
-      "refresh": "30s",
+      "refresh": "15s",
       "schemaVersion": 39,
       "style": "dark",
       "tags": [
-        "cost",
-        "opencost"
+        "gpu",
+        "dcgm",
+        "thermals"
       ],
       "templating": {
         "list": []
       },
       "time": {
-        "from": "now-6h",
+        "from": "now-1h",
         "to": "now"
       },
       "timepicker": {},
       "timezone": "",
-      "title": "Cost Observability",
-      "uid": "cost-observability",
+      "title": "GPU Power And Thermals",
+      "uid": "gpu-power-thermals",
       "version": 1,
       "weekStart": ""
     }

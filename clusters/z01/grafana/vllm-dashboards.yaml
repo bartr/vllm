@@ -1,12 +1,11 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: vllm-observability-dashboard
-  namespace: monitoring
+  name: grafana-vllm-dashboards
   labels:
-    grafana_dashboard: "1"
+    app.kubernetes.io/name: grafana
 data:
-  vllm-observability.json: |
+  vllm-overview.json: |
     {
       "annotations": {
         "list": [
@@ -210,7 +209,7 @@ data:
           },
           "gridPos": {
             "h": 8,
-            "w": 12,
+            "w": 24,
             "x": 0,
             "y": 8
           },
@@ -244,7 +243,52 @@ data:
           ],
           "title": "Token Throughput",
           "type": "timeseries"
-        },
+        }
+      ],
+      "refresh": "15s",
+      "schemaVersion": 39,
+      "style": "dark",
+      "tags": [
+        "vllm",
+        "prometheus",
+        "overview"
+      ],
+      "templating": {
+        "list": []
+      },
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "timepicker": {},
+      "timezone": "",
+      "title": "vLLM Overview",
+      "uid": "vllm-overview",
+      "version": 1,
+      "weekStart": ""
+    }
+  vllm-latency-and-http.json: |
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "grafana",
+              "uid": "-- Grafana --"
+            },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "panels": [
         {
           "datasource": {
             "type": "prometheus",
@@ -259,10 +303,10 @@ data:
           "gridPos": {
             "h": 8,
             "w": 12,
-            "x": 12,
-            "y": 8
+            "x": 0,
+            "y": 0
           },
-          "id": 6,
+          "id": 1,
           "options": {
             "legend": {
               "displayMode": "table",
@@ -306,11 +350,11 @@ data:
           },
           "gridPos": {
             "h": 8,
-            "w": 24,
-            "x": 0,
-            "y": 16
+            "w": 12,
+            "x": 12,
+            "y": 0
           },
-          "id": 7,
+          "id": 2,
           "options": {
             "legend": {
               "displayMode": "table",
@@ -333,6 +377,54 @@ data:
           ],
           "title": "HTTP Request Rate",
           "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 8
+          },
+          "id": 3,
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "editorMode": "code",
+              "expr": "sum(rate(vllm:request_success_total[5m]))",
+              "legendFormat": "success",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "editorMode": "code",
+              "expr": "sum(rate(vllm:request_failure_total[5m]))",
+              "legendFormat": "failure",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Request Outcome Rate",
+          "type": "timeseries"
         }
       ],
       "refresh": "15s",
@@ -352,8 +444,8 @@ data:
       },
       "timepicker": {},
       "timezone": "",
-      "title": "vLLM Observability",
-      "uid": "vllm-observability",
+      "title": "vLLM Latency And HTTP",
+      "uid": "vllm-latency-http",
       "version": 1,
       "weekStart": ""
     }

@@ -11,3 +11,4 @@ resources:
 #  - listeners/prometheus-operator.yaml
 #  - listeners/prometheus.yaml
 #  - listeners/grafana.yaml
+#  - listeners/dcgm-exporter.yaml

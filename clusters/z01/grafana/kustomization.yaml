@@ -6,6 +6,9 @@ resources:
   - secret.yaml
   - pvc.yaml
   - datasources.yaml
+  - dashboard-providers.yaml
+  - gpu-dashboards.yaml
+  - vllm-dashboards.yaml
   - deployment.yaml
   - service.yaml
   - ingress.yaml

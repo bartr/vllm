@@ -186,7 +186,7 @@ Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
 
 By default, `ask.sh` targets `http://localhost:8080` through `ASK_URL`, which is expected to be the local `cllm` service.
 
-For an in-cluster `cllm` deployment, use the manifests in [clusters/z01/cllm](/home/bartr/vllm/clusters/z01/cllm). They deploy the local image `cllm:0.1.0` with `imagePullPolicy: Never` and expose it through a dedicated Traefik entrypoint on port `8080`.
+For an in-cluster `cllm` deployment, use the manifests in [clusters/z01/cllm](/home/bartr/vllm/clusters/z01/cllm). They deploy the local image `cllm:0.1.0` with `imagePullPolicy: Never` and expose it through a dedicated Traefik entrypoint on port `8088`.
 
 Local build and import flow:
 
@@ -203,10 +203,10 @@ kubectl -n kube-system rollout status deployment/traefik
 kubectl -n cllm rollout status deployment/cllm
 ```
 
-Then call `cllm` through the Traefik external IP on port `8080`:
+Then call `cllm` through the Traefik external IP on port `8088`:
 
 ```bash
-curl -i http://192.168.68.63:8080/healthz
+curl -i http://192.168.68.63:8088/healthz
 ```
 
 If `ASK_TOKEN` is set, `ask.sh` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints.
@@ -327,55 +327,77 @@ Once the starter deployment works, the next tuning knobs are:
 
 ## Add Observability
 
-The repo now includes a first-phase, in-cluster observability stack for K3s:
+The repo now includes a Flux-managed, in-cluster observability stack for K3s:
 
+- `Prometheus Operator` for `ServiceMonitor`-driven scrape management
 - `Prometheus` for time-series collection
 - `Grafana` for dashboards
-- `node-exporter` and `kube-state-metrics` for node and workload basics
-- `NVIDIA DCGM exporter` for GPU utilization, memory, temperature, and power metrics
-- `OpenCost` for infrastructure cost estimation using local custom pricing
+- `vLLM` metrics scraped from the `vllm` service on `/metrics`
+- `cLLM` is prepared for scraping through a `ServiceMonitor`, but its `/metrics` endpoint still needs to be implemented before that target will go healthy
 
-This stack is tuned for the same local, single-node setup as the vLLM manifests. It keeps retention short, uses modest resource requests, and exposes the UIs with NodePorts so you can inspect the stack from the LAN without adding ingress auth yet.
+This stack is tuned for the same local, single-node setup as the vLLM manifests. It keeps retention short, uses modest resource requests, and exposes the UIs through dedicated Traefik entrypoints so you can inspect the stack from the LAN without adding ingress auth yet.
 
-The active `vllm` service is now included in Prometheus scraping through [manifests/vllm-servicemonitor.yaml](/home/bartr/vllm/manifests/vllm-servicemonitor.yaml). The pinned vLLM image exposes Prometheus metrics on the same API port at `/metrics`, so the stack can collect request, latency, token, cache, and HTTP server metrics from whichever model profile is deployed.
+The active `vllm` service is included in Prometheus scraping through the Flux-managed overlay in [clusters/z01/prometheus](/home/bartr/vllm/clusters/z01/prometheus). The pinned vLLM image exposes Prometheus metrics on the same API port at `/metrics`, so the stack can collect request, latency, token, cache, and HTTP server metrics from whichever model profile is deployed.
+
+### Current access URLs
+
+With the current Traefik service IP on this node, the exact URLs are:
+
+- vLLM: `http://192.168.68.63:8000`
+- cLLM: `http://192.168.68.63:8088`
+- Prometheus: `http://192.168.68.63:9090`
+- Grafana: `http://192.168.68.63:3000`
+
+Useful direct checks:
+
+```bash
+curl http://192.168.68.63:8000/health
+curl http://192.168.68.63:8088/healthz
+curl http://192.168.68.63:9090/-/healthy
+curl http://192.168.68.63:3000/api/health
+```
 
 ### Install the observability stack
 
-The installer follows the same pattern as the existing GPU support scripts and will install the monitoring stack, the GPU exporter, OpenCost, and the repo-provided Grafana dashboards:
+Apply the Flux-managed overlays directly:
 
 ```bash
-./scripts/install-observability.sh
+kubectl apply -k /home/bartr/vllm/clusters/z01/prometheus/operator
+kubectl apply -k /home/bartr/vllm/clusters/z01/prometheus
+kubectl apply -k /home/bartr/vllm/clusters/z01/grafana
+kubectl apply -k /home/bartr/vllm/clusters/z01/traefik
 ```
 
-It installs these charts into the `monitoring` namespace using the in-repo values files:
+Then wait for the monitoring workloads:
 
-- [helm/kube-prometheus-stack-values.yaml](/home/bartr/vllm/helm/kube-prometheus-stack-values.yaml)
-- [helm/dcgm-exporter-values.yaml](/home/bartr/vllm/helm/dcgm-exporter-values.yaml)
-- [helm/opencost-values.yaml](/home/bartr/vllm/helm/opencost-values.yaml)
+```bash
+kubectl -n monitoring rollout status deployment/prometheus-operator
+kubectl -n monitoring rollout status deployment/grafana
+kubectl -n monitoring rollout status statefulset/prometheus-prometheus
+kubectl -n kube-system rollout status deployment/traefik
+```
 
-The script prints the node IP and these local endpoints when the rollout completes:
+Once the rollout completes, the current local endpoints are:
 
-- Grafana: `http://<node-ip>:30080`
-- Prometheus: `http://<node-ip>:30090`
-- OpenCost: `http://<node-ip>:30081`
+- Grafana: `http://192.168.68.63:3000`
+- Prometheus: `http://192.168.68.63:9090`
 
-Grafana uses `admin` / `change-me` by default in this local-first setup. Change it in [helm/kube-prometheus-stack-values.yaml](/home/bartr/vllm/helm/kube-prometheus-stack-values.yaml) before installation if you do not want the default local password.
+Grafana uses the admin credentials stored in [clusters/z01/grafana/secret.yaml](/home/bartr/vllm/clusters/z01/grafana/secret.yaml).
 
 ### What you get first
 
-Out of the box, Grafana includes the kube-prometheus dashboards plus three repo-provided dashboards:
+Out of the box, Grafana includes the repo-provided dashboards from [clusters/z01/grafana](/home/bartr/vllm/clusters/z01/grafana):
 
-- [manifests/observability-grafana-dashboards.yaml](/home/bartr/vllm/manifests/observability-grafana-dashboards.yaml) provisions a `GPU Observability` dashboard
-- [manifests/observability-grafana-dashboards.yaml](/home/bartr/vllm/manifests/observability-grafana-dashboards.yaml) provisions a `Cost Observability` dashboard
-- [manifests/vllm-observability-dashboard.yaml](/home/bartr/vllm/manifests/vllm-observability-dashboard.yaml) provisions a `vLLM Observability` dashboard
+- `GPU / GPU Overview`
+- `GPU / GPU Power And Thermals`
+- `vLLM / vLLM Overview`
+- `vLLM / vLLM Latency And HTTP`
 
-Use the default dashboards for node CPU, memory, disk, pod health, and Kubernetes workload status. Use the custom dashboards for:
+Use the custom dashboards for:
 
 - GPU utilization by pod
 - GPU framebuffer memory used by pod
 - GPU power draw and temperature
-- cluster hourly cost
-- GPU, CPU, RAM, and persistent-volume hourly cost
 - running and queued vLLM requests
 - vLLM KV cache usage
 - request success rate, token throughput, and p95 TTFT / end-to-end latency
@@ -392,11 +414,13 @@ kubectl -n monitoring get servicemonitors
 
 Check Prometheus target health at `http://<node-ip>:30090/targets` and confirm you can see healthy scrape targets for:
 
-- `monitoring-prometheus-node-exporter`
-- `monitoring-kube-state-metrics`
-- `dcgm-dcgm-exporter`
-- `opencost`
+For the current node IP, that is:
+
+`http://192.168.68.63:9090/targets`
+
 - `vllm`
+
+The `cllm` `ServiceMonitor` object exists, but the target will remain down until `cllm` serves a real `/metrics` endpoint.
 
 You can also confirm the key metric families directly in Prometheus:
 
@@ -413,17 +437,6 @@ vllm:num_requests_running
 vllm:request_success_total
 vllm:time_to_first_token_seconds_bucket
 ```
-
-### Pricing assumptions
-
-OpenCost is configured with a simple local custom pricing model in [helm/opencost-values.yaml](/home/bartr/vllm/helm/opencost-values.yaml). The default values are intentionally easy to edit for a laptop or edge node:
-
-- CPU: `$0.03` per core-hour
-- RAM: `$0.004` per GiB-hour
-- GPU: `$0.35` per GPU-hour
-- storage: `$0.0001` per GiB-hour
-
-Adjust those values to match your own electricity, amortization, or internal chargeback model.
 
 ### vLLM application metrics
 
