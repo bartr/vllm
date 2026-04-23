@@ -10,3 +10,4 @@ resources:
 #  - listeners/cllm.yaml
 #  - listeners/prometheus-operator.yaml
 #  - listeners/prometheus.yaml
+#  - listeners/grafana.yaml

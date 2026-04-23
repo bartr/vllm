@@ -24,3 +24,9 @@ spec:
           default: true
         exposedPort: 9090
         protocol: TCP
+      grafana:
+        port: 3001
+        expose:
+          default: true
+        exposedPort: 3000
+        protocol: TCP
