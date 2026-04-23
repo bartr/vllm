@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ASK_URL=${ASK_URL:-http://localhost:8080}
+ASK_URL=${ASK_URL:-http://localhost:8000}
 ASK_TOKEN=${ASK_TOKEN:-}
 ASK_MODEL=${ASK_MODEL:-}
 ASK_SYSTEM_PROMPT=${ASK_SYSTEM_PROMPT:-You are a helpful assistant.}

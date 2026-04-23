@@ -4,3 +4,7 @@ resources:
   - components.yaml
   - source.yaml
   - flux-listener.yaml
+  - listeners/nvidia-plugin.yaml
+  - listeners/prometheus-operator.yaml
+  - listeners/vllm.yaml
+  - listeners/traefik.yaml

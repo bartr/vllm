@@ -16,4 +16,5 @@ curl -sfL https://get.k3s.io | sh -
 cd ../cllm
 make deploy
 
-kubectl get nodes
+cd ../clusters/z01
+kubectl apply -k flux-system
