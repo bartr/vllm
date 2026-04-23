@@ -4,7 +4,7 @@ metadata:
   name: traefik
   namespace: flux-system
 spec:
-  interval: 10m0s
+  interval: 1m
   path: ./clusters/z01/traefik
   prune: true
   sourceRef:
