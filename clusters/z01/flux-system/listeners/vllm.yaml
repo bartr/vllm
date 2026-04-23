@@ -7,6 +7,8 @@ spec:
   interval: 1m
   path: ./clusters/z01/vllm
   prune: true
+  dependsOn:
+    - name: nvidia-plugin
   sourceRef:
     kind: GitRepository
     name: flux-system
