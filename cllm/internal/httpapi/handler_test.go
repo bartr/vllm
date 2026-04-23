@@ -34,7 +34,7 @@ func TestRoutes(t *testing.T) {
 		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":31.2`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
 		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
@@ -233,8 +233,9 @@ func TestAskCachedReplayThrottlesNonStreamResponses(t *testing.T) {
 	if len(sleeps) != 1 {
 		t.Fatalf("sleep calls = %d, want 1", len(sleeps))
 	}
-	if sleeps[0] != 2*time.Second {
-		t.Fatalf("sleep duration = %s, want %s", sleeps[0], 2*time.Second)
+	expected := time.Duration(float64(4) * float64(time.Second) / calibratedTokensPerSecond(2))
+	if sleeps[0] != expected {
+		t.Fatalf("sleep duration = %s, want %s", sleeps[0], expected)
 	}
 }
 
@@ -283,8 +284,9 @@ func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 	if len(sleeps) != 1 {
 		t.Fatalf("sleep calls = %d, want 1", len(sleeps))
 	}
-	if sleeps[0] != 2*time.Second {
-		t.Fatalf("sleep duration = %s, want %s", sleeps[0], 2*time.Second)
+	expected := time.Duration(float64(4) * float64(time.Second) / calibratedTokensPerSecond(2))
+	if sleeps[0] != expected {
+		t.Fatalf("sleep duration = %s, want %s", sleeps[0], expected)
 	}
 }
 
@@ -298,8 +300,9 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	}
 	defer releaseOne()
 
-	if got := handler.cachedReplayDelay(2); got != 100*time.Millisecond {
-		t.Fatalf("delay below threshold = %s, want %s", got, 100*time.Millisecond)
+	expected := time.Duration(float64(2) * float64(time.Second) / calibratedTokensPerSecond(20))
+	if got := handler.cachedReplayDelay(2); got != expected {
+		t.Fatalf("delay below threshold = %s, want %s", got, expected)
 	}
 
 	releaseTwo, ok := handler.acquireRequestSlot(context.Background(), "/two")
@@ -308,8 +311,8 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	}
 	defer releaseTwo()
 
-	expectedTokensPerSecond := 20 * (1 - ((50.0 / 100.0) * ((0.2 - degradationThreshold) / (1 - degradationThreshold))))
-	expected := time.Duration(float64(2) * float64(time.Second) / expectedTokensPerSecond)
+	expectedTokensPerSecond := calibratedTokensPerSecond(20) * (1 - ((50.0 / 100.0) * ((0.2 - degradationThreshold) / (1 - degradationThreshold))))
+	expected = time.Duration(float64(2) * float64(time.Second) / expectedTokensPerSecond)
 	if got := handler.cachedReplayDelay(2); got != expected {
 		t.Fatalf("delay above threshold = %s, want %s", got, expected)
 	}
@@ -333,8 +336,9 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 		}
 	}()
 
-	if got := handler.cachedReplayDelay(10); got != 100*time.Millisecond {
-		t.Fatalf("delay at threshold = %s, want %s", got, 100*time.Millisecond)
+	expected := time.Duration(float64(10) * float64(time.Second) / calibratedTokensPerSecond(100))
+	if got := handler.cachedReplayDelay(10); got != expected {
+		t.Fatalf("delay at threshold = %s, want %s", got, expected)
 	}
 
 	release, ok := handler.acquireRequestSlot(context.Background(), "/threshold-plus-one")
@@ -343,8 +347,8 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 	}
 	releases = append(releases, release)
 
-	expectedTokensPerSecond := 100 * (1 - ((10.0 / 100.0) * (1.0 / float64(512-51))))
-	expected := time.Duration(float64(10) * float64(time.Second) / expectedTokensPerSecond)
+	expectedTokensPerSecond := calibratedTokensPerSecond(100) * (1 - ((10.0 / 100.0) * (1.0 / float64(512-51))))
+	expected = time.Duration(float64(10) * float64(time.Second) / expectedTokensPerSecond)
 	if got := handler.cachedReplayDelay(10); got != expected {
 		t.Fatalf("delay above whole-request threshold = %s, want %s", got, expected)
 	}
@@ -740,8 +744,8 @@ func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
 	if got.MaxTokensPerSecond != 48 {
 		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
 	}
-	if got.EffectiveTokensPerSecond != 48 {
-		t.Fatalf("effective tokens per second = %v, want %v", got.EffectiveTokensPerSecond, 48)
+	if got.EffectiveTokensPerSecond != 46.8 {
+		t.Fatalf("effective tokens per second = %v, want %v", got.EffectiveTokensPerSecond, 46.8)
 	}
 	if got.MaxConcurrentRequests != 64 {
 		t.Fatalf("max concurrent requests = %d, want %d", got.MaxConcurrentRequests, 64)
@@ -1066,7 +1070,7 @@ func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
 	for _, want := range []string{
 		`msg="computed degradation updated" source=limits_updated computed_degradation_percentage=0`,
 		`msg="computed degradation updated" source=request_admitted computed_degradation_percentage=5.556`,
-		`effective_tokens_per_second=18.889`,
+		`effective_tokens_per_second=18.417`,
 		`msg="computed degradation updated" source=request_completed computed_degradation_percentage=0`,
 	} {
 		if !strings.Contains(logOutput, want) {
@@ -1097,8 +1101,8 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 	if got.ComputedDegradationPercentage != 0.022 {
 		t.Fatalf("computed degradation percentage = %v, want 0.022", got.ComputedDegradationPercentage)
 	}
-	if got.EffectiveTokensPerSecond != 99.978 {
-		t.Fatalf("effective tokens per second = %v, want 99.978", got.EffectiveTokensPerSecond)
+	if got.EffectiveTokensPerSecond != 97.479 {
+		t.Fatalf("effective tokens per second = %v, want 97.479", got.EffectiveTokensPerSecond)
 	}
 }
 

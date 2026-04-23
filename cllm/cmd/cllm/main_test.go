@@ -191,7 +191,7 @@ func TestStartQueueDepthLoggerLogsQueueDepth(t *testing.T) {
 				`max_concurrent_requests=512`,
 				`waiting_requests=0`,
 				`max_waiting_requests=1023`,
-				`effective_tokens_per_second=32`,
+				`effective_tokens_per_second=31.2`,
 				`computed_degradation_percentage=0`,
 			} {
 				if !strings.Contains(logOutput, want) {

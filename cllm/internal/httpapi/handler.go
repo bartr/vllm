@@ -44,6 +44,7 @@ const (
 	defaultMaxWaitingRequests = 1023
 	defaultMaxDegradation = 10
 	degradationThreshold = 0.10
+	replayTokensPerSecondEfficiency = 0.975
 )
 
 type askOptions struct {
@@ -147,7 +148,7 @@ func (h *Handler) RequestProcessingStats() ProcessingStats {
 
 	stats := ProcessingStats{
 		MaxTokensPerSecond:       baseTokensPerSecond,
-		EffectiveTokensPerSecond: roundMetric(float64(baseTokensPerSecond)),
+		EffectiveTokensPerSecond: roundMetric(calibratedTokensPerSecond(baseTokensPerSecond)),
 		MaxDegradation:           maxDegradation,
 	}
 	if baseTokensPerSecond == 0 {
@@ -1063,7 +1064,7 @@ func (h *Handler) cachedReplayDelay(tokenCount int) time.Duration {
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
 
-	effectiveTokensPerSecond := float64(baseTokensPerSecond)
+	effectiveTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
 	if baseTokensPerSecond == 0 {
 		return 0
 	}
@@ -1115,6 +1116,17 @@ func (h *Handler) logComputedDegradationIfChanged(source string) {
 
 func roundMetric(value float64) float64 {
 	return math.Round(value*1000) / 1000
+}
+
+func calibratedTokensPerSecond(configuredTokensPerSecond int) float64 {
+	if configuredTokensPerSecond < 1 {
+		return 0
+	}
+	calibrated := float64(configuredTokensPerSecond) * replayTokensPerSecondEfficiency
+	if calibrated < 1 {
+		return 1
+	}
+	return calibrated
 }
 
 type requestScheduler struct {
@@ -1255,21 +1267,22 @@ func (s *requestScheduler) degradationMetricsLocked(baseTokensPerSecond, maxDegr
 	if baseTokensPerSecond < 1 {
 		return 0, 0
 	}
+	calibratedBaseTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
 	if maxDegradation == 0 {
-		return 0, float64(baseTokensPerSecond)
+		return 0, calibratedBaseTokensPerSecond
 	}
 	capacity := s.maxConcurrent
 	inFlight := s.inFlight
 	if capacity == 0 {
-		return 0, float64(baseTokensPerSecond)
+		return 0, calibratedBaseTokensPerSecond
 	}
 	thresholdRequests := int(math.Floor(float64(capacity) * degradationThreshold))
 	if inFlight <= thresholdRequests {
-		return 0, float64(baseTokensPerSecond)
+		return 0, calibratedBaseTokensPerSecond
 	}
 	degradationWindow := capacity - thresholdRequests
 	if degradationWindow <= 0 {
-		return 0, float64(baseTokensPerSecond)
+		return 0, calibratedBaseTokensPerSecond
 	}
 	progress := float64(inFlight-thresholdRequests) / float64(degradationWindow)
 	if progress < 0 {
@@ -1279,7 +1292,7 @@ func (s *requestScheduler) degradationMetricsLocked(baseTokensPerSecond, maxDegr
 		progress = 1
 	}
 	computedDegradationPercentage := float64(maxDegradation) * progress
-	effectiveTokensPerSecond := float64(baseTokensPerSecond) * (1 - computedDegradationPercentage/100)
+	effectiveTokensPerSecond := calibratedBaseTokensPerSecond * (1 - computedDegradationPercentage/100)
 	if effectiveTokensPerSecond < 1 {
 		effectiveTokensPerSecond = 1
 	}
