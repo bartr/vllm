@@ -48,8 +48,6 @@ gpasswd -a $SUDO_USER docker
 
 chown -r $SUDO_USER:$SUDO_USER /home/$SUDO_USER
 
-#update-alternatives --set iptables /usr/sbin/iptables-legacy
-
 apt-get update
 apt-get install -y gpg wget
 apt-get install -y apt-utils dialog apt-transport-https ca-certificates software-properties-common iputils-ping

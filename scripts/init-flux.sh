@@ -21,18 +21,18 @@ flux reconcile kustomization vllm
 kubectl apply -f listeners/traefik.yaml
 flux reconcile kustomization traefik
 
+kubectl apply -f listeners/prometheus-operator.yaml
+flux reconcile kustomization prometheus-operator
 echo ''
 echo 'Waiting for Prometheus operator to start - this can take up to 10 minutes'
 echo ''
-kubectl apply -f listeners/prometheus-operator.yaml
-flux reconcile kustomization prometheus-operator
 kubectl wait --namespace monitoring --for=condition=Ready pod --all --timeout=10m
 
+kubectl apply -f listeners/prometheus.yaml
+flux reconcile kustomization prometheus
 echo ''
 echo 'Waiting for Prometheus to start - this can take up to 5 minutes'
 echo ''
-kubectl apply -f listeners/prometheus.yaml
-flux reconcile kustomization prometheus
 kubectl wait --namespace monitoring --for=condition=Ready pod --all --timeout=5m
 
 kubectl apply -f listeners/dcgm-exporter.yaml
@@ -46,9 +46,9 @@ echo ''
 kubectl wait --namespace monitoring --for=condition=Ready pod --all --timeout=5m
 
 echo ''
-echo 'Waiting for vLLM pod to start - this can take up to 15 minutes'
+echo 'Waiting for vLLM pod to start - this can take up to 20 minutes'
 echo ''
-kubectl wait --namespace vllm --for=condition=Ready pod --all --timeout=15m
+kubectl wait --namespace vllm --for=condition=Ready pod --all --timeout=20m
 
 kubectl apply -f flux-listeners.yaml
 flux reconcile kustomization flux-listeners
