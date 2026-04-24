@@ -18,5 +18,11 @@ sudo chown $(id -u):$(id -g) -R ~/.kube
 cd ../cllm
 make deploy
 
+# wait for the node to be ready
 kubectl wait --for=condition=Ready node/z01 --timeout=3m
+
+# give K3s a chance to start
+sleep 25
+
+# wait for traefik to be ready
 kubectl -n kube-system rollout status deployment/traefik --timeout=3m
