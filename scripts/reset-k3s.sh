@@ -17,3 +17,5 @@ sudo chown $(id -u):$(id -g) -R ~/.kube
 
 cd ../cllm
 make deploy
+
+kubectl wait --for=condition=Ready node/z01 --timeout=3m
