@@ -23,7 +23,7 @@ mkdir -p $HOME/.k9s
     echo "alias kaf='kubectl apply -f'"
     echo "alias kdelf='kubectl delete -f'"
     echo "alias kl='kubectl logs'"
-    echo "alias kak='kubectl apply -k'"
+    echo "alias kak='kubectl apply --server-side -k'"
     echo "alias kuse='kubectl config use-context'"
     echo "alias kgp='kubectl get pods -A'"
     echo "alias kgs='kubectl get svc -A'"
