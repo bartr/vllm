@@ -19,3 +19,4 @@ cd ../cllm
 make deploy
 
 kubectl wait --for=condition=Ready node/z01 --timeout=3m
+kubectl -n kube-system rollout status deployment/traefik --timeout=3m
