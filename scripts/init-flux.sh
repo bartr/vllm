@@ -6,7 +6,11 @@ cd "$script_dir" || exit 1
 cd ../clusters/z01/flux-system
 kubectl apply -f components.yaml
 kubectl apply -f source.yaml
-kubectl wait --namespace flux-system --for=condition=Ready pod --all --timeout=60s
+
+echo ''
+echo 'Waiting for Flux to start - this can take up to 5 minutes'
+echo ''
+kubectl wait --namespace flux-system --for=condition=Ready pod --all --timeout=5m
 
 kubectl apply -f listeners/nvidia-plugin.yaml
 flux reconcile kustomization nvidia-plugin
