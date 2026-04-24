@@ -23,20 +23,37 @@ kubectl apply -f components.yaml
 kubectl apply -f source.yaml
 kubectl wait --namespace flux-system --for=condition=Ready pod --all --timeout=60s
 
-kubectl apply -f listeners/vllm.yaml
-flux reconcile kustomization vllm
-
 kubectl apply -f listeners/nvidia-plugin.yaml
 flux reconcile kustomization nvidia-plugin
+
+kubectl apply -f listeners/vllm.yaml
+flux reconcile kustomization vllm
 
 kubectl apply -f listeners/traefik.yaml
 flux reconcile kustomization traefik
 
+echo ''
+echo 'Waiting for Prometheus operator to start - this can take up to 10 minutes'
+echo ''
 kubectl apply -f listeners/prometheus-operator.yaml
 flux reconcile kustomization prometheus-operator
+kubectl wait --namespace monitoring --for=condition=Ready pod --all --timeout=10m
 
+echo ''
+echo 'Waiting for Prometheus to start - this can take up to 5 minutes'
+echo ''
 kubectl apply -f listeners/prometheus.yaml
 flux reconcile kustomization prometheus
+kubectl wait --namespace monitoring --for=condition=Ready pod --all --timeout=5m
+
+kubectl apply -f listeners/dcgm-exporter.yaml
+flux reconcile kustomization dcgm-exporter
+
+kubectl apply -f listeners/grafana.yaml
+flux reconcile kustomization grafana
+echo ''
+echo 'Waiting for Grafana to start - this can take up to 5 minutes'
+echo ''
 kubectl wait --namespace monitoring --for=condition=Ready pod --all --timeout=5m
 
 echo ''
