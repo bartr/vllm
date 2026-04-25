@@ -19,6 +19,7 @@ mkdir -p $HOME/.k9s
 
 {
     echo ""
+    echo "alias ask='$HOME/vllm/scripts/ask.sh'"
     echo "alias k='kubectl'"
     echo "alias kaf='kubectl apply -f'"
     echo "alias kdelf='kubectl delete -f'"

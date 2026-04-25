@@ -4,11 +4,11 @@
 
 ## Endpoints
 
-- `GET /healthz` returns `ok`
-- `GET /readyz` returns `ready`
+- `GET /health` returns `ok`
+- `GET /ready` returns `ready`
 - `GET /version` returns the current application version as plain text with no surrounding whitespace
-- `GET /ask` returns `success`
 - `GET /config` returns the live handler config and applies any supported query string updates before printing it
+- `GET /metrics` returns Prometheus metrics for HTTP traffic, queue state, cache activity, downstream latency, TTFTB, and job processing
 
 ## Run locally
 
@@ -37,13 +37,13 @@ The server supports these runtime settings:
 - `CACHE_DOWNSTREAM_URL` or `--downstream-url`: downstream OpenAI-compatible base URL, default `http://localhost:8000`
 - `CACHE_DOWNSTREAM_TOKEN` or `--downstream-token`: bearer token sent to the downstream API
 - `CACHE_DOWNSTREAM_MODEL` or `--downstream-model`: default downstream model when incoming requests omit `model`
-- `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for `/ask`
-- `CACHE_MAX_TOKENS` or `--max-tokens`: default max tokens for `/ask`
+- `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for chat completions
+- `CACHE_MAX_TOKENS` or `--max-tokens`: default max tokens for chat completions
 - `CACHE_MAX_TOKENS_PER_SECOND` or `--max-tokens-per-second`: cached replay token rate per request, `0` to `1000`, default `32`; `0` disables cached replay delay
 - `CACHE_MAX_CONCURRENT_REQUESTS` or `--max-concurrent-requests`: max concurrent request slots, `1` to `512`, default `512`
 - `CACHE_MAX_WAITING_REQUESTS` or `--max-waiting-requests`: max queued waiting requests, `0` to `1024`, must be less than `2 * max-concurrent-requests`; default `1023`
 - `CACHE_MAX_DEGRADATION` or `--max-degradation`: percent reduction applied to cached replay throughput once concurrency rises above `10%`, `0` to `95`, default `10`; `0` disables degradation
-- `CACHE_TEMPERATURE` or `--temperature`: default temperature for `/ask`
+- `CACHE_TEMPERATURE` or `--temperature`: default temperature for chat completions
 - `-h` or `--help`: show command usage and exit
 - `--version`: show the application version and exit
 
@@ -65,7 +65,7 @@ curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
-Request admission is limited by concurrent slots and a waiting queue for `GET /ask` and `POST /v1/chat/completions`. When both are full, `cllm` returns `429` with `over capacity`.
+Request admission is limited by concurrent slots and a waiting queue for `POST /v1/chat/completions`. When both are full, `cllm` returns `429` with `over capacity`.
 
 If you lower `max-concurrent-requests` or `max-waiting-requests` below the current in-flight or queued counts, existing work is preserved. New admissions stay blocked until the live counts fall back within the new limits.
 
@@ -92,6 +92,8 @@ curl 'http://127.0.0.1:8080/config?cache-size=1'
 ```
 
 The downstream token is intentionally not returned by `/config`.
+
+Prometheus scraping is exposed at `/metrics`. In addition to the standard Go and process collectors, `cllm` exports HTTP request metrics and service-specific metrics covering queue wait time, in-flight and waiting request counts, effective token throughput, cache hit and miss counts, downstream request latency, time to first byte, and overall job duration for `/v1/chat/completions`.
 
 ## Build
 
@@ -150,5 +152,5 @@ kubectl -n cllm rollout status deployment/cllm
 Then call it through the Traefik external IP on port `8080`:
 
 ```bash
-curl -i http://192.168.68.63:8080/healthz
+curl -i http://192.168.68.63:8080/health
 ```

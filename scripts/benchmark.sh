@@ -2,39 +2,89 @@
 
 set -euo pipefail
 
-VLLM_BENCH_URL=${VLLM_BENCH_URL:-http://localhost:8000}
+VLLM_BENCH_URL=${VLLM_BENCH_URL:-http://localhost:8088}
 VLLM_BENCH_TOKEN=${VLLM_BENCH_TOKEN:-}
 VLLM_BENCH_MODEL=${VLLM_BENCH_MODEL:-}
-VLLM_BENCH_START=${VLLM_BENCH_START:-1}
-VLLM_BENCH_MAX_CONCURRENCY=${VLLM_BENCH_MAX_CONCURRENCY:-100}
-VLLM_BENCH_REQUESTS_PER_WORKER=${VLLM_BENCH_REQUESTS_PER_WORKER:-1}
-VLLM_BENCH_MAX_TOKENS=${VLLM_BENCH_MAX_TOKENS:-64}
+VLLM_BENCH_CONCURRENCY=${VLLM_BENCH_CONCURRENCY:-20}
+VLLM_BENCH_DURATION=${VLLM_BENCH_DURATION:-}
+VLLM_BENCH_MAX_TOKENS=${VLLM_BENCH_MAX_TOKENS:-128}
 VLLM_BENCH_TEMPERATURE=${VLLM_BENCH_TEMPERATURE:-0}
 VLLM_BENCH_STREAM=${VLLM_BENCH_STREAM:-1}
 VLLM_BENCH_WARMUP=${VLLM_BENCH_WARMUP:-0}
 VLLM_BENCH_SYSTEM_PROMPT=${VLLM_BENCH_SYSTEM_PROMPT:-You are a helpful assistant.}
 VLLM_BENCH_PROMPT=${VLLM_BENCH_PROMPT:-Explain Azure}
 
+stop_requested=0
+stop_file=
+result_fifo=
+aggregator_pid=
+timer_pid=
+worker_pids=()
+
+parse_duration_seconds() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+
+value = sys.argv[1].strip().lower()
+match = re.fullmatch(r"(\d+)([smh]?)", value)
+if not match:
+    raise SystemExit(1)
+
+amount = int(match.group(1))
+suffix = match.group(2) or "s"
+multiplier = {"s": 1, "m": 60, "h": 3600}[suffix]
+print(amount * multiplier)
+PY
+}
+
+estimated_request_seconds() {
+  python3 - "$VLLM_BENCH_MAX_TOKENS" <<'PY'
+import sys
+
+max_tokens = int(sys.argv[1])
+print(f"{max_tokens / 32.0:.6f}")
+PY
+}
+
+initial_thread_delay_seconds() {
+  local thread_number=$1
+  python3 - "$thread_number" "$VLLM_BENCH_CONCURRENCY" "$VLLM_BENCH_MAX_TOKENS" <<'PY'
+import sys
+
+thread_number = int(sys.argv[1])
+concurrency = int(sys.argv[2])
+max_tokens = int(sys.argv[3])
+
+if concurrency <= 1:
+    print("0")
+else:
+    request_seconds = max_tokens / 32.0
+    delay_seconds = request_seconds * (thread_number - 1) / concurrency
+    print(f"{delay_seconds:.6f}")
+PY
+}
+
 usage() {
   cat <<'EOF'
-Usage: ./scripts/benchmark-vllm.sh [options]
+Usage: ./scripts/benchmark.sh [options]
 
-Benchmark the local vLLM OpenAI-compatible endpoint and report the best aggregate
-completion tokens/sec found across a concurrency sweep.
+Run a fixed number of concurrent benchmark workers against an OpenAI-compatible
+endpoint until Ctrl-C is pressed. Each completed request prints its worker
+thread number, TTFT, request duration, per-request tokens/sec, and sampled
+aggregate tokens/sec across the same request window.
 
 Options:
   -h, --help                 Show this help message and exit
-      --url URL              Base URL for vLLM (default: http://localhost:8000)
+      --url URL              Base URL for the target endpoint (default: http://localhost:8088)
       --token TOKEN          Bearer token for authenticated endpoints
       --model MODEL          Model ID to benchmark; auto-detected from /v1/models if omitted
-      --start N              Lowest concurrency level to test (default: 20)
-      --max-concurrency N    Highest concurrency level to test (default: 50)
-      --requests-per-worker N
-                             Number of sequential requests per worker (default: 2)
-      --max-tokens N         Max completion tokens per request (default: 1024)
+      --concurrency N        Number of concurrent workers to run continuously (default: 1)
+      --duration VALUE       Stop automatically after VALUE, e.g. 10s, 5m, or 1h
+      --max-tokens N         Max completion tokens per request (default: 64)
       --temperature VALUE    Sampling temperature (default: 0)
       --stream               Use streaming chat completions and measure TTFT
-      --warmup               Run one untimed warmup request
+      --warmup               Run one untimed warmup request before the live loop starts
       --system-prompt TEXT   System prompt sent with each request
       --prompt TEXT          User prompt sent with each request
 
@@ -42,9 +92,8 @@ Environment:
   VLLM_BENCH_URL
   VLLM_BENCH_TOKEN
   VLLM_BENCH_MODEL
-  VLLM_BENCH_START
-  VLLM_BENCH_MAX_CONCURRENCY
-  VLLM_BENCH_REQUESTS_PER_WORKER
+  VLLM_BENCH_CONCURRENCY
+  VLLM_BENCH_DURATION
   VLLM_BENCH_MAX_TOKENS
   VLLM_BENCH_TEMPERATURE
   VLLM_BENCH_STREAM
@@ -64,6 +113,8 @@ require_command() {
 require_command curl
 require_command jq
 require_command python3
+require_command mkfifo
+require_command mktemp
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -83,16 +134,12 @@ while [[ $# -gt 0 ]]; do
       VLLM_BENCH_MODEL=$2
       shift 2
       ;;
-    --start)
-      VLLM_BENCH_START=$2
+    --concurrency)
+      VLLM_BENCH_CONCURRENCY=$2
       shift 2
       ;;
-    --max-concurrency)
-      VLLM_BENCH_MAX_CONCURRENCY=$2
-      shift 2
-      ;;
-    --requests-per-worker)
-      VLLM_BENCH_REQUESTS_PER_WORKER=$2
+    --duration)
+      VLLM_BENCH_DURATION=$2
       shift 2
       ;;
     --max-tokens)
@@ -127,24 +174,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! [[ "$VLLM_BENCH_START" =~ ^[0-9]+$ ]] || (( VLLM_BENCH_START < 1 )); then
-  echo "VLLM_BENCH_START must be an integer >= 1." >&2
+if ! [[ "$VLLM_BENCH_CONCURRENCY" =~ ^[0-9]+$ ]] || (( VLLM_BENCH_CONCURRENCY < 1 )); then
+  echo "VLLM_BENCH_CONCURRENCY must be an integer >= 1." >&2
   exit 1
 fi
 
-if ! [[ "$VLLM_BENCH_MAX_CONCURRENCY" =~ ^[0-9]+$ ]] || (( VLLM_BENCH_MAX_CONCURRENCY < 1 )); then
-  echo "VLLM_BENCH_MAX_CONCURRENCY must be an integer >= 1." >&2
-  exit 1
-fi
-
-if (( VLLM_BENCH_START > VLLM_BENCH_MAX_CONCURRENCY )); then
-  echo "VLLM_BENCH_START must be less than or equal to VLLM_BENCH_MAX_CONCURRENCY." >&2
-  exit 1
-fi
-
-if ! [[ "$VLLM_BENCH_REQUESTS_PER_WORKER" =~ ^[0-9]+$ ]] || (( VLLM_BENCH_REQUESTS_PER_WORKER < 1 )); then
-  echo "VLLM_BENCH_REQUESTS_PER_WORKER must be an integer >= 1." >&2
-  exit 1
+duration_seconds=
+if [[ -n "$VLLM_BENCH_DURATION" ]]; then
+  if ! duration_seconds=$(parse_duration_seconds "$VLLM_BENCH_DURATION"); then
+    echo "VLLM_BENCH_DURATION must look like 10s, 5m, 1h, or an integer number of seconds." >&2
+    exit 1
+  fi
+  if (( duration_seconds < 1 )); then
+    echo "VLLM_BENCH_DURATION must be at least 1 second." >&2
+    exit 1
+  fi
 fi
 
 if ! [[ "$VLLM_BENCH_MAX_TOKENS" =~ ^[0-9]+$ ]] || (( VLLM_BENCH_MAX_TOKENS < 1 )); then
@@ -169,6 +213,18 @@ build_curl_args() {
   fi
 }
 
+warn_if_bypassing_cllm() {
+  case "$VLLM_BENCH_URL" in
+    http://localhost:8000|http://127.0.0.1:8000)
+      if [[ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:8080/health 2>/dev/null || true)" == "200" ]]; then
+        echo "note: cLLM is available at http://127.0.0.1:8080, but this benchmark is targeting downstream vLLM directly at $VLLM_BENCH_URL." >&2
+        echo "      cLLM /metrics and /config queue counters only change when requests go through cLLM." >&2
+        echo "      rerun with: VLLM_BENCH_URL=http://127.0.0.1:8080 ./scripts/benchmark.sh --concurrency $VLLM_BENCH_CONCURRENCY" >&2
+      fi
+      ;;
+  esac
+}
+
 wait_for_endpoint() {
   local attempts=${1:-60}
   local delay_s=${2:-2}
@@ -181,18 +237,18 @@ wait_for_endpoint() {
       fi
     fi
 
-    if output=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' "$VLLM_BENCH_URL/healthz" 2>&1); then
+    if output=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' "$VLLM_BENCH_URL/health" 2>&1); then
       if [[ "$output" == "200" ]]; then
         return 0
       fi
     fi
 
     if (( attempt == attempts )); then
-      echo "vLLM endpoint did not become ready at $VLLM_BENCH_URL/health after $attempts attempts." >&2
+      echo "endpoint did not become ready at $VLLM_BENCH_URL/health after $attempts attempts." >&2
       echo "$output" >&2
       return 1
     fi
-    echo "waiting for vLLM endpoint at $VLLM_BENCH_URL/health (attempt $attempt/$attempts)..." >&2
+    echo "waiting for endpoint at $VLLM_BENCH_URL/health (attempt $attempt/$attempts)..." >&2
     sleep "$delay_s"
   done
 }
@@ -235,59 +291,107 @@ detect_model() {
 
 run_request() {
   local request_body=$1
-  local result_file=$2
-  local response_file error_file curl_metrics http_code latency_s ttft_s latency_ns ttft_ns curl_exit
+  local thread_number=$2
+  local request_started_ns request_ended_ns response_file error_file curl_metrics http_code latency_s ttft_s latency_ns ttft_ns curl_exit
+  local stream_args=()
 
+  request_started_ns=$(date +%s%N)
   response_file=$(mktemp)
   error_file=$(mktemp)
+
+  if [[ "$VLLM_BENCH_STREAM" == "1" ]]; then
+    stream_args=(-N)
+  fi
+
   if ! curl_metrics=$(curl "${curl_args[@]}" \
-    $( [[ "$VLLM_BENCH_STREAM" == "1" ]] && printf '%s' '-N' ) \
+    "${stream_args[@]}" \
     -o "$response_file" \
     -w '%{http_code}\t%{time_total}\t%{time_starttransfer}' \
     -H 'Content-Type: application/json' \
     -d "$request_body" \
     "$VLLM_BENCH_URL/v1/chat/completions" 2>"$error_file"); then
     curl_exit=$?
+    request_ended_ns=$(date +%s%N)
     jq -nc \
+      --argjson thread "$thread_number" \
       --arg error "$(tr '\n' ' ' < "$error_file")" \
       --argjson curl_exit "$curl_exit" \
-      '{ok:false,error:(if $error == "" then "curl failed" else $error end),curl_exit:$curl_exit}' >> "$result_file"
-    rm -f "$response_file"
-    rm -f "$error_file"
+      --argjson started_at_ns "$request_started_ns" \
+      --argjson ended_at_ns "$request_ended_ns" \
+      '{
+        ok: false,
+        thread: $thread,
+        error: (if $error == "" then "curl failed" else $error end),
+        curl_exit: $curl_exit,
+        started_at_ns: $started_at_ns,
+        ended_at_ns: $ended_at_ns,
+        duration_ns: ($ended_at_ns - $started_at_ns),
+        completion_tokens: 0,
+        prompt_tokens: 0,
+        total_tokens: 0,
+        ttft_ns: null
+      }'
+    rm -f "$response_file" "$error_file"
     return 0
   fi
+
+  request_ended_ns=$(date +%s%N)
   IFS=$'\t' read -r http_code latency_s ttft_s <<< "$curl_metrics"
   latency_ns=$(python3 - "$latency_s" <<'PY'
 import sys
 print(int(float(sys.argv[1]) * 1_000_000_000))
 PY
 )
-  ttft_ns=$(python3 - "$ttft_s" <<'PY'
+
+  if [[ "$VLLM_BENCH_STREAM" == "1" ]]; then
+    ttft_ns=$(python3 - "$ttft_s" <<'PY'
 import sys
 print(int(float(sys.argv[1]) * 1_000_000_000))
 PY
 )
+  else
+    ttft_ns=null
+  fi
 
   if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
     if [[ "$http_code" -gt 399 ]]; then
-      echo "request failed: status=$http_code endpoint=$VLLM_BENCH_URL/v1/chat/completions" >&2
+      echo "request failed: thread=$thread_number status=$http_code endpoint=$VLLM_BENCH_URL/v1/chat/completions" >&2
     fi
     jq -nc \
-      --arg status "$http_code" \
+      --argjson thread "$thread_number" \
+      --argjson status "$http_code" \
       --arg body "$(tr '\n' ' ' < "$response_file")" \
-      '{ok:false,status:($status|tonumber),error:$body}' >> "$result_file"
-    rm -f "$response_file"
+      --argjson started_at_ns "$request_started_ns" \
+      --argjson ended_at_ns "$request_ended_ns" \
+      --argjson duration_ns "$latency_ns" \
+      '{
+        ok: false,
+        thread: $thread,
+        status: $status,
+        error: $body,
+        started_at_ns: $started_at_ns,
+        ended_at_ns: $ended_at_ns,
+        duration_ns: $duration_ns,
+        completion_tokens: 0,
+        prompt_tokens: 0,
+        total_tokens: 0,
+        ttft_ns: null
+      }'
+    rm -f "$response_file" "$error_file"
     return 0
   fi
 
   if [[ "$VLLM_BENCH_STREAM" == "1" ]]; then
-    if ! python3 - "$response_file" "$latency_ns" "$ttft_ns" >> "$result_file" <<'PY'
+    if ! python3 - "$response_file" "$thread_number" "$request_started_ns" "$request_ended_ns" "$latency_ns" "$ttft_ns" <<'PY'
 import json
 import sys
 
 response_path = sys.argv[1]
-latency_ns = int(sys.argv[2])
-ttft_ns = int(sys.argv[3])
+thread_number = int(sys.argv[2])
+started_at_ns = int(sys.argv[3])
+ended_at_ns = int(sys.argv[4])
+duration_ns = int(sys.argv[5])
+ttft_ns = int(sys.argv[6])
 completion_tokens = 0
 prompt_tokens = 0
 total_tokens = 0
@@ -309,110 +413,220 @@ with open(response_path, encoding="utf-8") as handle:
 
 print(json.dumps({
     "ok": True,
+    "thread": thread_number,
     "completion_tokens": completion_tokens,
     "prompt_tokens": prompt_tokens,
     "total_tokens": total_tokens,
-    "latency_ns": latency_ns,
+    "started_at_ns": started_at_ns,
+    "ended_at_ns": ended_at_ns,
+    "duration_ns": duration_ns,
     "ttft_ns": ttft_ns,
 }))
 PY
     then
-      jq -nc --arg error "invalid streaming response" '{ok:false,error:$error}' >> "$result_file"
+      jq -nc \
+        --argjson thread "$thread_number" \
+        --argjson started_at_ns "$request_started_ns" \
+        --argjson ended_at_ns "$request_ended_ns" \
+        --argjson duration_ns "$latency_ns" \
+        '{
+          ok: false,
+          thread: $thread,
+          error: "invalid streaming response",
+          started_at_ns: $started_at_ns,
+          ended_at_ns: $ended_at_ns,
+          duration_ns: $duration_ns,
+          completion_tokens: 0,
+          prompt_tokens: 0,
+          total_tokens: 0,
+          ttft_ns: null
+        }'
     fi
   else
-    if ! jq -c --argjson latency_ns "$latency_ns" '{ok:true,completion_tokens:(.usage.completion_tokens // 0),prompt_tokens:(.usage.prompt_tokens // 0),total_tokens:(.usage.total_tokens // 0),latency_ns:$latency_ns,ttft_ns:null}' "$response_file" >> "$result_file"; then
-      jq -nc --arg error "invalid JSON response" '{ok:false,error:$error}' >> "$result_file"
+    if ! jq -cn \
+      --argjson thread "$thread_number" \
+      --argjson started_at_ns "$request_started_ns" \
+      --argjson ended_at_ns "$request_ended_ns" \
+      --argjson duration_ns "$latency_ns" \
+      --slurpfile payload "$response_file" \
+      '{
+        ok: true,
+        thread: $thread,
+        completion_tokens: ($payload[0].usage.completion_tokens // 0),
+        prompt_tokens: ($payload[0].usage.prompt_tokens // 0),
+        total_tokens: ($payload[0].usage.total_tokens // 0),
+        started_at_ns: $started_at_ns,
+        ended_at_ns: $ended_at_ns,
+        duration_ns: $duration_ns,
+        ttft_ns: null
+      }'; then
+      jq -nc \
+        --argjson thread "$thread_number" \
+        --argjson started_at_ns "$request_started_ns" \
+        --argjson ended_at_ns "$request_ended_ns" \
+        --argjson duration_ns "$latency_ns" \
+        '{
+          ok: false,
+          thread: $thread,
+          error: "invalid JSON response",
+          started_at_ns: $started_at_ns,
+          ended_at_ns: $ended_at_ns,
+          duration_ns: $duration_ns,
+          completion_tokens: 0,
+          prompt_tokens: 0,
+          total_tokens: 0,
+          ttft_ns: null
+        }'
     fi
   fi
-  rm -f "$response_file"
-  rm -f "$error_file"
+
+  rm -f "$response_file" "$error_file"
 }
 
-run_worker() {
-  local request_body=$1
-  local result_file=$2
-  local count=$3
-  : > "$result_file"
-  for ((i = 0; i < count; i += 1)); do
-    run_request "$request_body" "$result_file"
+run_worker_loop() {
+  local thread_number=$1
+  local request_body=$2
+  local fifo_path=$3
+  local initial_delay_seconds=$4
+
+  trap '' INT TERM
+  if [[ ! -f "$stop_file" ]] && [[ "$initial_delay_seconds" != "0" && "$initial_delay_seconds" != "0.000000" ]]; then
+    python3 - "$initial_delay_seconds" <<'PY'
+import sys
+import time
+
+time.sleep(float(sys.argv[1]))
+PY
+  fi
+  while [[ ! -f "$stop_file" ]]; do
+    run_request "$request_body" "$thread_number" > "$fifo_path"
   done
 }
 
-summarize_results() {
-  local result_dir=$1
-  local elapsed_ns=$2
-  python3 - "$result_dir" "$elapsed_ns" <<'PY'
+run_aggregator() {
+  local fifo_path=$1
+
+  python3 - "$fifo_path" <<'PY'
+from collections import deque
 import json
-import pathlib
+import signal
 import sys
 
-result_dir = pathlib.Path(sys.argv[1])
-elapsed_ns = int(sys.argv[2])
-completion_tokens = 0
-prompt_tokens = 0
-total_tokens = 0
-latency_ns_total = 0
-request_tps_total = 0.0
-ttft_ns_total = 0
-ttft_count = 0
-ok = 0
-failed = 0
+fifo_path = sys.argv[1]
+window_ns = 15 * 1_000_000_000
+completion_window = deque()
 
-for path in sorted(result_dir.glob("*.jsonl")):
-    for line in path.read_text(encoding="utf-8").splitlines():
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+def total_tps_last_minute(end_ns: int) -> float:
+  window_start_ns = end_ns - window_ns
+  while completion_window and completion_window[0][0] < window_start_ns:
+    completion_window.popleft()
+  if not completion_window:
+        return 0.0
+  total_tokens = sum(tokens for _, tokens in completion_window)
+  covered_start_ns = max(window_start_ns, completion_window[0][0])
+  elapsed_ns = end_ns - covered_start_ns
+  if elapsed_ns <= 0:
+    return 0.0
+  return total_tokens / (elapsed_ns / 1_000_000_000)
+
+print("")
+print(f"{'thread':<8} {'tokens':<8} {'ttft_ms':<10} {'duration_ms':<12} {'req_tok/s':<12} {'total_tok/s':<12}")
+sys.stdout.flush()
+
+with open(fifo_path, encoding="utf-8") as handle:
+    for raw_line in handle:
+        line = raw_line.strip()
         if not line:
             continue
         item = json.loads(line)
-        if item.get("ok"):
-            ok += 1
-            completion = int(item.get("completion_tokens", 0))
-            prompt = int(item.get("prompt_tokens", 0))
-            total = int(item.get("total_tokens", 0))
-            latency_ns = int(item.get("latency_ns", 0))
-            completion_tokens += completion
-            prompt_tokens += prompt
-            total_tokens += total
-            latency_ns_total += latency_ns
-            if latency_ns > 0:
-                request_tps_total += completion / (latency_ns / 1_000_000_000)
-            if item.get("ttft_ns") is not None:
-                ttft_ns_total += int(item.get("ttft_ns", 0))
-                ttft_count += 1
-        else:
-            failed += 1
+        ended_at_ns = int(item.get("ended_at_ns", 0))
+        duration_ns = int(item.get("duration_ns", 0))
+        completion_tokens = int(item.get("completion_tokens", 0))
 
-elapsed_s = elapsed_ns / 1_000_000_000
-completion_tps = completion_tokens / elapsed_s if elapsed_s else 0.0
-avg_latency_ms = (latency_ns_total / ok) / 1_000_000 if ok else 0.0
-avg_request_tps = request_tps_total / ok if ok else 0.0
-avg_ttft_ms = (ttft_ns_total / ttft_count) / 1_000_000 if ttft_count else -1.0
-print("\t".join([
-    str(ok),
-    str(failed),
-    str(prompt_tokens),
-    str(completion_tokens),
-    str(total_tokens),
-    f"{elapsed_s:.3f}",
-    f"{completion_tps:.2f}",
-    f"{avg_latency_ms:.2f}",
-    f"{avg_request_tps:.2f}",
-    (f"{avg_ttft_ms:.2f}" if avg_ttft_ms >= 0 else "n/a"),
-]))
+        if item.get("ok"):
+          completion_window.append((ended_at_ns, completion_tokens))
+
+        req_tps = 0.0
+        if duration_ns > 0:
+            req_tps = completion_tokens / (duration_ns / 1_000_000_000)
+
+        total_tps = total_tps_last_minute(ended_at_ns)
+        ttft_ns = item.get("ttft_ns")
+        ttft_display = "n/a" if ttft_ns is None else f"{int(ttft_ns) / 1_000_000:.2f}"
+        duration_display = f"{duration_ns / 1_000_000:.2f}"
+
+        print(f"{int(item.get('thread', 0)):<8} {completion_tokens:<8} {ttft_display:<10} {duration_display:<12} {req_tps:<12.2f} {total_tps:<12.2f}")
+        sys.stdout.flush()
 PY
 }
 
+handle_stop() {
+  if (( stop_requested == 0 )); then
+    stop_requested=1
+    if [[ -n "$stop_file" ]]; then
+      touch "$stop_file"
+    fi
+    printf '\nStopping after in-flight requests finish...\n' >&2
+  fi
+}
+
+wait_for_pid() {
+  local pid=$1
+  local status
+
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if wait "$pid"; then
+      return 0
+    fi
+    status=$?
+    if (( stop_requested == 1 )) && (( status > 128 )); then
+      continue
+    fi
+    return "$status"
+  done
+
+  return 0
+}
+
+cleanup() {
+  trap - EXIT INT TERM
+  handle_stop
+
+  if [[ -n "$timer_pid" ]]; then
+    kill "$timer_pid" >/dev/null 2>&1 || true
+    wait "$timer_pid" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$aggregator_pid" ]]; then
+    wait "$aggregator_pid" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$result_fifo" ]]; then
+    rm -f "$result_fifo"
+  fi
+
+  if [[ -n "$stop_file" ]]; then
+    rm -f "$stop_file"
+  fi
+}
+
 build_curl_args
+warn_if_bypassing_cllm
 wait_for_endpoint
 detect_model
 request_body=$(build_request_body)
 
-echo "vLLM benchmark target: $VLLM_BENCH_URL"
+echo "benchmark target: $VLLM_BENCH_URL"
 echo "model: $VLLM_BENCH_MODEL"
-echo "start concurrency: $VLLM_BENCH_START"
-echo "max concurrency: $VLLM_BENCH_MAX_CONCURRENCY"
-echo "requests per worker: $VLLM_BENCH_REQUESTS_PER_WORKER"
+echo "concurrency: $VLLM_BENCH_CONCURRENCY"
+if [[ -n "$VLLM_BENCH_DURATION" ]]; then
+  echo "duration: $VLLM_BENCH_DURATION"
+fi
 echo "max tokens per request: $VLLM_BENCH_MAX_TOKENS"
 echo "stream mode: $VLLM_BENCH_STREAM"
+echo "press Ctrl-C to stop"
 
 if [[ "$VLLM_BENCH_WARMUP" == "1" ]]; then
   warmup_max_tokens=$VLLM_BENCH_MAX_TOKENS
@@ -420,88 +634,45 @@ if [[ "$VLLM_BENCH_WARMUP" == "1" ]]; then
     warmup_max_tokens=32
   fi
   echo "warming up with max tokens: $warmup_max_tokens"
-  warmup_result=$(mktemp)
   warmup_request_body=$(build_request_body "$warmup_max_tokens")
-  run_request "$warmup_request_body" "$warmup_result"
-  rm -f "$warmup_result"
+  run_request "$warmup_request_body" 0 >/dev/null
 fi
 
-printf '\n'
-printf '%-12s %-10s %-10s %-14s %-10s %-10s %-12s %-12s %-10s\n' 'concurrency' 'requests' 'failures' 'completion_tok' 'elapsed_s' 'tok/s' 'avg_lat_ms' 'req_tok/s' 'ttft_ms'
+stop_file=$(mktemp)
+rm -f "$stop_file"
+result_fifo=$(mktemp -u)
+mkfifo "$result_fifo"
 
-best_concurrency=0
-best_tps=0
-best_balanced_concurrency=0
-best_balanced_tps=0
-best_balanced_latency=0
-min_latency_ms=0
+trap handle_stop INT TERM
+trap cleanup EXIT
 
-for ((concurrency = VLLM_BENCH_START; concurrency <= VLLM_BENCH_MAX_CONCURRENCY; concurrency += 1)); do
-  result_dir=$(mktemp -d)
-  start_ns=$(date +%s%N)
-  pids=()
-  for ((worker = 1; worker <= concurrency; worker += 1)); do
-    run_worker "$request_body" "$result_dir/$worker.jsonl" "$VLLM_BENCH_REQUESTS_PER_WORKER" &
-    pids+=($!)
-  done
-  for pid in "${pids[@]}"; do
-    wait "$pid"
-  done
-  end_ns=$(date +%s%N)
-  elapsed_ns=$((end_ns - start_ns))
-
-  IFS=$'\t' read -r ok failed prompt_tokens completion_tokens total_tokens elapsed_s completion_tps avg_latency_ms avg_request_tps avg_ttft_ms < <(summarize_results "$result_dir" "$elapsed_ns")
-  rm -rf "$result_dir"
-
-  printf '%-12s %-10s %-10s %-14s %-10s %-10s %-12s %-12s %-10s\n' "$concurrency" "$ok" "$failed" "$completion_tokens" "$elapsed_s" "$completion_tps" "$avg_latency_ms" "$avg_request_tps" "$avg_ttft_ms"
-
-  if python3 - "$completion_tps" "$best_tps" <<'PY'
+if [[ -n "$duration_seconds" ]]; then
+  (
+    trap '' INT TERM
+    python3 - "$duration_seconds" <<'PY'
 import sys
-current = float(sys.argv[1])
-best = float(sys.argv[2])
-raise SystemExit(0 if current > best else 1)
-PY
-  then
-    best_tps=$completion_tps
-    best_concurrency=$concurrency
-  fi
+import time
 
-  if python3 - "$avg_latency_ms" "$min_latency_ms" <<'PY'
-import sys
-current = float(sys.argv[1])
-best = float(sys.argv[2])
-raise SystemExit(0 if best == 0 or current < best else 1)
+time.sleep(int(sys.argv[1]))
 PY
-  then
-    min_latency_ms=$avg_latency_ms
-  fi
+    if [[ ! -f "$stop_file" ]]; then
+      touch "$stop_file"
+    fi
+  ) &
+  timer_pid=$!
+fi
 
-  if python3 - "$failed" "$avg_latency_ms" "$min_latency_ms" "$completion_tps" "$best_balanced_tps" <<'PY'
-import sys
-failed = int(sys.argv[1])
-latency = float(sys.argv[2])
-min_latency = float(sys.argv[3])
-current_tps = float(sys.argv[4])
-best_tps = float(sys.argv[5])
-if failed != 0:
-    raise SystemExit(1)
-if min_latency == 0:
-    raise SystemExit(0)
-threshold = min_latency * 2.0
-raise SystemExit(0 if latency <= threshold and current_tps > best_tps else 1)
-PY
-  then
-    best_balanced_tps=$completion_tps
-    best_balanced_concurrency=$concurrency
-    best_balanced_latency=$avg_latency_ms
-  fi
+(trap '' INT TERM; run_aggregator "$result_fifo") &
+aggregator_pid=$!
+
+for ((thread_number = 1; thread_number <= VLLM_BENCH_CONCURRENCY; thread_number += 1)); do
+  initial_delay_seconds=$(initial_thread_delay_seconds "$thread_number")
+  run_worker_loop "$thread_number" "$request_body" "$result_fifo" "$initial_delay_seconds" &
+  worker_pids+=("$!")
 done
 
-printf '\n'
-echo "best_concurrency: $best_concurrency"
-echo "best_completion_tokens_per_second: $best_tps"
-if [[ "$best_balanced_concurrency" != "0" ]]; then
-  echo "best_latency_balanced_concurrency: $best_balanced_concurrency"
-  echo "best_latency_balanced_tokens_per_second: $best_balanced_tps"
-  echo "best_latency_balanced_avg_latency_ms: $best_balanced_latency"
-fi
+for pid in "${worker_pids[@]}"; do
+  wait_for_pid "$pid"
+done
+
+wait_for_pid "$aggregator_pid"

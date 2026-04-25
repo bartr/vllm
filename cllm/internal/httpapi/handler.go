@@ -69,6 +69,7 @@ func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askO
 type Handler struct {
 	ready      atomic.Bool
 	cache      *lruCache
+	metrics    *handlerMetrics
 	configMu   sync.RWMutex
 	defaults   askOptions
 	vllmURL    string
@@ -96,6 +97,7 @@ func NewHandler() *Handler {
 	handler.scheduler = newRequestScheduler(defaultMaxConcurrentRequests, defaultMaxWaitingRequests)
 	handler.sleep = sleepWithContext
 	handler.lastLoggedComputedDegradationMilliPercent.Store(-1)
+	handler.metrics = newHandlerMetrics(handler)
 	return handler
 }
 
@@ -244,13 +246,13 @@ func (h *Handler) applyDownstreamAuth(request *http.Request) {
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /config", h.config)
-	mux.HandleFunc("GET /healthz", h.healthz)
-	mux.HandleFunc("GET /readyz", h.readyz)
+	mux.HandleFunc("GET /health", h.healthEndpoint)
+	mux.Handle("GET /metrics", h.metrics.Handler())
+	mux.HandleFunc("GET /ready", h.readyEndpoint)
 	mux.HandleFunc("GET /version", h.version)
-	mux.HandleFunc("GET /ask", h.ask)
 	mux.HandleFunc("GET /v1/models", h.models)
 	mux.HandleFunc("POST /v1/chat/completions", h.chatCompletions)
-	return requestLogger(mux)
+	return requestLogger(mux, h.metrics)
 }
 
 type runtimeConfig struct {
@@ -272,11 +274,11 @@ type runtimeConfig struct {
 	Stream         bool    `json:"stream"`
 }
 
-func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) healthEndpoint(w http.ResponseWriter, _ *http.Request) {
 	writePlainText(w, http.StatusOK, "ok\n")
 }
 
-func (h *Handler) readyz(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) readyEndpoint(w http.ResponseWriter, _ *http.Request) {
 	if !h.ready.Load() {
 		writePlainText(w, http.StatusServiceUnavailable, "not ready\n")
 		return
@@ -316,6 +318,8 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	const endpoint = "chat_completions"
+
 	var requestPayload chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&requestPayload); err != nil {
 		markCacheHit(w, false)
@@ -329,16 +333,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	release, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
+	release, queueWait, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
 	if !ok {
+		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
 		return
 	}
 	defer release()
+	mode := modeLabel(requestPayload.Stream)
+	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
+	if queueWait > 0 {
+		h.metrics.observeQueueWait(endpoint, queueWait)
+	}
+	processingStartedAt := time.Now()
 
 	requestPayload, err := h.populateChatCompletionDefaults(r.Context(), requestPayload)
 	if err != nil {
+		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
 		markCacheHit(w, false)
 		http.Error(w, fmt.Sprintf("prepare chat completion: %v", err), http.StatusBadGateway)
 		return
@@ -346,6 +358,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	cacheKey, err := buildChatCompletionCacheKey(requestPayload)
 	if err != nil {
+		h.metrics.observeJob(endpoint, "failed", "none", mode, time.Since(processingStartedAt))
 		markCacheHit(w, false)
 		http.Error(w, fmt.Sprintf("cache chat completion request: %v", err), http.StatusInternalServerError)
 		return
@@ -353,35 +366,56 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if h.cache != nil {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
+			h.metrics.observeCacheLookup(endpoint, "hit")
 			markCacheHit(w, true)
+			completionTokens := cachedResponseCompletionTokens(cachedResponse)
+			timedWriter := newFirstByteMetricsWriter(w, func() {
+				h.metrics.observeTimeToFirstByte(endpoint, "cache", modeLabel(cachedResponse.streaming), time.Since(processingStartedAt))
+			})
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse)
+				h.replayCachedStream(r.Context(), timedWriter, cachedResponse)
+				h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
+				h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(true), time.Since(processingStartedAt))
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse)
+			h.replayCachedResponse(r.Context(), timedWriter, cachedResponse)
+			h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
+			h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(false), time.Since(processingStartedAt))
 			return
 		}
+		h.metrics.observeCacheLookup(endpoint, "miss")
 	}
 
 	markCacheHit(w, false)
+	timedWriter := newFirstByteMetricsWriter(w, func() {
+		h.metrics.observeTimeToFirstByte(endpoint, "downstream", mode, time.Since(processingStartedAt))
+	})
 
 	if requestPayload.Stream {
-		cachedResponse, err := h.streamChatCompletion(r.Context(), w, requestPayload)
+		downstreamStartedAt := time.Now()
+		cachedResponse, err := h.streamChatCompletion(r.Context(), timedWriter, requestPayload)
+		h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
+			h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+			http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 			return
 		}
 
 		if h.cache != nil {
 			h.cache.Add(cacheKey, cachedResponse)
 		}
+		h.metrics.observeCompletionTokens(endpoint, "downstream", cachedResponseCompletionTokens(cachedResponse))
+		h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
 		return
 	}
 
+	downstreamStartedAt := time.Now()
 	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
+	h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 	if err != nil {
-		http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
+		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+		http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 		return
 	}
 
@@ -389,12 +423,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody, contentType: contentType})
 	}
 
-	w.Header().Set("Content-Type", contentType)
-	w.WriteHeader(statusCode)
-	_, _ = w.Write(responseBody)
+	timedWriter.Header().Set("Content-Type", contentType)
+	timedWriter.WriteHeader(statusCode)
+	_, _ = timedWriter.Write(responseBody)
+	h.metrics.observeCompletionTokens(endpoint, "downstream", cachedJSONTokenCount(responseBody))
+	h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
 }
 
 func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
+	const endpoint = "ask"
+
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		markCacheHit(w, false)
@@ -416,31 +454,49 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	release, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
+	release, queueWait, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
 	if !ok {
+		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
 		return
 	}
 	defer release()
+	mode := modeLabel(options.stream)
+	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
+	if queueWait > 0 {
+		h.metrics.observeQueueWait(endpoint, queueWait)
+	}
+	processingStartedAt := time.Now()
 
 	if h.cache != nil {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
+			h.metrics.observeCacheLookup(endpoint, "hit")
 			markCacheHit(w, true)
+			completionTokens := cachedResponseCompletionTokens(cachedResponse)
+			timedWriter := newFirstByteMetricsWriter(w, func() {
+				h.metrics.observeTimeToFirstByte(endpoint, "cache", modeLabel(cachedResponse.streaming), time.Since(processingStartedAt))
+			})
 			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), w, cachedResponse)
+				h.replayCachedStream(r.Context(), timedWriter, cachedResponse)
+				h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
+				h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(true), time.Since(processingStartedAt))
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), w, cachedResponse)
+			h.replayCachedResponse(r.Context(), timedWriter, cachedResponse)
+			h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
+			h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(false), time.Since(processingStartedAt))
 			return
 		}
+		h.metrics.observeCacheLookup(endpoint, "miss")
 	}
 
 	markCacheHit(w, false)
 
 	model, err := h.fetchModel(r.Context())
 	if err != nil {
+		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
 		http.Error(w, fmt.Sprintf("fetch downstream model: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -458,23 +514,34 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 	if options.stream {
 		requestPayload.StreamOptions = &chatCompletionStreamOptions{IncludeUsage: true}
 	}
+	timedWriter := newFirstByteMetricsWriter(w, func() {
+		h.metrics.observeTimeToFirstByte(endpoint, "downstream", mode, time.Since(processingStartedAt))
+	})
 
 	if options.stream {
-		cachedResponse, err := h.streamChatCompletion(r.Context(), w, requestPayload)
+		downstreamStartedAt := time.Now()
+		cachedResponse, err := h.streamChatCompletion(r.Context(), timedWriter, requestPayload)
+		h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
+			h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+			http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 			return
 		}
 
 		if h.cache != nil {
 			h.cache.Add(cacheKey, cachedResponse)
 		}
+		h.metrics.observeCompletionTokens(endpoint, "downstream", cachedResponseCompletionTokens(cachedResponse))
+		h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
 		return
 	}
 
+	downstreamStartedAt := time.Now()
 	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
+	h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 	if err != nil {
-		http.Error(w, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
+		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+		http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 		return
 	}
 
@@ -482,9 +549,11 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody, contentType: contentType})
 	}
 
-	w.Header().Set("Content-Type", contentType)
-	w.WriteHeader(statusCode)
-	_, _ = w.Write(responseBody)
+	timedWriter.Header().Set("Content-Type", contentType)
+	timedWriter.WriteHeader(statusCode)
+	_, _ = timedWriter.Write(responseBody)
+	h.metrics.observeCompletionTokens(endpoint, "downstream", cachedJSONTokenCount(responseBody))
+	h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
 }
 
 func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
@@ -1025,22 +1094,22 @@ func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWrite
 	_, _ = w.Write(body)
 }
 
-func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), bool) {
+func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), time.Duration, bool) {
 	h.configMu.RLock()
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
 	if scheduler == nil {
-		return func() {}, true
+		return func() {}, 0, true
 	}
-	release, ok := scheduler.AcquirePath(ctx, path)
+	release, queueWait, ok := scheduler.AcquirePath(ctx, path)
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 	h.logComputedDegradationIfChanged("request_admitted")
 	return func() {
 		release()
 		h.logComputedDegradationIfChanged("request_completed")
-	}, true
+	}, queueWait, true
 }
 
 func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int) error {
@@ -1118,6 +1187,20 @@ func roundMetric(value float64) float64 {
 	return math.Round(value*1000) / 1000
 }
 
+func modeLabel(stream bool) string {
+	if stream {
+		return "stream"
+	}
+	return "nonstream"
+}
+
+func downstreamResultLabel(err error) string {
+	if err != nil {
+		return "failed"
+	}
+	return "completed"
+}
+
 func calibratedTokensPerSecond(configuredTokensPerSecond int) float64 {
 	if configuredTokensPerSecond < 1 {
 		return 0
@@ -1143,6 +1226,8 @@ type waitingRequest struct {
 	ready chan struct{}
 	element *list.Element
 	admitted bool
+	enqueuedAt time.Time
+	queueWait time.Duration
 }
 
 func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *requestScheduler {
@@ -1159,25 +1244,25 @@ func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *request
 	}
 }
 
-func (s *requestScheduler) Acquire(ctx context.Context) (func(), bool) {
+func (s *requestScheduler) Acquire(ctx context.Context) (func(), time.Duration, bool) {
 	return s.AcquirePath(ctx, "")
 }
 
-func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func(), bool) {
+func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func(), time.Duration, bool) {
 	s.mu.Lock()
 	if s.inFlight < s.maxConcurrent {
 		s.inFlight++
 		slog.Info("request admitted", "path", path, "source", "direct", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
 		s.mu.Unlock()
-		return s.releaseFunc(path), true
+		return s.releaseFunc(path), 0, true
 	}
 	if s.waiting >= s.maxWaiting {
 		slog.Warn("request admission rejected", "path", path, "reason", "over_capacity", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
 		s.mu.Unlock()
-		return nil, false
+		return nil, 0, false
 	}
 
-	request := &waitingRequest{path: path, ready: make(chan struct{})}
+	request := &waitingRequest{path: path, ready: make(chan struct{}), enqueuedAt: time.Now()}
 	request.element = s.queue.PushBack(request)
 	s.waiting++
 	slog.Info("request admitted", "path", path, "source", "waiting_queue", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
@@ -1185,12 +1270,12 @@ func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func()
 
 	select {
 	case <-request.ready:
-		return s.releaseFunc(path), true
+		return s.releaseFunc(path), request.queueWait, true
 	case <-ctx.Done():
 		s.mu.Lock()
 		if request.admitted {
 			s.mu.Unlock()
-			return s.releaseFunc(path), true
+			return s.releaseFunc(path), request.queueWait, true
 		}
 		if request.element != nil {
 			s.queue.Remove(request.element)
@@ -1198,7 +1283,7 @@ func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func()
 			s.waiting--
 		}
 		s.mu.Unlock()
-		return nil, false
+		return nil, 0, false
 	}
 }
 
@@ -1242,6 +1327,7 @@ func (s *requestScheduler) promoteWaitingLocked() {
 		s.queue.Remove(front)
 		request.element = nil
 		request.admitted = true
+		request.queueWait = time.Since(request.enqueuedAt)
 		s.waiting--
 		s.inFlight++
 		slog.Info("request admitted", "path", request.path, "source", "waiting_to_concurrent", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
@@ -1368,6 +1454,22 @@ func cachedJSONTokenCount(body []byte) int {
 		}
 	}
 	return estimateTextTokens(strings.Join(parts, " "))
+}
+
+func cachedStreamTokenCount(body []byte) int {
+	segments := parseCachedStreamReplaySegments(body)
+	tokenCount := 0
+	for _, segment := range segments {
+		tokenCount += segment.tokenCount
+	}
+	return tokenCount
+}
+
+func cachedResponseCompletionTokens(cachedResponse cachedVLLMResponse) int {
+	if cachedResponse.streaming {
+		return cachedStreamTokenCount(cachedResponse.body)
+	}
+	return cachedJSONTokenCount(cachedResponse.body)
 }
 
 func inspectSSEChunk(line []byte) (string, int) {
@@ -1627,9 +1729,13 @@ func markCacheHit(w http.ResponseWriter, cacheHit bool) {
 	cacheAwareWriter.SetCacheHit(cacheHit)
 }
 
-func requestLogger(next http.Handler) http.Handler {
+func requestLogger(next http.Handler, metrics *handlerMetrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedAt := time.Now()
+		if metrics != nil {
+			metrics.httpInflightRequests.Inc()
+			defer metrics.httpInflightRequests.Dec()
+		}
 		responseWriter := &loggingResponseWriter{ResponseWriter: w}
 
 		next.ServeHTTP(responseWriter, r)
@@ -1637,6 +1743,9 @@ func requestLogger(next http.Handler) http.Handler {
 		statusCode := responseWriter.statusCode
 		if statusCode == 0 {
 			statusCode = http.StatusOK
+		}
+		if metrics != nil {
+			metrics.observeHTTPRequest(routeLabel(r), r.Method, statusCode, time.Since(startedAt), responseWriter.bytes)
 		}
 
 		attrs := []any{

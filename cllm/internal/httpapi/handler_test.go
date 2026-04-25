@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"regexp"
 	"sync"
 	"sync/atomic"
 	"strings"
@@ -24,27 +23,19 @@ func TestRoutes(t *testing.T) {
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: "You are a detailed assistant.", maxTokens: 2500, temperature: defaultTemperature}).Routes()
 
 	tests := []struct {
-		name       string
-		method     string
-		path       string
-		statusCode int
-		body       string
+		name         string
+		method       string
+		path         string
+		statusCode   int
+		body         string
 		bodyContains []string
 	}{
-		{name: "healthz", method: http.MethodGet, path: "/healthz", statusCode: http.StatusOK, body: "ok\n"},
-		{name: "readyz", method: http.MethodGet, path: "/readyz", statusCode: http.StatusOK, body: "ready\n"},
+		{name: "health", method: http.MethodGet, path: "/health", statusCode: http.StatusOK, body: "ok\n"},
+		{name: "ready", method: http.MethodGet, path: "/ready", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
 		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
+		{name: "metrics", method: http.MethodGet, path: "/metrics", statusCode: http.StatusOK, bodyContains: []string{"# HELP cllm_http_requests_total", "cllm_http_inflight_requests", "cllm_queue_waiting_requests"}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
-		{name: "ask", method: http.MethodGet, path: "/ask?q=success", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
-		{name: "ask stream", method: http.MethodGet, path: "/ask?q=success&stream=true", statusCode: http.StatusOK, body: "data: {\"cache\":false,\"choices\":[{\"delta\":{\"content\":\"success\"},\"finish_reason\":null,\"index\":0}],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"cache\":false,\"choices\":[],\"created\":123,\"id\":\"chatcmpl-test-stream\",\"model\":\"test-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":5,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"},
-		{name: "ask example query", method: http.MethodGet, path: "/ask?q=what%20is%20the%20capital%20of%20Texas%3F", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"what is the capital of Texas?","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
-		{name: "ask custom options", method: http.MethodGet, path: "/ask?q=success&system-prompt=Be%20precise&max-tokens=700&temperature=0.7", statusCode: http.StatusOK, body: `{"cache":false,"choices":[{"message":{"content":"success","role":"assistant"}}],"id":"chatcmpl-test","object":"chat.completion"}`},
-		{name: "ask missing q", method: http.MethodGet, path: "/ask", statusCode: http.StatusBadRequest, body: "missing q\n"},
-		{name: "ask invalid max-tokens", method: http.MethodGet, path: "/ask?q=success&max-tokens=99", statusCode: http.StatusBadRequest, body: "max-tokens must be between 100 and 4000\n"},
-		{name: "ask invalid max-tokens format", method: http.MethodGet, path: "/ask?q=success&max-tokens=nope", statusCode: http.StatusBadRequest, body: "invalid max-tokens \"nope\"\n"},
-		{name: "ask invalid temperature", method: http.MethodGet, path: "/ask?q=success&temperature=nope", statusCode: http.StatusBadRequest, body: "invalid temperature \"nope\"\n"},
-		{name: "ask method not allowed", method: http.MethodPost, path: "/ask", statusCode: http.StatusMethodNotAllowed, body: "Method Not Allowed\n"},
 	}
 
 	for _, test := range tests {
@@ -72,6 +63,53 @@ func TestRoutes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMetricsCollapseStreamModeAndKeepChatCompletionsDurationRoute(t *testing.T) {
+	vllmServer := newTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	nonStreamingBody := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700}`
+	nonStreamingRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(nonStreamingBody))
+	nonStreamingRequest.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), nonStreamingRequest)
+
+	streamingBody := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700,"stream":true,"stream_options":{"include_usage":true}}`
+	streamingRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(streamingBody))
+	streamingRequest.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), streamingRequest)
+
+	metricsRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(metricsRecorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if metricsRecorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", metricsRecorder.Code, http.StatusOK)
+	}
+
+	body := metricsRecorder.Body.String()
+	for _, forbidden := range []string{
+		`mode="stream"`,
+		`mode="nonstream"`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("metrics body contains unexpected mode split %q", forbidden)
+		}
+	}
+
+	for _, want := range []string{
+		`cllm_http_request_duration_seconds_bucket{method="GET",route="other",status="200"`,
+		`cllm_http_request_duration_seconds_bucket{method="POST",route="POST /v1/chat/completions",status="200"`,
+		`cllm_time_to_first_byte_seconds_bucket{endpoint="chat_completions",source="downstream"`,
+		`cllm_job_duration_seconds_bucket{endpoint="chat_completions",result="completed",source="downstream"`,
+		`cllm_downstream_request_duration_seconds_bucket{endpoint="chat_completions",result="completed"`,
+		`cllm_completion_tokens_total{endpoint="chat_completions",source="downstream"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing substring %q", want)
+		}
 	}
 }
 
@@ -196,48 +234,6 @@ func TestChatCompletionsStreamCachesReplay(t *testing.T) {
 	}
 }
 
-func TestAskCachedReplayThrottlesNonStreamResponses(t *testing.T) {
-	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":[{"id":"test-model"}]}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"one two three four"}}],"usage":{"completion_tokens":4}}`))
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer vllmServer.Close()
-
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.SetRequestProcessingLimits(2, 10, 10, 0)
-	var sleeps []time.Duration
-	handler.sleep = func(_ context.Context, duration time.Duration) error {
-		sleeps = append(sleeps, duration)
-		return nil
-	}
-	router := handler.Routes()
-
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
-	secondRecorder := httptest.NewRecorder()
-	router.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
-
-	if secondRecorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusOK)
-	}
-	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
-		t.Fatalf("cached body %q does not contain cache=true", secondRecorder.Body.String())
-	}
-	if len(sleeps) != 1 {
-		t.Fatalf("sleep calls = %d, want 1", len(sleeps))
-	}
-	expected := time.Duration(float64(4) * float64(time.Second) / calibratedTokensPerSecond(2))
-	if sleeps[0] != expected {
-		t.Fatalf("sleep duration = %s, want %s", sleeps[0], expected)
-	}
-}
 
 func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -294,7 +290,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(20, 10, 10, 50)
 
-	releaseOne, ok := handler.acquireRequestSlot(context.Background(), "/one")
+	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), "/one")
 	if !ok {
 		t.Fatal("failed to acquire first request slot")
 	}
@@ -305,7 +301,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 		t.Fatalf("delay below threshold = %s, want %s", got, expected)
 	}
 
-	releaseTwo, ok := handler.acquireRequestSlot(context.Background(), "/two")
+	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), "/two")
 	if !ok {
 		t.Fatal("failed to acquire second request slot")
 	}
@@ -324,7 +320,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 
 	releases := make([]func(), 0, 52)
 	for i := 0; i < 51; i++ {
-		release, ok := handler.acquireRequestSlot(context.Background(), "/threshold")
+		release, _, ok := handler.acquireRequestSlot(context.Background(), "/threshold")
 		if !ok {
 			t.Fatalf("failed to acquire slot %d", i+1)
 		}
@@ -341,7 +337,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 		t.Fatalf("delay at threshold = %s, want %s", got, expected)
 	}
 
-	release, ok := handler.acquireRequestSlot(context.Background(), "/threshold-plus-one")
+	release, _, ok := handler.acquireRequestSlot(context.Background(), "/threshold-plus-one")
 	if !ok {
 		t.Fatal("failed to acquire threshold+1 slot")
 	}
@@ -354,86 +350,6 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 	}
 }
 
-func TestAskReturnsOverCapacityWhenConcurrencyAndQueueAreFull(t *testing.T) {
-	releaseDownstream := make(chan struct{})
-	downstreamStarted := make(chan struct{}, 1)
-	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		downstreamStarted <- struct{}{}
-		<-releaseDownstream
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"done"}}]}`))
-	}))
-	defer vllmServer.Close()
-
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.SetDownstreamModel("test-model")
-	handler.SetRequestProcessingLimits(32, 1, 0, 0)
-	router := handler.Routes()
-
-	firstDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		firstRecorder := httptest.NewRecorder()
-		router.ServeHTTP(firstRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=first", nil))
-		firstDone <- firstRecorder
-	}()
-
-	<-downstreamStarted
-
-	secondRecorder := httptest.NewRecorder()
-	router.ServeHTTP(secondRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=second", nil))
-
-	if secondRecorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("status code = %d, want %d", secondRecorder.Code, http.StatusTooManyRequests)
-	}
-	if secondRecorder.Body.String() != "over capacity\n" {
-		t.Fatalf("body = %q, want %q", secondRecorder.Body.String(), "over capacity\n")
-	}
-
-	close(releaseDownstream)
-	firstRecorder := <-firstDone
-	if firstRecorder.Code != http.StatusOK {
-		t.Fatalf("first request status code = %d, want %d", firstRecorder.Code, http.StatusOK)
-	}
-}
-
-func TestRoutesRequestLogging(t *testing.T) {
-	var logBuffer bytes.Buffer
-	originalLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
-	defer slog.SetDefault(originalLogger)
-
-	vllmServer := newTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=success", nil))
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=%20%20Success%20%20", nil))
-
-	logLine := logBuffer.String()
-	for _, want := range []string{
-		`msg="request completed"`,
-		"method=GET",
-		`path="/ask?q=success"`,
-		"status=200",
-		"bytes=128",
-		"cache=false",
-		"cache=true",
-	} {
-		if !strings.Contains(logLine, want) {
-			t.Fatalf("log line %q does not contain %q", logLine, want)
-		}
-	}
-
-	matched, err := regexp.MatchString(`duration_ms=\d+\.\d{2}`, logLine)
-	if err != nil {
-		t.Fatalf("match duration regex: %v", err)
-	}
-	if !matched {
-		t.Fatalf("log line %q does not contain duration_ms with two decimals", logLine)
-	}
-}
 
 func TestRoutesNotFoundLogging(t *testing.T) {
 	var logBuffer bytes.Buffer
@@ -461,119 +377,6 @@ func TestRoutesNotFoundLogging(t *testing.T) {
 	}
 }
 
-func TestAskCachesNormalizedQueries(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	firstRequest := httptest.NewRequest(http.MethodGet, "/ask?q=What%20is%20the%20capital%20of%20Texas%3F", nil)
-	firstRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(firstRecorder, firstRequest)
-
-	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=%20%20what%20is%20%20%20the%20capital%20of%20texas!!!%20%20", nil)
-	secondRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(secondRecorder, secondRequest)
-
-	if firstRecorder.Code != http.StatusOK {
-		t.Fatalf("first status = %d, want %d", firstRecorder.Code, http.StatusOK)
-	}
-	if secondRecorder.Code != http.StatusOK {
-		t.Fatalf("second status = %d, want %d", secondRecorder.Code, http.StatusOK)
-	}
-	if !strings.Contains(firstRecorder.Body.String(), `"cache":false`) {
-		t.Fatalf("live body %q does not contain cache=false", firstRecorder.Body.String())
-	}
-	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
-		t.Fatalf("cached body %q does not contain cache=true", secondRecorder.Body.String())
-	}
-	if !strings.Contains(secondRecorder.Body.String(), `capital of Texas`) {
-		t.Fatalf("cached body %q does not contain assistant content", secondRecorder.Body.String())
-	}
-	if got := counters.models.Load(); got != 1 {
-		t.Fatalf("models requests = %d, want 1", got)
-	}
-	if got := counters.chat.Load(); got != 1 {
-		t.Fatalf("chat requests = %d, want 1", got)
-	}
-}
-
-func TestAskStreamsAndReplaysCachedStreamWithFreshMetadata(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	firstRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil)
-	firstRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(firstRecorder, firstRequest)
-
-	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil)
-	secondRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(secondRecorder, secondRequest)
-
-	if firstRecorder.Code != http.StatusOK || secondRecorder.Code != http.StatusOK {
-		t.Fatalf("status codes = %d, %d, want both 200", firstRecorder.Code, secondRecorder.Code)
-	}
-	if got := counters.chat.Load(); got != 1 {
-		t.Fatalf("chat requests = %d, want 1", got)
-	}
-	if contentType := secondRecorder.Header().Get("Content-Type"); contentType != "text/event-stream" {
-		t.Fatalf("content type = %q, want %q", contentType, "text/event-stream")
-	}
-	if !strings.Contains(secondRecorder.Body.String(), "data: [DONE]") {
-		t.Fatalf("cached stream %q does not contain done marker", secondRecorder.Body.String())
-	}
-	if !strings.Contains(firstRecorder.Body.String(), `"cache":false`) {
-		t.Fatalf("live stream %q does not contain cache=false", firstRecorder.Body.String())
-	}
-	if !strings.Contains(secondRecorder.Body.String(), `"cache":true`) {
-		t.Fatalf("cached stream %q does not contain cache=true", secondRecorder.Body.String())
-	}
-	if !strings.Contains(secondRecorder.Body.String(), `"content":"hello"`) {
-		t.Fatalf("cached stream %q does not contain assistant content", secondRecorder.Body.String())
-	}
-
-	firstID, firstCreated := extractFirstStreamMetadata(t, firstRecorder.Body.String())
-	secondID, secondCreated := extractFirstStreamMetadata(t, secondRecorder.Body.String())
-	if firstID == secondID {
-		t.Fatalf("cached replay id = %q, want a fresh value distinct from %q", secondID, firstID)
-	}
-	if firstCreated == secondCreated {
-		t.Fatalf("cached replay created = %d, want a fresh value distinct from %d", secondCreated, firstCreated)
-	}
-	if !strings.HasPrefix(secondID, "chatcmpl-") {
-		t.Fatalf("cached replay id = %q, want chatcmpl- prefix", secondID)
-	}
-}
-
-func TestAskDoesNotReuseCacheAcrossStreamMode(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=hello&stream=true", nil))
-
-	if got := counters.chat.Load(); got != 2 {
-		t.Fatalf("chat requests = %d, want 2", got)
-	}
-}
-
-func TestAskDoesNotReuseCacheAcrossOptions(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	firstRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello&temperature=0.2", nil)
-	firstRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(firstRecorder, firstRequest)
-
-	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello&temperature=0.7", nil)
-	secondRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(secondRecorder, secondRequest)
-
-	if firstRecorder.Code != http.StatusOK || secondRecorder.Code != http.StatusOK {
-		t.Fatalf("status codes = %d, %d, want both 200", firstRecorder.Code, secondRecorder.Code)
-	}
-	if got := counters.chat.Load(); got != 2 {
-		t.Fatalf("chat requests = %d, want 2", got)
-	}
-}
 
 func TestStandardizeCacheKey(t *testing.T) {
 	tests := []struct {
@@ -608,207 +411,7 @@ func TestBuildCacheKeyIncludesAskOptions(t *testing.T) {
 	}
 }
 
-func TestParseAskOptions(t *testing.T) {
-	tests := []struct {
-		name        string
-		path        string
-		want        askOptions
-		wantErr     string
-	}{
-		{
-			name: "defaults",
-			path: "/ask?q=hello",
-			want: askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature, stream: false},
-		},
-		{
-			name: "custom values",
-			path: "/ask?q=hello&system-prompt=Be%20precise&max-tokens=700&temperature=0.7&stream=true",
-			want: askOptions{systemPrompt: "Be precise", maxTokens: 700, temperature: 0.7, stream: true},
-		},
-		{name: "invalid max tokens low", path: "/ask?q=hello&max-tokens=99", wantErr: "max-tokens must be between 100 and 4000"},
-		{name: "invalid max tokens high", path: "/ask?q=hello&max-tokens=10001", wantErr: "max-tokens must be between 100 and 4000"},
-		{name: "invalid max tokens format", path: "/ask?q=hello&max-tokens=abc", wantErr: "invalid max-tokens \"abc\""},
-		{name: "invalid temperature format", path: "/ask?q=hello&temperature=abc", wantErr: "invalid temperature \"abc\""},
-		{name: "invalid stream format", path: "/ask?q=hello&stream=maybe", wantErr: "invalid stream \"maybe\""},
-	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, test.path, nil)
-			got, err := parseAskOptions(req, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-			if test.wantErr != "" {
-				if err == nil || err.Error() != test.wantErr {
-					t.Fatalf("parseAskOptions() error = %v, want %q", err, test.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseAskOptions() error = %v", err)
-			}
-			if got != test.want {
-				t.Fatalf("parseAskOptions() = %+v, want %+v", got, test.want)
-			}
-		})
-	}
-}
-
-func TestAskUsesDefaultVLLMOptions(t *testing.T) {
-	vllmServer, captured := newCapturingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
-	}
-	if len(*captured) != 1 {
-		t.Fatalf("captured requests = %d, want 1", len(*captured))
-	}
-	got := (*captured)[0]
-	if got.SystemPrompt != defaultSystemPrompt {
-		t.Fatalf("system prompt = %q, want %q", got.SystemPrompt, defaultSystemPrompt)
-	}
-	if got.MaxTokens != defaultMaxTokens {
-		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, defaultMaxTokens)
-	}
-	if got.Temperature != defaultTemperature {
-		t.Fatalf("temperature = %v, want %v", got.Temperature, defaultTemperature)
-	}
-	if got.UserContent != "hello" {
-		t.Fatalf("user content = %q, want %q", got.UserContent, "hello")
-	}
-}
-
-func TestAskUsesCustomVLLMOptions(t *testing.T) {
-	vllmServer, captured := newCapturingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello&system-prompt=Be%20precise&max-tokens=700&temperature=0.7", nil))
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
-	}
-	if len(*captured) != 1 {
-		t.Fatalf("captured requests = %d, want 1", len(*captured))
-	}
-	got := (*captured)[0]
-	if got.SystemPrompt != "Be precise" {
-		t.Fatalf("system prompt = %q, want %q", got.SystemPrompt, "Be precise")
-	}
-	if got.MaxTokens != 700 {
-		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
-	}
-	if got.Temperature != 0.7 {
-		t.Fatalf("temperature = %v, want %v", got.Temperature, 0.7)
-	}
-	if got.UserContent != "hello" {
-		t.Fatalf("user content = %q, want %q", got.UserContent, "hello")
-	}
-}
-
-func TestConfigEndpointUpdatesAndReturnsCurrentConfig(t *testing.T) {
-	vllmServer, captured := newCapturingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	configRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?cache-size=7&downstream-url="+url.QueryEscape(vllmServer.URL)+"&downstream-model=gpt-4.1&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=64&max-waiting-requests=96&max-degradation=25&temperature=0.7&stream=true", nil))
-
-	if configRecorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", configRecorder.Code, http.StatusOK)
-	}
-
-	var got runtimeConfig
-	if err := json.Unmarshal(configRecorder.Body.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal config response: %v", err)
-	}
-	if got.SystemPrompt != "Be precise" {
-		t.Fatalf("system prompt = %q, want %q", got.SystemPrompt, "Be precise")
-	}
-	if got.DownstreamURL != vllmServer.URL {
-		t.Fatalf("downstream url = %q, want %q", got.DownstreamURL, vllmServer.URL)
-	}
-	if got.DownstreamModel != "gpt-4.1" {
-		t.Fatalf("downstream model = %q, want %q", got.DownstreamModel, "gpt-4.1")
-	}
-	if got.CacheSize != 7 {
-		t.Fatalf("cache size = %d, want %d", got.CacheSize, 7)
-	}
-	if got.CacheEntries != 0 {
-		t.Fatalf("cache entries = %d, want %d", got.CacheEntries, 0)
-	}
-	if got.MaxTokens != 700 {
-		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
-	}
-	if got.MaxTokensPerSecond != 48 {
-		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
-	}
-	if got.EffectiveTokensPerSecond != 49.2 {
-		t.Fatalf("effective tokens per second = %v, want %v", got.EffectiveTokensPerSecond, 49.2)
-	}
-	if got.MaxConcurrentRequests != 64 {
-		t.Fatalf("max concurrent requests = %d, want %d", got.MaxConcurrentRequests, 64)
-	}
-	if got.ConcurrentRequests != 0 {
-		t.Fatalf("concurrent requests = %d, want %d", got.ConcurrentRequests, 0)
-	}
-	if got.MaxWaitingRequests != 96 {
-		t.Fatalf("max waiting requests = %d, want %d", got.MaxWaitingRequests, 96)
-	}
-	if got.WaitingRequests != 0 {
-		t.Fatalf("waiting requests = %d, want %d", got.WaitingRequests, 0)
-	}
-	if got.MaxDegradation != 25 {
-		t.Fatalf("max degradation = %d, want %d", got.MaxDegradation, 25)
-	}
-	if got.ComputedDegradationPercentage != 0 {
-		t.Fatalf("computed degradation percentage = %v, want 0", got.ComputedDegradationPercentage)
-	}
-	if got.Temperature != 0.7 {
-		t.Fatalf("temperature = %v, want %v", got.Temperature, 0.7)
-	}
-	if !got.Stream {
-		t.Fatal("stream = false, want true")
-	}
-	askRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(askRecorder, httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil))
-
-	if askRecorder.Code != http.StatusOK {
-		t.Fatalf("ask status code = %d, want %d", askRecorder.Code, http.StatusOK)
-	}
-	if len(*captured) != 1 {
-		t.Fatalf("captured requests = %d, want 1", len(*captured))
-	}
-	request := (*captured)[0]
-	if request.Model != "gpt-4.1" {
-		t.Fatalf("captured model = %q, want %q", request.Model, "gpt-4.1")
-	}
-	if request.SystemPrompt != "Be precise" {
-		t.Fatalf("captured system prompt = %q, want %q", request.SystemPrompt, "Be precise")
-	}
-	if request.MaxTokens != 700 {
-		t.Fatalf("captured max tokens = %d, want %d", request.MaxTokens, 700)
-	}
-	if request.Temperature != 0.7 {
-		t.Fatalf("captured temperature = %v, want %v", request.Temperature, 0.7)
-	}
-	if !request.Stream {
-		t.Fatal("captured stream = false, want true")
-	}
-
-	configRecorder = httptest.NewRecorder()
-	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config", nil))
-	if configRecorder.Code != http.StatusOK {
-		t.Fatalf("config status code = %d, want %d", configRecorder.Code, http.StatusOK)
-	}
-	if err := json.Unmarshal(configRecorder.Body.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal config response after ask: %v", err)
-	}
-	if got.CacheEntries != 1 {
-		t.Fatalf("cache entries after ask = %d, want %d", got.CacheEntries, 1)
-	}
-}
 
 func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
@@ -892,11 +495,11 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	releaseOne, ok := scheduler.AcquirePath(ctx, "/one")
+	releaseOne, _, ok := scheduler.AcquirePath(ctx, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first direct slot")
 	}
-	releaseTwo, ok := scheduler.AcquirePath(ctx, "/two")
+	releaseTwo, _, ok := scheduler.AcquirePath(ctx, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second direct slot")
 	}
@@ -907,13 +510,13 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	}
 	acquired := make(chan acquiredRelease, 2)
 	go func() {
-		release, ok := scheduler.AcquirePath(ctx, "/three")
+		release, _, ok := scheduler.AcquirePath(ctx, "/three")
 		if ok {
 			acquired <- acquiredRelease{path: "/three", release: release}
 		}
 	}()
 	go func() {
-		release, ok := scheduler.AcquirePath(ctx, "/four")
+		release, _, ok := scheduler.AcquirePath(ctx, "/four")
 		if ok {
 			acquired <- acquiredRelease{path: "/four", release: release}
 		}
@@ -932,7 +535,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 		t.Fatalf("stats after reconfigure = (%d,%d,%d,%d), want (1,2,1,2)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
 
-	if _, ok := scheduler.AcquirePath(ctx, "/five"); ok {
+	if _, _, ok := scheduler.AcquirePath(ctx, "/five"); ok {
 		t.Fatal("expected new admission to be rejected while queue remains above max waiting")
 	}
 
@@ -949,7 +552,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 1 || maxWaiting != 1 || waiting != 1 {
 		t.Fatalf("stats after first promotion = (%d,%d,%d,%d), want (1,1,1,1)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
-	if _, ok := scheduler.AcquirePath(ctx, "/six"); ok {
+	if _, _, ok := scheduler.AcquirePath(ctx, "/six"); ok {
 		t.Fatal("expected new admission to be rejected while waiting queue is still full")
 	}
 
@@ -962,7 +565,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 0 || maxWaiting != 1 || waiting != 0 {
 		t.Fatalf("final stats = (%d,%d,%d,%d), want (1,0,1,0)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
-	if release, ok := scheduler.AcquirePath(ctx, "/seven"); !ok {
+	if release, _, ok := scheduler.AcquirePath(ctx, "/seven"); !ok {
 		t.Fatal("expected direct admission once both queues had space again")
 	} else {
 		release()
@@ -978,14 +581,14 @@ func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 	scheduler := newRequestScheduler(1, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	releaseOne, ok := scheduler.AcquirePath(ctx, "/one")
+	releaseOne, _, ok := scheduler.AcquirePath(ctx, "/one")
 	if !ok {
 		t.Fatal("failed to acquire direct slot")
 	}
 
 	queuedAcquired := make(chan func(), 1)
 	go func() {
-		release, ok := scheduler.AcquirePath(ctx, "/two")
+		release, _, ok := scheduler.AcquirePath(ctx, "/two")
 		if ok {
 			queuedAcquired <- release
 		}
@@ -1055,11 +658,11 @@ func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(20, 10, 10, 50)
 
-	releaseOne, ok := handler.acquireRequestSlot(context.Background(), "/one")
+	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), "/one")
 	if !ok {
 		t.Fatal("failed to acquire first request slot")
 	}
-	releaseTwo, ok := handler.acquireRequestSlot(context.Background(), "/two")
+	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), "/two")
 	if !ok {
 		t.Fatal("failed to acquire second request slot")
 	}
@@ -1085,7 +688,7 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 
 	releases := make([]func(), 0, 52)
 	for i := 0; i < 52; i++ {
-		release, ok := handler.acquireRequestSlot(context.Background(), "/load")
+		release, _, ok := handler.acquireRequestSlot(context.Background(), "/load")
 		if !ok {
 			t.Fatalf("failed to acquire slot %d", i+1)
 		}
@@ -1114,41 +717,6 @@ func TestCachedReplayDelayDisabledWhenTokensPerSecondZero(t *testing.T) {
 	}
 }
 
-func TestConfigEndpointResizesCacheAndEvictsOldestEntries(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 2, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=first", nil))
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=second", nil))
-
-	configRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?cache-size=1", nil))
-
-	if configRecorder.Code != http.StatusOK {
-		t.Fatalf("config status code = %d, want %d", configRecorder.Code, http.StatusOK)
-	}
-
-	var got runtimeConfig
-	if err := json.Unmarshal(configRecorder.Body.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal config response: %v", err)
-	}
-	if got.CacheSize != 1 {
-		t.Fatalf("cache size = %d, want %d", got.CacheSize, 1)
-	}
-	if got.CacheEntries != 1 {
-		t.Fatalf("cache entries = %d, want %d", got.CacheEntries, 1)
-	}
-
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=second", nil))
-	if got := counters.chat.Load(); got != 2 {
-		t.Fatalf("chat requests after cached second = %d, want %d", got, 2)
-	}
-
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ask?q=first", nil))
-	if got := counters.chat.Load(); got != 3 {
-		t.Fatalf("chat requests after evicted first = %d, want %d", got, 3)
-	}
-}
 
 func TestLoadConfigCacheSize(t *testing.T) {
 	originalArgs := os.Args
@@ -1251,28 +819,6 @@ func TestModelsEndpointDoesNotRefreshWithoutRestart(t *testing.T) {
 	}
 }
 
-func TestAskWithCacheDisabled(t *testing.T) {
-	vllmServer, counters := newCountingTestVLLMServer(t)
-	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 0, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
-
-	firstRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil)
-	firstRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(firstRecorder, firstRequest)
-
-	secondRequest := httptest.NewRequest(http.MethodGet, "/ask?q=hello", nil)
-	secondRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(secondRecorder, secondRequest)
-
-	if firstRecorder.Code != http.StatusOK || secondRecorder.Code != http.StatusOK {
-		t.Fatalf("status codes = %d, %d, want both 200", firstRecorder.Code, secondRecorder.Code)
-	}
-	if got := counters.models.Load(); got != 1 {
-		t.Fatalf("models requests = %d, want 1", got)
-	}
-	if got := counters.chat.Load(); got != 2 {
-		t.Fatalf("chat requests = %d, want 2", got)
-	}
-}
 
 func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	originalArgs := os.Args
@@ -1519,7 +1065,7 @@ func newCountingTestVLLMServer(t *testing.T) (*httptest.Server, *vllmCounters) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + content + `"}}]}`))
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + content + `"}}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -1576,7 +1122,7 @@ func newCapturingTestVLLMServer(t *testing.T) (*httptest.Server, *[]capturedChat
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + requestBody.Messages[1].Content + `"}}]}`))
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + requestBody.Messages[1].Content + `"}}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}

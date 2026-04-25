@@ -1,11 +1,5 @@
 #!/bin/bash
 
-helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
-helm repo update
+set -euo pipefail
 
-helm upgrade -i nvdp nvdp/nvidia-device-plugin \
-  --namespace nvidia-device-plugin \
-  --create-namespace \
-  --version 0.19.0 \
-  --set runtimeClassName=nvidia \
-  --set gfd.enabled=true
+kubectl apply -k "$(dirname "$0")"

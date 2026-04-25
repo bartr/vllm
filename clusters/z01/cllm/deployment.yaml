@@ -19,7 +19,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: cllm
-          image: cllm:0.1.0
+          image: cllm:0.3.0
           imagePullPolicy: Never
           env:
             - name: CACHE_DOWNSTREAM_URL
@@ -29,19 +29,19 @@ spec:
               name: http
           startupProbe:
             httpGet:
-              path: /healthz
+              path: /health
               port: http
             periodSeconds: 10
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /ready
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /health
               port: http
             initialDelaySeconds: 5
             periodSeconds: 15

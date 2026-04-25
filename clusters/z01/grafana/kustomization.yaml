@@ -6,9 +6,21 @@ resources:
   - secret.yaml
   - pvc.yaml
   - datasources.yaml
-  - dashboard-providers.yaml
-  - gpu-dashboards.yaml
-  - vllm-dashboards.yaml
   - deployment.yaml
   - service.yaml
   - ingress.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    app.kubernetes.io/name: grafana
+
+configMapGenerator:
+  - name: grafana-dashboard-importer
+    files:
+      - import-dashboards.sh=scripts/import-dashboards.sh
+  - name: grafana-dashboard-sources
+    files:
+      - dashboards/cllm-overview.json
+      - dashboards/gpu-overview.json
+      - dashboards/vllm-overview.json

@@ -206,7 +206,7 @@ kubectl -n cllm rollout status deployment/cllm
 Then call `cllm` through the Traefik external IP on port `8088`:
 
 ```bash
-curl -i http://192.168.68.63:8088/healthz
+curl -i http://192.168.68.63:8088/health
 ```
 
 If `ASK_TOKEN` is set, `ask.sh` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints.
@@ -228,31 +228,27 @@ ASK_MODEL='gpt-4.1' \
 ./ask.sh "Give me three uses for an edge-hosted LLM."
 ```
 
-Benchmark the local vLLM instance directly with [scripts/benchmark-vllm.sh](/home/bartr/vllm/scripts/benchmark-vllm.sh):
+Benchmark an OpenAI-compatible endpoint with [scripts/benchmark.sh](/home/bartr/vllm/scripts/benchmark.sh):
 
 ```bash
-./scripts/benchmark-vllm.sh
+./scripts/benchmark.sh --concurrency 10
 ```
 
-By default it targets `http://localhost:8000`, auto-detects the active model from `/v1/models`, sends long non-streaming completion requests, starts its concurrency sweep at `VLLM_BENCH_START=20`, and runs through `VLLM_BENCH_MAX_CONCURRENCY=50`.
+It runs a fixed number of concurrent workers until you press `Ctrl-C` or until an optional `--duration` expires. Each completed request prints the worker thread number, returned completion tokens, TTFT, request duration, per-request tokens/sec, and aggregate tokens/sec over the last 15 seconds.
 
-For each concurrency level it reports:
+If you want to exercise `cllm` queueing, `/metrics`, or `/config` state instead of benchmarking the downstream vLLM server directly, point the benchmark at `http://localhost:8080`:
 
-- aggregate completion tokens/sec
-- average request latency in milliseconds
-- average per-request completion tokens/sec
-- average TTFT in milliseconds when `VLLM_BENCH_STREAM=1`
+```bash
+VLLM_BENCH_URL=http://127.0.0.1:8080 ./scripts/benchmark.sh --concurrency 10
+```
 
-At the end it prints both the highest-throughput concurrency and a latency-balanced recommendation that stays within `2x` the minimum observed average latency.
 
 Example with smaller test settings:
 
 ```bash
-VLLM_BENCH_START=2 \
-VLLM_BENCH_MAX_CONCURRENCY=2 \
-VLLM_BENCH_REQUESTS_PER_WORKER=1 \
+VLLM_BENCH_CONCURRENCY=2 \
 VLLM_BENCH_MAX_TOKENS=64 \
-./scripts/benchmark-vllm.sh
+./scripts/benchmark.sh
 ```
 
 Example with streaming enabled so TTFT is measured:
@@ -352,7 +348,7 @@ Useful direct checks:
 
 ```bash
 curl http://192.168.68.63:8000/health
-curl http://192.168.68.63:8088/healthz
+curl http://192.168.68.63:8088/health
 curl http://192.168.68.63:9090/-/healthy
 curl http://192.168.68.63:3000/api/health
 ```
@@ -377,6 +373,20 @@ kubectl -n monitoring rollout status statefulset/prometheus-prometheus
 kubectl -n kube-system rollout status deployment/traefik
 ```
 
+Import the repo-managed Grafana dashboards through the Grafana API after Grafana is ready. The dashboard JSON source of truth now lives under [clusters/z01/grafana/dashboards](/home/bartr/vllm/clusters/z01/grafana/dashboards), so dashboards remain editable and saveable in the Grafana UI after import.
+
+Run either the local importer:
+
+```bash
+./clusters/z01/grafana/scripts/import-dashboards.sh
+```
+
+Or the in-cluster Job:
+
+```bash
+./clusters/z01/grafana/scripts/run-dashboard-import-job.sh
+```
+
 Once the rollout completes, the current local endpoints are:
 
 - Grafana: `http://192.168.68.63:3000`
@@ -386,10 +396,11 @@ Grafana uses the admin credentials stored in [clusters/z01/grafana/secret.yaml](
 
 ### What you get first
 
-Out of the box, Grafana includes the repo-provided dashboards from [clusters/z01/grafana](/home/bartr/vllm/clusters/z01/grafana):
+After importing the repo-provided dashboards from [clusters/z01/grafana/dashboards](/home/bartr/vllm/clusters/z01/grafana/dashboards), Grafana includes:
 
 - `GPU / GPU Overview`
 - `GPU / GPU Power And Thermals`
+- `cLLM / cLLM Overview`
 - `vLLM / vLLM Overview`
 - `vLLM / vLLM Latency And HTTP`
 

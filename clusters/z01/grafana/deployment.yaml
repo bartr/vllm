@@ -63,15 +63,6 @@ spec:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
               readOnly: true
-            - name: dashboard-providers
-              mountPath: /etc/grafana/provisioning/dashboards
-              readOnly: true
-            - name: gpu-dashboards
-              mountPath: /var/lib/grafana/dashboards/gpu
-              readOnly: true
-            - name: vllm-dashboards
-              mountPath: /var/lib/grafana/dashboards/vllm
-              readOnly: true
       volumes:
         - name: storage
           persistentVolumeClaim:
@@ -79,12 +70,3 @@ spec:
         - name: datasources
           configMap:
             name: grafana-datasources
-        - name: dashboard-providers
-          configMap:
-            name: grafana-dashboard-providers
-        - name: gpu-dashboards
-          configMap:
-            name: grafana-gpu-dashboards
-        - name: vllm-dashboards
-          configMap:
-            name: grafana-vllm-dashboards

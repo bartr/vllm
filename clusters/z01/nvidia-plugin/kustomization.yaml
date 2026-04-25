@@ -1,5 +1,22 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+namespace: nvidia-device-plugin
 resources:
-  - repository.yaml
-  - release.yaml
+  - namespace.yaml
+  - nvidia-device-plugin-upstream.yaml
+  - gpu-feature-discovery-upstream.yaml
+patches:
+  - target:
+      kind: DaemonSet
+      name: nvidia-device-plugin-daemonset
+    patch: |-
+      - op: add
+        path: /spec/template/spec/runtimeClassName
+        value: nvidia
+  - target:
+      kind: DaemonSet
+      name: gpu-feature-discovery
+    patch: |-
+      - op: add
+        path: /spec/template/spec/runtimeClassName
+        value: nvidia

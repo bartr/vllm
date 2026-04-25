@@ -4,7 +4,7 @@ metadata:
   name: prometheus-operator
   namespace: flux-system
 spec:
-  interval: 30m
+  interval: 1m
   path: ./clusters/z01/prometheus/operator
   prune: true
   sourceRef:
