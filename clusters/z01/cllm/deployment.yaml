@@ -16,10 +16,12 @@ spec:
         app: cllm
         app.kubernetes.io/name: cllm
     spec:
+      securityContext:
+        fsGroup: 65532
       enableServiceLinks: false
       containers:
         - name: cllm
-          image: cllm:0.3.0
+          image: cllm:0.4.0
           imagePullPolicy: Never
           env:
             - name: CACHE_DOWNSTREAM_URL
@@ -52,3 +54,10 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          volumeMounts:
+            - name: storage
+              mountPath: /var/lib/cllm
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: cllm-storage

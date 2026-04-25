@@ -1,7 +1,7 @@
 GO ?= go
 BINARY ?= cllm
 DOCKER ?= docker
-IMAGE ?= cllm:0.3.0
+IMAGE ?= cllm:0.4.0
 K3S ?= sudo k3s
 
 .PHONY: build run test fmt clean deploy

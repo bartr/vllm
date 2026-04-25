@@ -8,7 +8,7 @@ VLLM_BENCH_MODEL=${VLLM_BENCH_MODEL:-}
 VLLM_BENCH_CONCURRENCY=${VLLM_BENCH_CONCURRENCY:-20}
 VLLM_BENCH_DURATION=${VLLM_BENCH_DURATION:-}
 VLLM_BENCH_MAX_TOKENS=${VLLM_BENCH_MAX_TOKENS:-128}
-VLLM_BENCH_TEMPERATURE=${VLLM_BENCH_TEMPERATURE:-0}
+VLLM_BENCH_TEMPERATURE=${VLLM_BENCH_TEMPERATURE:-0.2}
 VLLM_BENCH_STREAM=${VLLM_BENCH_STREAM:-1}
 VLLM_BENCH_WARMUP=${VLLM_BENCH_WARMUP:-0}
 VLLM_BENCH_SYSTEM_PROMPT=${VLLM_BENCH_SYSTEM_PROMPT:-You are a helpful assistant.}
@@ -81,7 +81,7 @@ Options:
       --model MODEL          Model ID to benchmark; auto-detected from /v1/models if omitted
       --concurrency N        Number of concurrent workers to run continuously (default: 1)
       --duration VALUE       Stop automatically after VALUE, e.g. 10s, 5m, or 1h
-      --max-tokens N         Max completion tokens per request (default: 64)
+      --max-tokens N         Max completion tokens per request (default: 128)
       --temperature VALUE    Sampling temperature (default: 0)
       --stream               Use streaming chat completions and measure TTFT
       --warmup               Run one untimed warmup request before the live loop starts

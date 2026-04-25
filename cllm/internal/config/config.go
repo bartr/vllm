@@ -13,6 +13,7 @@ import (
 
 const (
 	defaultCacheSize             = 100
+	defaultCacheFilePath         = "/var/lib/cllm/cache.json"
 	defaultDownstreamURL         = "http://localhost:8000"
 	defaultMaxTokens             = 4000
 	defaultTemperature           = 0.2
@@ -36,6 +37,7 @@ const (
 type Config struct {
 	Addr            string
 	CacheSize       int
+	CacheFilePath   string
 	DownstreamURL   string
 	DownstreamToken string
 	DownstreamModel string
@@ -74,6 +76,7 @@ func LoadFromArgs(args []string) (Config, error) {
 	return Config{
 		Addr:            net.JoinHostPort("", strconv.Itoa(portNumber)),
 		CacheSize:       runtimeOptions.cacheSize,
+		CacheFilePath:   runtimeOptions.cacheFilePath,
 		DownstreamURL:   runtimeOptions.downstreamURL,
 		DownstreamToken: runtimeOptions.downstreamToken,
 		DownstreamModel: runtimeOptions.downstreamModel,
@@ -95,6 +98,7 @@ func Usage() string {
 	builder.WriteString("  -h, --help                  Show this help message and exit\n")
 	builder.WriteString("      --version               Show version information and exit\n")
 	builder.WriteString("  -c, --cache-size int        Maximum number of cached chat responses\n")
+	builder.WriteString("      --cache-file-path str  Cache persistence file path (default /var/lib/cllm/cache.json)\n")
 	builder.WriteString("      --downstream-url string Downstream OpenAI-compatible base URL (default http://localhost:8000)\n")
 	builder.WriteString("      --downstream-token str  Bearer token for downstream requests\n")
 	builder.WriteString("      --downstream-model str  Default downstream model when requests omit model\n")
@@ -109,6 +113,7 @@ func Usage() string {
 	builder.WriteString("  CACHE_PORT\n")
 	builder.WriteString("  CACHE_SHUTDOWN_TIMEOUT\n")
 	builder.WriteString("  CACHE_CACHE_SIZE\n")
+	builder.WriteString("  CACHE_CACHE_FILE_PATH\n")
 	builder.WriteString("  CACHE_DOWNSTREAM_URL\n")
 	builder.WriteString("  CACHE_DOWNSTREAM_TOKEN\n")
 	builder.WriteString("  CACHE_DOWNSTREAM_MODEL\n")
@@ -124,6 +129,7 @@ func Usage() string {
 
 type runtimeOptions struct {
 	cacheSize      int
+	cacheFilePath  string
 	downstreamURL  string
 	downstreamToken string
 	downstreamModel string
@@ -139,6 +145,7 @@ type runtimeOptions struct {
 func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	options := runtimeOptions{
 		cacheSize:      defaultCacheSize,
+		cacheFilePath:  defaultCacheFilePath,
 		downstreamURL:  defaultDownstreamURL,
 		systemPrompt: defaultSystemPrompt,
 		maxTokens:    defaultMaxTokens,
@@ -155,6 +162,10 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 			return runtimeOptions{}, fmt.Errorf("invalid CACHE_CACHE_SIZE %q", envValue)
 		}
 		options.cacheSize = parsedValue
+	}
+
+	if envValue := os.Getenv("CACHE_CACHE_FILE_PATH"); envValue != "" {
+		options.cacheFilePath = envValue
 	}
 
 	if envValue := os.Getenv("CACHE_DOWNSTREAM_URL"); envValue != "" {
@@ -228,6 +239,7 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	flagSet.SetOutput(io.Discard)
 	flagSet.IntVar(&options.cacheSize, "cache-size", options.cacheSize, "maximum number of cached ask responses")
 	flagSet.IntVar(&options.cacheSize, "c", options.cacheSize, "maximum number of cached ask responses")
+	flagSet.StringVar(&options.cacheFilePath, "cache-file-path", options.cacheFilePath, "cache persistence file path")
 	flagSet.StringVar(&options.downstreamURL, "downstream-url", options.downstreamURL, "downstream OpenAI-compatible base URL")
 	flagSet.StringVar(&options.downstreamToken, "downstream-token", options.downstreamToken, "bearer token for downstream requests")
 	flagSet.StringVar(&options.downstreamModel, "downstream-model", options.downstreamModel, "default downstream model when model is omitted")
@@ -250,6 +262,10 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 			normalizedArgs = append(normalizedArgs, "-downstream-url")
 		case len(arg) > len("--downstream-url=") && arg[:len("--downstream-url=")] == "--downstream-url=":
 			normalizedArgs = append(normalizedArgs, "-downstream-url="+arg[len("--downstream-url="):])
+		case arg == "--cache-file-path":
+			normalizedArgs = append(normalizedArgs, "-cache-file-path")
+		case len(arg) > len("--cache-file-path=") && arg[:len("--cache-file-path=")] == "--cache-file-path=":
+			normalizedArgs = append(normalizedArgs, "-cache-file-path="+arg[len("--cache-file-path="):])
 		case arg == "--downstream-token":
 			normalizedArgs = append(normalizedArgs, "-downstream-token")
 		case len(arg) > len("--downstream-token=") && arg[:len("--downstream-token=")] == "--downstream-token=":

@@ -5,6 +5,7 @@ import (
 	"cllm/internal/buildinfo"
 	"context"
 	"container/list"
+	"crypto/sha256"
 	"crypto/rand"
 	"encoding/json"
 	"encoding/hex"
@@ -14,17 +15,19 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 )
 
 const (
 	defaultVLLMURL          = "http://localhost:8000"
 	defaultCacheSize        = 100
+	defaultCacheFilePath    = "/var/lib/cllm/cache.json"
 	defaultSystemPrompt     = "You are a helpful assistant."
 	minMaxTokens            = 100
 	maxMaxTokens            = 4000
@@ -69,6 +72,7 @@ func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askO
 type Handler struct {
 	ready      atomic.Bool
 	cache      *lruCache
+	cacheFilePath string
 	metrics    *handlerMetrics
 	configMu   sync.RWMutex
 	defaults   askOptions
@@ -89,6 +93,7 @@ func NewHandler() *Handler {
 	handler := &Handler{}
 	handler.ready.Store(true)
 	handler.cache = newLRUCache(defaultCacheSize)
+	handler.cacheFilePath = defaultCacheFilePath
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
@@ -216,6 +221,16 @@ func (h *Handler) SetCacheSize(size int) {
 	h.cache.Resize(size)
 }
 
+func (h *Handler) SetCacheFilePath(path string) {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if strings.TrimSpace(path) == "" {
+		h.cacheFilePath = defaultCacheFilePath
+		return
+	}
+	h.cacheFilePath = path
+}
+
 func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
 	handler := NewHandler()
 	if vllmURL != "" {
@@ -245,6 +260,8 @@ func (h *Handler) applyDownstreamAuth(request *http.Request) {
 
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /cache", h.cacheEndpoint)
+	mux.HandleFunc("GET /cache/{key}", h.cacheItemEndpoint)
 	mux.HandleFunc("GET /config", h.config)
 	mux.HandleFunc("GET /health", h.healthEndpoint)
 	mux.Handle("GET /metrics", h.metrics.Handler())
@@ -258,6 +275,7 @@ func (h *Handler) Routes() http.Handler {
 type runtimeConfig struct {
 	CacheSize       int     `json:"cache_size"`
 	CacheEntries    int     `json:"cache_entries"`
+	CacheFilePath   string  `json:"cache_file_path"`
 	DownstreamURL string  `json:"downstream_url"`
 	DownstreamModel string `json:"downstream_model"`
 	SystemPrompt   string  `json:"system_prompt"`
@@ -272,6 +290,62 @@ type runtimeConfig struct {
 	ComputedDegradationPercentage float64 `json:"computed_degradation_percentage"`
 	Temperature    float64 `json:"temperature"`
 	Stream         bool    `json:"stream"`
+}
+
+type cacheEntrySummary struct {
+	Key              string `json:"key"`
+	StatusCode       int    `json:"status_code"`
+	ContentType      string `json:"content_type"`
+	Streaming        bool   `json:"streaming"`
+	BodyBytes        int    `json:"body_bytes"`
+	CompletionTokens int    `json:"completion_tokens"`
+	ContentPreview   string `json:"content_preview"`
+}
+
+type cacheResponse struct {
+	Enabled     bool                `json:"enabled"`
+	CacheSize   int                 `json:"cache_size"`
+	CacheEntries int                `json:"cache_entries"`
+	CacheFilePath string            `json:"cache_file_path"`
+	Keys        []cacheEntrySummary `json:"keys"`
+	Action      *cacheActionResult  `json:"action,omitempty"`
+}
+
+type cacheActionResult struct {
+	Name         string `json:"name"`
+	CacheFilePath string `json:"cache_file_path"`
+	SavedEntries int    `json:"saved_entries,omitempty"`
+	LoadedEntries int   `json:"loaded_entries,omitempty"`
+}
+
+type cacheItemResponse struct {
+	Key              string   `json:"key"`
+	StatusCode       int      `json:"status_code"`
+	ContentType      string   `json:"content_type"`
+	Streaming        bool     `json:"streaming"`
+	BodyBytes        int      `json:"body_bytes"`
+	CompletionTokens int      `json:"completion_tokens"`
+	Content          string   `json:"content"`
+	TextTokens       []string `json:"text_tokens"`
+	Body             string   `json:"body"`
+}
+
+type cacheSnapshotEntry struct {
+	key   string
+	value cachedVLLMResponse
+}
+
+type persistedCache struct {
+	Version int                   `json:"version"`
+	Entries []persistedCacheEntry `json:"entries"`
+}
+
+type persistedCacheEntry struct {
+	Key         string `json:"key"`
+	StatusCode  int    `json:"status_code"`
+	Body        []byte `json:"body"`
+	ContentType string `json:"content_type"`
+	Streaming   bool   `json:"streaming"`
 }
 
 func (h *Handler) healthEndpoint(w http.ResponseWriter, _ *http.Request) {
@@ -303,6 +377,54 @@ func (h *Handler) config(w http.ResponseWriter, r *http.Request) {
 
 	markCacheHit(w, false)
 	writeJSON(w, http.StatusOK, h.currentConfig())
+}
+
+func (h *Handler) cacheEndpoint(w http.ResponseWriter, r *http.Request) {
+	actionResult, err := h.applyCacheQuery(r)
+	if err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
+		return
+	}
+
+	markCacheHit(w, false)
+	writeJSON(w, http.StatusOK, h.currentCache(actionResult))
+}
+
+func (h *Handler) cacheItemEndpoint(w http.ResponseWriter, r *http.Request) {
+	markCacheHit(w, false)
+	key := r.PathValue("key")
+	if key == "" {
+		writePlainText(w, http.StatusBadRequest, "missing cache key\n")
+		return
+	}
+
+	h.configMu.RLock()
+	cache := h.cache
+	h.configMu.RUnlock()
+	if cache == nil {
+		writePlainText(w, http.StatusNotFound, "cache disabled\n")
+		return
+	}
+
+	value, ok := cache.Peek(key)
+	if !ok {
+		writePlainText(w, http.StatusNotFound, "cache key not found\n")
+		return
+	}
+
+	content := cachedResponseContent(value)
+	writeJSON(w, http.StatusOK, cacheItemResponse{
+		Key:              key,
+		StatusCode:       value.statusCode,
+		ContentType:      value.contentType,
+		Streaming:        value.streaming,
+		BodyBytes:        len(value.body),
+		CompletionTokens: cachedResponseCompletionTokens(value),
+		Content:          content,
+		TextTokens:       strings.Fields(content),
+		Body:             string(value.body),
+	})
 }
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
@@ -430,171 +552,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
 }
 
-func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
-	const endpoint = "ask"
-
-	query := r.URL.Query().Get("q")
-	if query == "" {
-		markCacheHit(w, false)
-		writePlainText(w, http.StatusBadRequest, "missing q\n")
-		return
-	}
-
-	options, err := parseAskOptions(r, h.getDefaults())
-	if err != nil {
-		markCacheHit(w, false)
-		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
-		return
-	}
-
-	cacheKey := buildCacheKey(query, options)
-	if cacheKey == "" {
-		markCacheHit(w, false)
-		writePlainText(w, http.StatusBadRequest, "missing q\n")
-		return
-	}
-
-	release, queueWait, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
-	if !ok {
-		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
-		markCacheHit(w, false)
-		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
-		return
-	}
-	defer release()
-	mode := modeLabel(options.stream)
-	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
-	if queueWait > 0 {
-		h.metrics.observeQueueWait(endpoint, queueWait)
-	}
-	processingStartedAt := time.Now()
-
-	if h.cache != nil {
-		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
-			h.metrics.observeCacheLookup(endpoint, "hit")
-			markCacheHit(w, true)
-			completionTokens := cachedResponseCompletionTokens(cachedResponse)
-			timedWriter := newFirstByteMetricsWriter(w, func() {
-				h.metrics.observeTimeToFirstByte(endpoint, "cache", modeLabel(cachedResponse.streaming), time.Since(processingStartedAt))
-			})
-			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), timedWriter, cachedResponse)
-				h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
-				h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(true), time.Since(processingStartedAt))
-				return
-			}
-
-			h.replayCachedResponse(r.Context(), timedWriter, cachedResponse)
-			h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
-			h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(false), time.Since(processingStartedAt))
-			return
-		}
-		h.metrics.observeCacheLookup(endpoint, "miss")
-	}
-
-	markCacheHit(w, false)
-
-	model, err := h.fetchModel(r.Context())
-	if err != nil {
-		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
-		http.Error(w, fmt.Sprintf("fetch downstream model: %v", err), http.StatusBadGateway)
-		return
-	}
-
-	requestPayload := chatCompletionRequest{
-		Model: model,
-		Messages: []chatCompletionMessage{
-			{Role: "system", Content: options.systemPrompt},
-			{Role: "user", Content: query},
-		},
-		Temperature: options.temperature,
-		MaxTokens:   options.maxTokens,
-		Stream:      options.stream,
-	}
-	if options.stream {
-		requestPayload.StreamOptions = &chatCompletionStreamOptions{IncludeUsage: true}
-	}
-	timedWriter := newFirstByteMetricsWriter(w, func() {
-		h.metrics.observeTimeToFirstByte(endpoint, "downstream", mode, time.Since(processingStartedAt))
-	})
-
-	if options.stream {
-		downstreamStartedAt := time.Now()
-		cachedResponse, err := h.streamChatCompletion(r.Context(), timedWriter, requestPayload)
-		h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
-		if err != nil {
-			h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
-			http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		if h.cache != nil {
-			h.cache.Add(cacheKey, cachedResponse)
-		}
-		h.metrics.observeCompletionTokens(endpoint, "downstream", cachedResponseCompletionTokens(cachedResponse))
-		h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
-		return
-	}
-
-	downstreamStartedAt := time.Now()
-	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
-	h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
-	if err != nil {
-		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
-		http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
-		return
-	}
-
-	if h.cache != nil {
-		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody, contentType: contentType})
-	}
-
-	timedWriter.Header().Set("Content-Type", contentType)
-	timedWriter.WriteHeader(statusCode)
-	_, _ = timedWriter.Write(responseBody)
-	h.metrics.observeCompletionTokens(endpoint, "downstream", cachedJSONTokenCount(responseBody))
-	h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
-}
-
-func parseAskOptions(r *http.Request, defaults askOptions) (askOptions, error) {
-	options := defaults
-
-	queryValues := r.URL.Query()
-
-	if systemPrompt := queryValues.Get("system-prompt"); systemPrompt != "" {
-		options.systemPrompt = systemPrompt
-	}
-
-	if maxTokensRaw := queryValues.Get("max-tokens"); maxTokensRaw != "" {
-		maxTokens, err := strconv.Atoi(maxTokensRaw)
-		if err != nil {
-			return askOptions{}, fmt.Errorf("invalid max-tokens %q", maxTokensRaw)
-		}
-		if maxTokens < minMaxTokens || maxTokens > maxMaxTokens {
-			return askOptions{}, fmt.Errorf("max-tokens must be between %d and %d", minMaxTokens, maxMaxTokens)
-		}
-		options.maxTokens = maxTokens
-	}
-
-	if temperatureRaw := queryValues.Get("temperature"); temperatureRaw != "" {
-		temperature, err := strconv.ParseFloat(temperatureRaw, 64)
-		if err != nil {
-			return askOptions{}, fmt.Errorf("invalid temperature %q", temperatureRaw)
-		}
-		options.temperature = temperature
-	}
-
-	if streamRaw := queryValues.Get("stream"); streamRaw != "" {
-		stream, err := strconv.ParseBool(streamRaw)
-		if err != nil {
-			return askOptions{}, fmt.Errorf("invalid stream %q", streamRaw)
-		}
-		options.stream = stream
-	}
-
-	return options, nil
-}
-
 func (h *Handler) getDefaults() askOptions {
 	h.configMu.RLock()
 	defer h.configMu.RUnlock()
@@ -611,6 +568,85 @@ func (h *Handler) cacheStats() (int, int) {
 	return cache.Stats()
 }
 
+func (h *Handler) currentCache(actionResult *cacheActionResult) cacheResponse {
+	h.configMu.RLock()
+	cache := h.cache
+	cacheFilePath := h.cacheFilePath
+	h.configMu.RUnlock()
+	if cache == nil {
+		return cacheResponse{Enabled: false, CacheSize: 0, CacheEntries: 0, CacheFilePath: cacheFilePath, Keys: []cacheEntrySummary{}, Action: actionResult}
+	}
+
+	capacity, snapshots := cache.Snapshot()
+	keys := make([]cacheEntrySummary, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		content := cachedResponseContent(snapshot.value)
+		keys = append(keys, cacheEntrySummary{
+			Key:              snapshot.key,
+			StatusCode:       snapshot.value.statusCode,
+			ContentType:      snapshot.value.contentType,
+			Streaming:        snapshot.value.streaming,
+			BodyBytes:        len(snapshot.value.body),
+			CompletionTokens: cachedResponseCompletionTokens(snapshot.value),
+			ContentPreview:   previewText(content, 120),
+		})
+	}
+
+	return cacheResponse{
+		Enabled:      true,
+		CacheSize:    capacity,
+		CacheEntries: len(keys),
+		CacheFilePath: cacheFilePath,
+		Keys:         keys,
+		Action:       actionResult,
+	}
+}
+
+func (h *Handler) applyCacheQuery(r *http.Request) (*cacheActionResult, error) {
+	queryValues := r.URL.Query()
+	var actionResult *cacheActionResult
+	if action := queryValues.Get("action"); action != "" {
+		switch action {
+		case "clear":
+			h.configMu.RLock()
+			cache := h.cache
+			cacheFilePath := h.cacheFilePath
+			h.configMu.RUnlock()
+			if cache != nil {
+				cache.Clear()
+			}
+			actionResult = &cacheActionResult{Name: action, CacheFilePath: cacheFilePath}
+		case "save":
+			savedEntries, cacheFilePath, err := h.SaveCacheToDisk()
+			if err != nil {
+				return nil, fmt.Errorf("save cache: %w", err)
+			}
+			actionResult = &cacheActionResult{Name: action, CacheFilePath: cacheFilePath, SavedEntries: savedEntries}
+		case "load":
+			loadedEntries, cacheFilePath, err := h.LoadCacheFromDisk()
+			if err != nil {
+				return nil, fmt.Errorf("load cache: %w", err)
+			}
+			actionResult = &cacheActionResult{Name: action, CacheFilePath: cacheFilePath, LoadedEntries: loadedEntries}
+		default:
+			return nil, fmt.Errorf("invalid action %q", action)
+		}
+	}
+
+	if sizeRaw := queryValues.Get("size"); sizeRaw != "" {
+		size, err := strconv.Atoi(sizeRaw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid size %q", sizeRaw)
+		}
+		if size < 0 || size > 10000 {
+			return nil, fmt.Errorf("size must be between %d and %d", 0, 10000)
+		}
+		h.SetCacheSize(size)
+	}
+
+	return actionResult, nil
+}
+
 func (h *Handler) currentConfig() runtimeConfig {
 	defaults := h.getDefaults()
 	cacheSize, cacheEntries := h.cacheStats()
@@ -624,6 +660,7 @@ func (h *Handler) currentConfig() runtimeConfig {
 	return runtimeConfig{
 		CacheSize: cacheSize,
 		CacheEntries: cacheEntries,
+		CacheFilePath: h.getCacheFilePath(),
 		DownstreamURL: downstreamURL,
 		DownstreamModel: downstreamModel,
 		SystemPrompt:   defaults.systemPrompt,
@@ -639,6 +676,112 @@ func (h *Handler) currentConfig() runtimeConfig {
 		Temperature:    defaults.temperature,
 		Stream:         defaults.stream,
 	}
+}
+
+func (h *Handler) getCacheFilePath() string {
+	h.configMu.RLock()
+	defer h.configMu.RUnlock()
+	return h.cacheFilePath
+}
+
+func (h *Handler) SaveCacheToDisk() (int, string, error) {
+	h.configMu.RLock()
+	cache := h.cache
+	cacheFilePath := h.cacheFilePath
+	h.configMu.RUnlock()
+
+	persisted := persistedCache{Version: 1}
+	if cache == nil {
+		persisted.Entries = []persistedCacheEntry{}
+	} else {
+		_, snapshots := cache.Snapshot()
+		persisted.Entries = make([]persistedCacheEntry, 0, len(snapshots))
+		for _, snapshot := range snapshots {
+			persisted.Entries = append(persisted.Entries, persistedCacheEntry{
+				Key:         snapshot.key,
+				StatusCode:  snapshot.value.statusCode,
+				Body:        append([]byte(nil), snapshot.value.body...),
+				ContentType: snapshot.value.contentType,
+				Streaming:   snapshot.value.streaming,
+			})
+		}
+	}
+
+	body, err := json.MarshalIndent(persisted, "", "  ")
+	if err != nil {
+		return 0, cacheFilePath, fmt.Errorf("marshal cache: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cacheFilePath), 0o755); err != nil {
+		return 0, cacheFilePath, fmt.Errorf("create cache directory: %w", err)
+	}
+	if err := os.WriteFile(cacheFilePath, append(body, '\n'), 0o644); err != nil {
+		return 0, cacheFilePath, fmt.Errorf("write cache file: %w", err)
+	}
+
+	return len(persisted.Entries), cacheFilePath, nil
+}
+
+func (h *Handler) LoadCacheFromDisk() (int, string, error) {
+	cacheFilePath := h.getCacheFilePath()
+	body, err := os.ReadFile(cacheFilePath)
+	if err != nil {
+		return 0, cacheFilePath, err
+	}
+
+	var persisted persistedCache
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		return 0, cacheFilePath, fmt.Errorf("decode cache file: %w", err)
+	}
+	if persisted.Version != 1 {
+		return 0, cacheFilePath, fmt.Errorf("unsupported cache file version %d", persisted.Version)
+	}
+
+	entries := make([]cacheSnapshotEntry, 0, len(persisted.Entries))
+	for _, entry := range persisted.Entries {
+		if entry.Key == "" {
+			return 0, cacheFilePath, fmt.Errorf("cache entry key must not be empty")
+		}
+		entries = append(entries, cacheSnapshotEntry{
+			key: entry.Key,
+			value: cachedVLLMResponse{
+				statusCode:  entry.StatusCode,
+				body:        append([]byte(nil), entry.Body...),
+				contentType: entry.ContentType,
+				streaming:   entry.Streaming,
+			},
+		})
+	}
+
+	h.configMu.RLock()
+	cache := h.cache
+	h.configMu.RUnlock()
+	if cache == nil {
+		return 0, cacheFilePath, nil
+	}
+
+	capacity, _ := cache.Stats()
+	loadedEntries := h.replaceCache(capacity, entries)
+	return loadedEntries, cacheFilePath, nil
+}
+
+func (h *Handler) replaceCache(capacity int, entries []cacheSnapshotEntry) int {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if capacity <= 0 {
+		if h.cache == nil {
+			return 0
+		}
+		h.cache = nil
+		return 0
+	}
+
+	replacement := newLRUCache(capacity)
+	for index := len(entries) - 1; index >= 0; index-- {
+		replacement.Add(entries[index].key, entries[index].value)
+	}
+	h.cache = replacement
+	_, loadedEntries := replacement.Stats()
+	return loadedEntries
 }
 
 func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
@@ -795,28 +938,6 @@ func configQueryValue(values url.Values, keys ...string) string {
 	return ""
 }
 
-func buildCacheKey(query string, options askOptions) string {
-	queryKey := standardizeCacheKey(query)
-	if queryKey == "" {
-		return ""
-	}
-
-	return fmt.Sprintf("%s|%s|%d|%.6f|%t", queryKey, standardizeCacheKey(options.systemPrompt), options.maxTokens, options.temperature, options.stream)
-}
-
-func standardizeCacheKey(query string) string {
-	var builder strings.Builder
-	builder.Grow(len(query))
-
-	for _, char := range strings.ToLower(query) {
-		if unicode.IsLetter(char) || unicode.IsNumber(char) {
-			builder.WriteRune(char)
-		}
-	}
-
-	return builder.String()
-}
-
 type modelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
@@ -846,6 +967,13 @@ type chatCompletionStreamOptions struct {
 type chatCompletionMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+type chatCompletionCacheKey struct {
+	Messages    []chatCompletionMessage `json:"messages"`
+	Temperature float64                 `json:"temperature"`
+	MaxTokens   int                     `json:"max_tokens"`
+	Stream      bool                    `json:"stream"`
 }
 
 func (h *Handler) fetchModel(ctx context.Context) (string, error) {
@@ -1053,12 +1181,18 @@ func (h *Handler) populateChatCompletionDefaults(ctx context.Context, requestPay
 }
 
 func buildChatCompletionCacheKey(requestPayload chatCompletionRequest) (string, error) {
-	requestBody, err := json.Marshal(requestPayload)
+	requestBody, err := json.Marshal(chatCompletionCacheKey{
+		Messages:    requestPayload.Messages,
+		Temperature: requestPayload.Temperature,
+		MaxTokens:   requestPayload.MaxTokens,
+		Stream:      requestPayload.Stream,
+	})
 	if err != nil {
 		return "", fmt.Errorf("marshal chat completion cache key: %w", err)
 	}
 
-	return string(requestBody), nil
+	sum := sha256.Sum256(requestBody)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
@@ -1472,6 +1606,48 @@ func cachedResponseCompletionTokens(cachedResponse cachedVLLMResponse) int {
 	return cachedJSONTokenCount(cachedResponse.body)
 }
 
+func cachedResponseContent(cachedResponse cachedVLLMResponse) string {
+	if cachedResponse.streaming {
+		segments := parseCachedStreamReplaySegments(cachedResponse.body)
+		parts := make([]string, 0, len(segments))
+		for _, segment := range segments {
+			content, _ := inspectSSEChunk(segment.line)
+			if content != "" {
+				parts = append(parts, content)
+			}
+		}
+		return strings.Join(parts, "")
+	}
+
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(cachedResponse.body, &response); err != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(response.Choices))
+	for _, choice := range response.Choices {
+		if choice.Message.Content != "" {
+			parts = append(parts, choice.Message.Content)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func previewText(text string, maxLen int) string {
+	if maxLen < 1 || len(text) <= maxLen {
+		return text
+	}
+	if maxLen <= 3 {
+		return text[:maxLen]
+	}
+	return text[:maxLen-3] + "..."
+}
+
 func inspectSSEChunk(line []byte) (string, int) {
 	trimmed := bytes.TrimRight(line, "\r\n")
 	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
@@ -1878,4 +2054,50 @@ func (c *lruCache) Stats() (int, int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capacity, c.items.Len()
+}
+
+func (c *lruCache) Peek(key string) (cachedVLLMResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	element, ok := c.entries[key]
+	if !ok {
+		return cachedVLLMResponse{}, false
+	}
+
+	entry := element.Value.(*cacheEntry)
+	return cachedVLLMResponse{
+		statusCode:  entry.value.statusCode,
+		body:        append([]byte(nil), entry.value.body...),
+		contentType: entry.value.contentType,
+		streaming:   entry.value.streaming,
+	}, true
+}
+
+func (c *lruCache) Snapshot() (int, []cacheSnapshotEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entries := make([]cacheSnapshotEntry, 0, c.items.Len())
+	for element := c.items.Front(); element != nil; element = element.Next() {
+		entry := element.Value.(*cacheEntry)
+		entries = append(entries, cacheSnapshotEntry{
+			key: entry.key,
+			value: cachedVLLMResponse{
+				statusCode:  entry.value.statusCode,
+				body:        append([]byte(nil), entry.value.body...),
+				contentType: entry.value.contentType,
+				streaming:   entry.value.streaming,
+			},
+		})
+	}
+
+	return c.capacity, entries
+}
+
+func (c *lruCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]*list.Element, c.capacity)
+	c.items.Init()
 }

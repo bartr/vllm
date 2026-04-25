@@ -58,6 +58,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
 	handler.SetRequestProcessingLimits(cfg.MaxTokensPerSecond, cfg.MaxConcurrentRequests, cfg.MaxWaitingRequests, cfg.MaxDegradation)
+	if err := loadStartupCache(logger, handler, cfg.CacheFilePath); err != nil {
+		logger.Error("load startup cache", "err", err, "cache_file_path", cfg.CacheFilePath)
+		return 1
+	}
 	server := newServer(cfg, handler.Routes())
 	queueLogCtx, stopQueueLogger := context.WithCancel(context.Background())
 	defer stopQueueLogger()
@@ -121,6 +125,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	logger.Info("server stopped")
 	return 0
+}
+
+func loadStartupCache(logger *slog.Logger, handler *httpapi.Handler, cacheFilePath string) error {
+	handler.SetCacheFilePath(cacheFilePath)
+	loadedEntries, resolvedPath, err := handler.LoadCacheFromDisk()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	logger.Info("startup cache loaded", "cache_file_path", resolvedPath, "cache_entries", loadedEntries)
+	return nil
 }
 
 func startQueueDepthLogger(ctx context.Context, logger *slog.Logger, handler *httpapi.Handler, interval time.Duration) {

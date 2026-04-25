@@ -4,6 +4,8 @@
 
 ## Endpoints
 
+- `GET /cache` returns cache status, size, entries, and cache key summaries; it also supports cache actions through query params
+- `GET /cache/{key}` returns details for one cache entry, including cached content, extracted tokens, and raw body
 - `GET /health` returns `ok`
 - `GET /ready` returns `ready`
 - `GET /version` returns the current application version as plain text with no surrounding whitespace
@@ -34,6 +36,7 @@ go run ./cmd/cllm --version
 The server supports these runtime settings:
 
 - `CACHE_CACHE_SIZE` or `--cache-size` / `-c`: maximum number of cached chat responses
+- `CACHE_CACHE_FILE_PATH` or `--cache-file-path`: cache persistence file path, default `/var/lib/cllm/cache.json`
 - `CACHE_DOWNSTREAM_URL` or `--downstream-url`: downstream OpenAI-compatible base URL, default `http://localhost:8000`
 - `CACHE_DOWNSTREAM_TOKEN` or `--downstream-token`: bearer token sent to the downstream API
 - `CACHE_DOWNSTREAM_MODEL` or `--downstream-model`: default downstream model when incoming requests omit `model`
@@ -61,7 +64,7 @@ You can inspect or update the live handler config at runtime:
 curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=256&max-waiting-requests=512&max-degradation=15&temperature=0.7&stream=true'
 ```
 
-`/config` now also returns `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_concurrent_requests`, `concurrent_requests`, `max_waiting_requests`, `waiting_requests`, `max_degradation`, and `computed_degradation_percentage`, and you can update the configurable values live with either hyphenated or snake_case query params.
+`/config` now also returns `cache_file_path`, `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_concurrent_requests`, `concurrent_requests`, `max_waiting_requests`, `waiting_requests`, `max_degradation`, and `computed_degradation_percentage`, and you can update the configurable values live with either hyphenated or snake_case query params.
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
@@ -72,6 +75,28 @@ If you lower `max-concurrent-requests` or `max-waiting-requests` below the curre
 Cached responses are replayed at the configured token rate. Once more than `10%` of concurrent slots are in use, cached replay throughput degrades gradually up to the configured maximum. The live computed degradation percentage and effective token rate are exposed through `/config`, logged whenever they change, and included in the periodic queue-depth logs. Live downstream responses still stream through once admitted.
 
 It also returns `cache_size` and `cache_entries`. You can resize the cache live with `cache-size` or `cache_size`; if the new size is smaller than the current number of entries, the least recently used entries are evicted immediately.
+
+On startup, `cllm` attempts to load the configured cache file if it exists. A missing file is ignored; a malformed cache file fails startup. The cache file stores persisted entries only; runtime `cache_size` still comes from `CACHE_CACHE_SIZE` or `--cache-size`.
+
+You can also inspect and manage the cache through `/cache`:
+
+```bash
+curl 'http://127.0.0.1:8080/cache'
+curl 'http://127.0.0.1:8080/cache/<cache-key>'
+curl 'http://127.0.0.1:8080/cache?action=clear'
+curl 'http://127.0.0.1:8080/cache?action=save'
+curl 'http://127.0.0.1:8080/cache?action=load'
+curl 'http://127.0.0.1:8080/cache?size=200'
+```
+
+`/cache` supports these query parameters:
+
+- `action=clear` clears the current cache contents
+- `action=save` writes the current cache entries to `cache_file_path`
+- `action=load` replaces the current in-memory cache with the contents of `cache_file_path`
+- `size=n` resizes the cache to `n`, where `n` must be between `0` and `10000`; `0` disables the cache
+
+`/cache` responses include `cache_file_path`, and save/load actions also report the number of entries written or loaded. `/cache/{key}` returns metadata for the matching cache entry plus the cached content, a whitespace-split `text_tokens` view, and the raw cached body.
 
 Example switching the downstream source to OpenAI-compatible settings at runtime:
 
@@ -128,6 +153,8 @@ go test ./...
 docker build -t cllm:0.1.0 .
 docker run --rm -p 8080:8080 cllm:0.1.0
 ```
+
+The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
 
 ## Kubernetes
 

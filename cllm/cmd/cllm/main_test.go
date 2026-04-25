@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func TestRunHelp(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exitCode = %d, want 0", exitCode)
 	}
-	for _, want := range []string{"Usage: cllm [options]", "--downstream-url", "--downstream-token", "--downstream-model", "--max-tokens-per-second", "--max-concurrent-requests", "--max-waiting-requests", "--max-degradation", "--version", "-h, --help", `Default system prompt for chat completions (default "You are a helpful assistant.")`, "Default max tokens for chat completions (default 4000)", "Default temperature for chat completions (default 0.2)"} {
+	for _, want := range []string{"Usage: cllm [options]", "--cache-file-path", "--downstream-url", "--downstream-token", "--downstream-model", "--max-tokens-per-second", "--max-concurrent-requests", "--max-waiting-requests", "--max-degradation", "--version", "-h, --help", `Default system prompt for chat completions (default "You are a helpful assistant.")`, "Default max tokens for chat completions (default 4000)", "Default temperature for chat completions (default 0.2)"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output %q does not contain %q", stdout.String(), want)
 		}
@@ -162,6 +163,48 @@ func TestResolveStartupDownstreamModelFailsWhenNoModelAvailable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "models response did not include a model id") {
 		t.Fatalf("error = %q, want models response error", err.Error())
+	}
+}
+
+func TestLoadStartupCacheLoadsPersistedEntries(t *testing.T) {
+	tempDir := t.TempDir()
+	cacheFilePath := tempDir + "/cache.json"
+	cacheFileBody := []byte("{\n  \"version\": 1,\n  \"entries\": [\n    {\n      \"key\": \"persisted-key\",\n      \"status_code\": 201,\n      \"body\": \"eyJjaG9pY2VzIjpbeyJtZXNzYWdlIjp7ImNvbnRlbnQiOiJsb2FkZWQgZnJvbSBkaXNrIn19XSwidXNhZ2UiOnsiY29tcGxldGlvbl90b2tlbnMiOjJ9fQ==\",\n      \"content_type\": \"application/json\",\n      \"streaming\": false\n    }\n  ]\n}\n")
+	if err := os.WriteFile(cacheFilePath, cacheFileBody, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+	handler := httpapi.NewHandler()
+
+	if err := loadStartupCache(logger, handler, cacheFilePath); err != nil {
+		t.Fatalf("loadStartupCache() error = %v", err)
+	}
+
+	summaryRecorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(summaryRecorder, httptest.NewRequest(http.MethodGet, "/cache", nil))
+	if summaryRecorder.Code != http.StatusOK {
+		t.Fatalf("summary status code = %d, want %d", summaryRecorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"enabled":true`, `"cache_size":100`, `"cache_entries":1`, `"cache_file_path":"` + cacheFilePath + `"`} {
+		if !strings.Contains(summaryRecorder.Body.String(), want) {
+			t.Fatalf("summary body = %q, want substring %q", summaryRecorder.Body.String(), want)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cache/persisted-key", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"status_code":201`, `"content":"loaded from disk"`} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Fatalf("body = %q, want substring %q", recorder.Body.String(), want)
+		}
+	}
+	if !strings.Contains(logBuffer.String(), `msg="startup cache loaded"`) {
+		t.Fatalf("log output = %q, want startup cache loaded message", logBuffer.String())
 	}
 }
 

@@ -33,7 +33,8 @@ func TestRoutes(t *testing.T) {
 		{name: "health", method: http.MethodGet, path: "/health", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "ready", method: http.MethodGet, path: "/ready", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
+		{name: "cache", method: http.MethodGet, path: "/cache", statusCode: http.StatusOK, bodyContains: []string{`"enabled":true`, `"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`}},
 		{name: "metrics", method: http.MethodGet, path: "/metrics", statusCode: http.StatusOK, bodyContains: []string{"# HELP cllm_http_requests_total", "cllm_http_inflight_requests", "cllm_queue_waiting_requests"}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
 	}
@@ -63,6 +64,261 @@ func TestRoutes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCacheEndpointListsKeysAndItemDetails(t *testing.T) {
+	handler := NewHandler()
+	handler.cache.Add("abc123", cachedVLLMResponse{
+		statusCode:  http.StatusOK,
+		body:        []byte(`{"choices":[{"message":{"content":"Explain Azure is a cloud platform."}}],"usage":{"completion_tokens":5}}`),
+		contentType: "application/json",
+	})
+	router := handler.Routes()
+
+	summaryRecorder := httptest.NewRecorder()
+	router.ServeHTTP(summaryRecorder, httptest.NewRequest(http.MethodGet, "/cache", nil))
+
+	if summaryRecorder.Code != http.StatusOK {
+		t.Fatalf("summary status code = %d, want %d", summaryRecorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"key":"abc123"`, `"completion_tokens":5`, `"content_preview":"Explain Azure is a cloud platform."`} {
+		if !strings.Contains(summaryRecorder.Body.String(), want) {
+			t.Fatalf("summary body = %q, want substring %q", summaryRecorder.Body.String(), want)
+		}
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	router.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/cache/abc123", nil))
+
+	if detailRecorder.Code != http.StatusOK {
+		t.Fatalf("detail status code = %d, want %d", detailRecorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"key":"abc123"`, `"completion_tokens":5`, `"content":"Explain Azure is a cloud platform."`, `"text_tokens":["Explain","Azure","is","a","cloud","platform."]`} {
+		if !strings.Contains(detailRecorder.Body.String(), want) {
+			t.Fatalf("detail body = %q, want substring %q", detailRecorder.Body.String(), want)
+		}
+	}
+}
+
+func TestCacheEndpointClearAndResize(t *testing.T) {
+	handler := NewHandler()
+	handler.cache.Add("first", cachedVLLMResponse{statusCode: http.StatusOK, body: []byte(`{"choices":[{"message":{"content":"one"}}],"usage":{"completion_tokens":1}}`), contentType: "application/json"})
+	router := handler.Routes()
+
+	clearRecorder := httptest.NewRecorder()
+	router.ServeHTTP(clearRecorder, httptest.NewRequest(http.MethodGet, "/cache?action=clear", nil))
+	if clearRecorder.Code != http.StatusOK {
+		t.Fatalf("clear status code = %d, want %d", clearRecorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(clearRecorder.Body.String(), `"cache_entries":0`) {
+		t.Fatalf("clear body = %q, want cache_entries=0", clearRecorder.Body.String())
+	}
+
+	sizeRecorder := httptest.NewRecorder()
+	router.ServeHTTP(sizeRecorder, httptest.NewRequest(http.MethodGet, "/cache?size=0", nil))
+	if sizeRecorder.Code != http.StatusOK {
+		t.Fatalf("size status code = %d, want %d", sizeRecorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"enabled":false`, `"cache_size":0`, `"cache_entries":0`} {
+		if !strings.Contains(sizeRecorder.Body.String(), want) {
+			t.Fatalf("size body = %q, want substring %q", sizeRecorder.Body.String(), want)
+		}
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	router.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/cache/first", nil))
+	if detailRecorder.Code != http.StatusNotFound {
+		t.Fatalf("detail status code after disable = %d, want %d", detailRecorder.Code, http.StatusNotFound)
+	}
+}
+
+func TestCacheEndpointSaveAndLoad(t *testing.T) {
+	tempDir := t.TempDir()
+	handler := NewHandler()
+	handler.SetCacheFilePath(tempDir + "/cache.json")
+	handler.cache.Add("first", cachedVLLMResponse{statusCode: http.StatusCreated, body: []byte(`{"choices":[{"message":{"content":"saved value"}}],"usage":{"completion_tokens":2}}`), contentType: "application/json"})
+	router := handler.Routes()
+
+	saveRecorder := httptest.NewRecorder()
+	router.ServeHTTP(saveRecorder, httptest.NewRequest(http.MethodGet, "/cache?action=save", nil))
+	if saveRecorder.Code != http.StatusOK {
+		t.Fatalf("save status code = %d, want %d", saveRecorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"name":"save"`, `"saved_entries":1`, `"cache_file_path":"` + tempDir + `/cache.json"`} {
+		if !strings.Contains(saveRecorder.Body.String(), want) {
+			t.Fatalf("save body = %q, want substring %q", saveRecorder.Body.String(), want)
+		}
+	}
+
+	handler.cache.Clear()
+
+	loadRecorder := httptest.NewRecorder()
+	router.ServeHTTP(loadRecorder, httptest.NewRequest(http.MethodGet, "/cache?action=load", nil))
+	if loadRecorder.Code != http.StatusOK {
+		t.Fatalf("load status code = %d, want %d", loadRecorder.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"name":"load"`, `"loaded_entries":1`, `"cache_entries":1`} {
+		if !strings.Contains(loadRecorder.Body.String(), want) {
+			t.Fatalf("load body = %q, want substring %q", loadRecorder.Body.String(), want)
+		}
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	router.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/cache/first", nil))
+	if detailRecorder.Code != http.StatusOK {
+		t.Fatalf("detail status code after load = %d, want %d", detailRecorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(detailRecorder.Body.String(), `"content":"saved value"`) {
+		t.Fatalf("detail body = %q, want restored content", detailRecorder.Body.String())
+	}
+}
+
+func TestLoadCacheFromDiskReplacesExistingCache(t *testing.T) {
+	tempDir := t.TempDir()
+	handler := NewHandler()
+	handler.SetCacheFilePath(tempDir + "/cache.json")
+	handler.cache.Add("persisted", cachedVLLMResponse{statusCode: http.StatusAccepted, body: []byte(`{"choices":[{"message":{"content":"persisted"}}],"usage":{"completion_tokens":3}}`), contentType: "application/json"})
+
+	if savedEntries, _, err := handler.SaveCacheToDisk(); err != nil {
+		t.Fatalf("SaveCacheToDisk() error = %v", err)
+	} else if savedEntries != 1 {
+		t.Fatalf("savedEntries = %d, want 1", savedEntries)
+	}
+
+	handler.cache.Add("transient", cachedVLLMResponse{statusCode: http.StatusOK, body: []byte(`{"choices":[{"message":{"content":"transient"}}],"usage":{"completion_tokens":1}}`), contentType: "application/json"})
+
+	loadedEntries, _, err := handler.LoadCacheFromDisk()
+	if err != nil {
+		t.Fatalf("LoadCacheFromDisk() error = %v", err)
+	}
+	if loadedEntries != 1 {
+		t.Fatalf("loadedEntries = %d, want 1", loadedEntries)
+	}
+
+	if _, ok := handler.cache.Peek("transient"); ok {
+		t.Fatal("transient cache entry still present after replace load")
+	}
+	value, ok := handler.cache.Peek("persisted")
+	if !ok {
+		t.Fatal("persisted cache entry missing after load")
+	}
+	if value.statusCode != http.StatusAccepted {
+		t.Fatalf("statusCode = %d, want %d", value.statusCode, http.StatusAccepted)
+	}
+}
+
+func TestLoadCacheFromDiskIgnoresPersistedCapacity(t *testing.T) {
+	tempDir := t.TempDir()
+	handler := NewHandler()
+	handler.SetCacheFilePath(tempDir + "/cache.json")
+
+	cacheFileBody := []byte("{\n  \"version\": 1,\n  \"capacity\": 0,\n  \"entries\": [\n    {\n      \"key\": \"persisted\",\n      \"status_code\": 202,\n      \"body\": \"eyJjaG9pY2VzIjpbeyJtZXNzYWdlIjp7ImNvbnRlbnQiOiJ1c2UgcnVudGltZSBzaXplIn19XSwidXNhZ2UiOnsiY29tcGxldGlvbl90b2tlbnMiOjN9fQ==\",\n      \"content_type\": \"application/json\",\n      \"streaming\": false\n    }\n  ]\n}\n")
+	if err := os.WriteFile(tempDir+"/cache.json", cacheFileBody, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	loadedEntries, _, err := handler.LoadCacheFromDisk()
+	if err != nil {
+		t.Fatalf("LoadCacheFromDisk() error = %v", err)
+	}
+	if loadedEntries != 1 {
+		t.Fatalf("loadedEntries = %d, want 1", loadedEntries)
+	}
+
+	capacity, entries := handler.cache.Stats()
+	if capacity != 100 {
+		t.Fatalf("capacity = %d, want 100", capacity)
+	}
+	if entries != 1 {
+		t.Fatalf("entries = %d, want 1", entries)
+	}
+
+	value, ok := handler.cache.Peek("persisted")
+	if !ok {
+		t.Fatal("persisted cache entry missing after load")
+	}
+	if value.statusCode != http.StatusAccepted {
+		t.Fatalf("statusCode = %d, want %d", value.statusCode, http.StatusAccepted)
+	}
+}
+
+func TestSaveCacheToDiskOmitsCapacity(t *testing.T) {
+	tempDir := t.TempDir()
+	handler := NewHandler()
+	handler.SetCacheFilePath(tempDir + "/cache.json")
+	handler.cache.Add("persisted", cachedVLLMResponse{statusCode: http.StatusOK, body: []byte(`{"choices":[{"message":{"content":"saved"}}],"usage":{"completion_tokens":1}}`), contentType: "application/json"})
+
+	if _, _, err := handler.SaveCacheToDisk(); err != nil {
+		t.Fatalf("SaveCacheToDisk() error = %v", err)
+	}
+
+	body, err := os.ReadFile(tempDir + "/cache.json")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.Contains(string(body), `"capacity"`) {
+		t.Fatalf("saved cache file unexpectedly contains capacity: %s", string(body))
+	}
+}
+
+func TestBuildChatCompletionCacheKeyCanonicalizesEquivalentRequests(t *testing.T) {
+	base := chatCompletionRequest{
+		Model: "model-a",
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "user", Content: "Explain Azure"},
+		},
+		Temperature: 0.2,
+		MaxTokens:   4000,
+		Stream:      true,
+		StreamOptions: &chatCompletionStreamOptions{
+			IncludeUsage: true,
+		},
+	}
+
+	equivalent := chatCompletionRequest{
+		Model: "model-b",
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "user", Content: "Explain Azure"},
+		},
+		Temperature: 0.2,
+		MaxTokens:   4000,
+		Stream:      true,
+	}
+
+	different := chatCompletionRequest{
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "user", Content: "Explain Azure"},
+		},
+		Temperature: 0.0,
+		MaxTokens:   4000,
+		Stream:      true,
+	}
+
+	baseKey, err := buildChatCompletionCacheKey(base)
+	if err != nil {
+		t.Fatalf("buildChatCompletionCacheKey(base) error = %v", err)
+	}
+
+	equivalentKey, err := buildChatCompletionCacheKey(equivalent)
+	if err != nil {
+		t.Fatalf("buildChatCompletionCacheKey(equivalent) error = %v", err)
+	}
+
+	differentKey, err := buildChatCompletionCacheKey(different)
+	if err != nil {
+		t.Fatalf("buildChatCompletionCacheKey(different) error = %v", err)
+	}
+
+	if baseKey != equivalentKey {
+		t.Fatalf("equivalent cache keys differ: %q != %q", baseKey, equivalentKey)
+	}
+
+	if baseKey == differentKey {
+		t.Fatalf("different request produced same cache key: %q", baseKey)
 	}
 }
 
@@ -378,41 +634,6 @@ func TestRoutesNotFoundLogging(t *testing.T) {
 }
 
 
-func TestStandardizeCacheKey(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{name: "whitespace and punctuation", input: " What, is the capital of Texas?! ", want: "whatisthecapitaloftexas"},
-		{name: "numbers preserved", input: "Model 3.1 Turbo", want: "model31turbo"},
-		{name: "only punctuation", input: "?! ,.-", want: ""},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := standardizeCacheKey(test.input)
-			if got != test.want {
-				t.Fatalf("standardizeCacheKey(%q) = %q, want %q", test.input, got, test.want)
-			}
-		})
-	}
-}
-
-func TestBuildCacheKeyIncludesAskOptions(t *testing.T) {
-	defaultOptions := askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
-	customOptions := askOptions{systemPrompt: "Be precise", maxTokens: 700, temperature: 0.7}
-
-	defaultKey := buildCacheKey("hello", defaultOptions)
-	customKey := buildCacheKey("hello", customOptions)
-
-	if defaultKey == customKey {
-		t.Fatalf("buildCacheKey() produced identical keys for different options: %q", defaultKey)
-	}
-}
-
-
-
 func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
@@ -726,6 +947,7 @@ func TestLoadConfigCacheSize(t *testing.T) {
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_CACHE_SIZE", "123")
+	t.Setenv("CACHE_CACHE_FILE_PATH", "/tmp/cache-from-env.json")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -734,16 +956,20 @@ func TestLoadConfigCacheSize(t *testing.T) {
 	if cfg.CacheSize != 123 {
 		t.Fatalf("CacheSize = %d, want 123", cfg.CacheSize)
 	}
+	if cfg.CacheFilePath != "/tmp/cache-from-env.json" {
+		t.Fatalf("CacheFilePath = %q, want %q", cfg.CacheFilePath, "/tmp/cache-from-env.json")
+	}
 }
 
-func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
+func TestLoadConfigCacheFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--cache-size", "7"}
+	os.Args = []string{"cllm", "--cache-size", "7", "--cache-file-path", "/tmp/cache-from-flag.json"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_CACHE_SIZE", "123")
+	t.Setenv("CACHE_CACHE_FILE_PATH", "/tmp/cache-from-env.json")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -751,6 +977,9 @@ func TestLoadConfigCacheSizeFlagPrecedence(t *testing.T) {
 	}
 	if cfg.CacheSize != 7 {
 		t.Fatalf("CacheSize = %d, want 7", cfg.CacheSize)
+	}
+	if cfg.CacheFilePath != "/tmp/cache-from-flag.json" {
+		t.Fatalf("CacheFilePath = %q, want %q", cfg.CacheFilePath, "/tmp/cache-from-flag.json")
 	}
 }
 
