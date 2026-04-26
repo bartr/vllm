@@ -22,8 +22,16 @@ type handlerMetrics struct {
 	cacheLookupsTotal         *prometheus.CounterVec
 	queueWaitDuration         *prometheus.HistogramVec
 	timeToFirstByteDuration   *prometheus.HistogramVec
+	prefillDuration           *prometheus.HistogramVec
+	streamStallDuration       *prometheus.HistogramVec
+	streamStallsTotal         *prometheus.CounterVec
+	dslDirectivesTotal        *prometheus.CounterVec
+	dslRequestsTotal          *prometheus.CounterVec
+	dslTimeToFirstByte        *prometheus.HistogramVec
+	dslJobDuration            *prometheus.HistogramVec
 	jobDuration               *prometheus.HistogramVec
 	downstreamRequestDuration *prometheus.HistogramVec
+	requestLifecycleEvents    *prometheus.CounterVec
 }
 
 const chatCompletionsRouteLabel = "POST /v1/chat/completions"
@@ -72,6 +80,38 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			Help:    "Time from job admission to the first response byte written to the client.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 		}, []string{"endpoint", "source"}),
+		prefillDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "cllm_prefill_duration_seconds",
+			Help:    "Simulated prefill latency before the first response byte on cache replay.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"endpoint", "source"}),
+		streamStallDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "cllm_stream_stall_duration_seconds",
+			Help:    "Simulated mid-stream stall durations on cache replay.",
+			Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30},
+		}, []string{"endpoint", "source"}),
+		streamStallsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_stream_stalls_total",
+			Help: "Total simulated mid-stream stall events on cache replay.",
+		}, []string{"endpoint", "source"}),
+		dslDirectivesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_dsl_directives_total",
+			Help: "Total replay-DSL directives parsed from prompts.",
+		}, []string{"endpoint", "directive"}),
+		dslRequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_dsl_requests_total",
+			Help: "Total chat completion requests by DSL directive family and terminal result. The family label is 'none' for requests without DSL directives.",
+		}, []string{"endpoint", "family", "result"}),
+		dslTimeToFirstByte: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "cllm_dsl_time_to_first_byte_seconds",
+			Help:    "Time to first byte by DSL directive family. The family label is 'none' for requests without DSL directives.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"endpoint", "family", "source"}),
+		dslJobDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "cllm_dsl_job_duration_seconds",
+			Help:    "Job duration by DSL directive family. The family label is 'none' for requests without DSL directives.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		}, []string{"endpoint", "family", "source", "result"}),
 		jobDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_job_duration_seconds",
 			Help:    "Time from job admission to completion.",
@@ -82,6 +122,10 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			Help:    "Time spent waiting on downstream chat completion requests.",
 			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 		}, []string{"endpoint", "result"}),
+		requestLifecycleEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_request_lifecycle_events_total",
+			Help: "Total per-request lifecycle events (admitted, queued, started, completed, rejected). The outcome label is empty for events that do not carry a result or reason.",
+		}, []string{"endpoint", "event", "outcome"}),
 	}
 
 	registry.MustRegister(
@@ -96,8 +140,16 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		metrics.cacheLookupsTotal,
 		metrics.queueWaitDuration,
 		metrics.timeToFirstByteDuration,
+		metrics.prefillDuration,
+		metrics.streamStallDuration,
+		metrics.streamStallsTotal,
+		metrics.dslDirectivesTotal,
+		metrics.dslRequestsTotal,
+		metrics.dslTimeToFirstByte,
+		metrics.dslJobDuration,
 		metrics.jobDuration,
 		metrics.downstreamRequestDuration,
+		metrics.requestLifecycleEvents,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cllm_queue_active_requests",
 			Help: "Current number of active admitted requests.",
@@ -195,6 +247,81 @@ func (m *handlerMetrics) observeQueueWait(endpoint string, duration time.Duratio
 
 func (m *handlerMetrics) observeTimeToFirstByte(endpoint, source, _ string, duration time.Duration) {
 	m.timeToFirstByteDuration.WithLabelValues(endpoint, source).Observe(duration.Seconds())
+}
+
+func (m *handlerMetrics) observePrefillDuration(endpoint, source string, duration time.Duration) {
+	if m == nil || m.prefillDuration == nil || duration <= 0 {
+		return
+	}
+	m.prefillDuration.WithLabelValues(endpoint, source).Observe(duration.Seconds())
+}
+
+func (m *handlerMetrics) observeStreamStall(endpoint, source string, duration time.Duration) {
+	if m == nil || duration <= 0 {
+		return
+	}
+	if m.streamStallDuration != nil {
+		m.streamStallDuration.WithLabelValues(endpoint, source).Observe(duration.Seconds())
+	}
+	if m.streamStallsTotal != nil {
+		m.streamStallsTotal.WithLabelValues(endpoint, source).Inc()
+	}
+}
+
+func (m *handlerMetrics) observeDSLDirective(endpoint, directive string) {
+	if m == nil || m.dslDirectivesTotal == nil || directive == "" {
+		return
+	}
+	m.dslDirectivesTotal.WithLabelValues(endpoint, directive).Inc()
+}
+
+// observeDSLRequestResult increments the per-family request counter for a
+// terminal request outcome. families is typically the result of dslFamilies
+// and always contains at least one entry ("none" baseline when DSL is absent).
+func (m *handlerMetrics) observeDSLRequestResult(endpoint string, families []string, result string) {
+	if m == nil || m.dslRequestsTotal == nil || result == "" {
+		return
+	}
+	if len(families) == 0 {
+		families = []string{"none"}
+	}
+	for _, fam := range families {
+		m.dslRequestsTotal.WithLabelValues(endpoint, fam, result).Inc()
+	}
+}
+
+// observeDSLTimeToFirstByte records TTFT into the per-family histogram.
+func (m *handlerMetrics) observeDSLTimeToFirstByte(endpoint, source string, families []string, duration time.Duration) {
+	if m == nil || m.dslTimeToFirstByte == nil || duration <= 0 {
+		return
+	}
+	if len(families) == 0 {
+		families = []string{"none"}
+	}
+	for _, fam := range families {
+		m.dslTimeToFirstByte.WithLabelValues(endpoint, fam, source).Observe(duration.Seconds())
+	}
+}
+
+// observeDSLJobDuration records terminal job duration into the per-family
+// histogram.
+func (m *handlerMetrics) observeDSLJobDuration(endpoint, source, result string, families []string, duration time.Duration) {
+	if m == nil || m.dslJobDuration == nil || duration <= 0 {
+		return
+	}
+	if len(families) == 0 {
+		families = []string{"none"}
+	}
+	for _, fam := range families {
+		m.dslJobDuration.WithLabelValues(endpoint, fam, source, result).Observe(duration.Seconds())
+	}
+}
+
+func (m *handlerMetrics) observeLifecycleEvent(endpoint, event, outcome string) {
+	if m == nil || m.requestLifecycleEvents == nil {
+		return
+	}
+	m.requestLifecycleEvents.WithLabelValues(endpoint, event, outcome).Inc()
 }
 
 func (m *handlerMetrics) observeJob(endpoint, result, source, _ string, duration time.Duration) {

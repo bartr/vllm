@@ -1,4 +1,4 @@
-# **cLLM: A Controllable LLM Inference Control Plane for Scheduling and Scaling Experiments**
+# cLLM: A Controllable LLM Inference Control Plane for Scheduling and Scaling Experiments
 
 ## 1. Abstract
 
@@ -66,10 +66,6 @@ cLLM consists of three primary components:
 * Structured logging with correlation IDs
 
 The system is deployed alongside a real vLLM instance in Kubernetes, allowing **side-by-side comparison of simulated and real behavior on the same hardware**.
-
----
-
-Here’s the updated Section 5 with the refined capacity model, the new interpretation section, and renumbered subsections.
 
 ---
 
@@ -142,7 +138,7 @@ flowchart LR
     M --> O[Request lifecycle trace]
 ```
 
-## Short verbal explanation
+#### Short verbal explanation
 
 cLLM treats inference capacity as a function of **parallelism plus contention**, not as a fixed global tokens/sec limit. Incoming requests first go through admission control. If capacity is available, they enter the active queue; otherwise they wait, and if the waiting queue is full, they receive a 429.
 
@@ -313,6 +309,18 @@ This decomposition allows precise attribution of latency to specific system beha
 
 ---
 
+### 6.5 Realism Is Opt-In by Default
+
+The realism mechanisms described above (prefill simulation, jitter, rate variability, partial stalls) are **disabled by default**. Out of the box the system replays cached responses at a strict per-request TPS cadence with global degradation `f(load)` still applied; nothing else perturbs the schedule. This is intentional:
+
+* **Predictable baseline.** A fresh deployment behaves like a clean rate-limited replay, which makes throughput sweeps and scheduling experiments trivially reproducible.
+* **Additive composition.** Realism is then layered on by enabling individual classes (prefill rate multiplier, jitter percent, stall probability, etc.) via flags, environment variables, or `/config` updates, or by selecting a DSL profile that bundles them.
+* **Per-experiment scoping.** Because realism is opt-in, an experiment that needs (for example) prefill-heavy behavior on one tenant and a clean baseline on another can express that with a default profile plus per-request DSL directives, without dual deployments.
+
+In short: TPS pacing and load-driven degradation are always on; everything else is opt-in.
+
+---
+
 ## 7. Observability and Traceability
 
 ### 7.1 Request-Level Tracing
@@ -412,7 +420,271 @@ While hardware-level details are abstracted, the simulator accurately reproduces
 
 ---
 
-## 11. Key Insights
+## 11. Replay DSL (Per-Request Execution Directives)
+
+cLLM includes a **Replay DSL** that allows individual requests to carry execution directives which modify replay behavior without changing workload identity or global configuration. This turns the control plane into a **per-request experiment surface**, enabling mixed workloads, targeted fault injection, and reproducible scenario design.
+
+---
+
+### 11.1 Design Goals
+
+* **Per-request control** without service restarts or global config changes
+* **Reproducibility**: identical prompts map to the same cache entry regardless of directives
+* **Safety and predictability**: deterministic parsing with clear precedence rules
+* **Observability**: directives are visible in logs and metrics
+* **Composability**: a small grammar of orthogonal directives plus named profile bundles
+
+---
+
+### 11.2 Syntax and Parsing
+
+Directives are embedded in prompts using a `:dsl` marker (case-insensitive). The parser:
+
+* **Strips the marker and every trailing whitespace-separated token** from the message before forwarding to downstream models and before cache key generation
+* Applies **first-occurrence-of-each-class-wins** semantics across all messages (e.g., the first `tps=` directive in any message wins; later same-class directives are silently dropped)
+* Resolves ranges and randomness against a shared jitter source so a fixed seed produces a fixed schedule
+* Treats `no-cache` as having the highest precedence — it is honored regardless of position in the token stream
+* Treats `no-delay` as a **macro** that expands to `no-prefill no-jitter no-variability no-stall`; it does **not** halt parsing and does **not** disable TPS pacing
+
+Numeric directives use a uniform `key=value` shape. The `=` is optional, so `segment 50` and `segment=50` are equivalent. Values are signed integers (`50`, `-30`) or signed ranges `lo:hi` (`30:50`, `-50:-30`, `-20:20`); inverted bounds are normalized by swapping. For ranges, the value is drawn uniformly from `[lo, hi]` once per request, except `segment=…` which redraws per stream segment.
+
+Example:
+
+```text
+:dsl tps=80 jitter=20 stall=5
+Explain how transformers work.
+```
+
+After parsing:
+
+* Clean prompt: `Explain how transformers work.`
+* Cache key derived from the cleaned prompt only
+* Applied overrides: `tps=80`, `jitter+=20pp`, `stall+=5pp`
+
+---
+
+### 11.3 Supported Directive Classes
+
+The DSL groups directives into orthogonal classes; each class can be claimed at most once per request (first-wins).
+
+* **Cache control**
+
+  * `no-cache` — bypass cache lookup; refresh-write the response (highest precedence)
+* **Throughput**
+
+  * `tps=N` / `tps=A:B` — pin per-request decode rate (1–2048)
+  * `no-tps` — disable TPS pacing entirely (claims the `tps` class, so a later `tps=N` is ignored)
+* **Latency / Timing**
+
+  * `no-delay` — macro for `no-prefill no-jitter no-variability no-stall` (TPS pacing still applies)
+  * `no-prefill` — skip prefill simulation only
+  * `prefill=N` / `prefill=A:B` — scale prefill duration by `(1 + N/100)`; negatives shrink
+  * `segment=N` / `segment=A:B` — per-segment delay scale, redrawn each segment; negatives shrink
+* **Variability and Faults**
+
+  * `jitter=N` / `jitter=A:B` — add signed percentage points to jitter, clamped 0–100
+  * `variability=N` / `variability=A:B` — same shape, on rate variability
+  * `stall=N` / `stall=A:B` — same shape, on stall probability
+  * `no-jitter` / `no-variability` / `no-stall` — zero out the corresponding class
+* **Response shaping**
+
+  * `max-tokens=N` / `max-tokens=A:B` — override `max_tokens` for this request (does not affect cache key)
+* **Composition**
+
+  * `profile=NAME` — expand a named directive bundle (see 11.5)
+
+A bare keyword followed by a non-numeric next token is treated as a no-op; the next token is then parsed independently. Unknown or malformed tokens are silently ignored for forward compatibility.
+
+---
+
+### 11.4 Execution Model Integration
+
+Parsed directives are carried as **replay overrides** through the execution pipeline:
+
+* `cachedReplayDelay(tokens, overrides)` — honors `noTPS` and `tpsOverride`
+* `computePrefillDelay(tokens, overrides)` — honors `noPrefill` and `prefillDurationScale`
+* `computeStreamSegmentDelay(tokens, overrides)` — applies `delayScaleFn` per segment, plus jitter/variability/stall via the override functions
+
+Overrides affect:
+
+* Prefill latency (skip or scaled multiplicatively)
+* Streaming token pacing (per-request TPS, plus per-segment scale)
+* Jitter, variability, and stall behavior (per-class deltas on top of handler defaults, clamped 0–100)
+* Per-request `max_tokens` shaping for both cached and live paths
+
+Global degradation (`f(load)`) is still applied on top of per-request overrides, so per-request adjustments compose with system-wide contention modeling rather than replacing it.
+
+---
+
+### 11.5 Profiles
+
+Profiles are **named directive bundles** loaded from `configs/profiles.yaml` at startup. They keep prompts terse for benchmark scenarios — the prompt names a profile and the server expands it.
+
+Resolution order:
+
+1. `CLLM_DSL_PROFILES_FILE` (explicit override; YAML or JSON; missing file is an error)
+2. `./configs/profiles.yaml` relative to the working directory
+3. `configs/profiles.yaml` next to the running binary
+
+Each entry's value is either a space-separated string of directive tokens or a YAML list of token strings. Profile bundles are expanded **after** explicit prompt directives, so an explicit token in the prompt always wins on conflicts (e.g. `:dsl tps=50 profile=interactive` keeps `tps=50` and inherits `no-stall`/`no-jitter` from the profile). Only the first `profile=` token is honored; unknown profile names are silently ignored.
+
+The shipped catalog includes:
+
+| Group | Names | Effect |
+|---|---|---|
+| Style | `interactive`, `batch`, `stall-heavy`, `prefill-heavy` | Snappy / throughput / pathological / slow-TTFB |
+| Speed (faster) | `fast`, `faster`, `fastest` | Per-segment delay **and** prefill duration shrunk by 0–10%, 10–25%, 25–50% |
+| Speed (slower) | `slow`, `slower`, `slowest` | Per-segment delay **and** prefill duration grown by 0–10%, 10–25%, 25–50% |
+| TPS sweep | `tps-16`, `tps-32`, `tps-64`, `tps-128`, `tps-256`, `tps-512`, `tps-1024`, `tps-1536`, `tps-2048` | Pin tokens-per-second; `no-delay` macro disables prefill/jitter/variability/stall |
+
+---
+
+### 11.5.1 Server-Wide Default Profile
+
+A single profile may be designated as the **server-wide default**, applied to every request that omits the `:dsl` marker entirely. This lets operators shift the baseline replay behavior of an entire deployment without modifying client prompts.
+
+**Scope.** The default profile applies only when **no message in the request carries `:dsl`**. Any presence of `:dsl` — even an empty marker, or one that only carries `no-cache` — fully suppresses the default. This keeps the rule simple: prompts that opt into the DSL get exactly what they asked for; prompts that don't get the server default.
+
+**Precedence.**
+
+1. The default profile is the lowest-priority source of directives.
+2. Any `:dsl` marker in the prompt suppresses the default profile entirely.
+3. An explicit `profile=NAME` token in the prompt replaces (does not stack with) the default.
+4. First-wins-per-class still applies, so individual prompt directives (e.g. `tps=50`) override the same class supplied by the default profile bundle.
+
+**Configuration surfaces.**
+
+* Flag: `--dsl-profile NAME`
+* Environment: `CACHE_DSL_PROFILE=NAME`
+* Runtime: `GET /config?dsl-profile=NAME` (or `dsl_profile=NAME`); send the parameter with an empty value to clear it.
+
+**Validation.** The named profile must exist in the loaded profile map at the moment it is set; unknown names are rejected at startup and on `/config` updates. The current default (or empty) is reported by `GET /config` as `dsl_default_profile`.
+
+**Observability.** When the default fires, the resulting request still emits `profile=NAME` in its directive list and in the `dsl_applied` lifecycle event, so dashboards cannot distinguish "prompt asked for `profile=fast`" from "server default expanded `profile=fast`" — by design. The two paths have identical execution semantics.
+
+---
+
+### 11.6 Cache and Workload Identity
+
+A key design principle is that **DSL directives do not affect cache identity**:
+
+* Cache keys are generated **after directive stripping**
+* Multiple DSL variants of the same prompt map to the **same cached response**
+* `no-cache` bypasses the lookup but still writes the downstream response back into the cache (refresh semantics)
+
+This ensures:
+
+* reproducible workloads across runs
+* consistent benchmarking across different execution scenarios
+* separation of *what is said* (prompt) from *how it is executed* (DSL)
+
+---
+
+### 11.7 Observability
+
+DSL usage is fully instrumented:
+
+* **Lifecycle event**: `dsl_applied` includes the parsed directive list
+* **Metrics**:
+
+  ```text
+  cllm_dsl_directives_total{endpoint, directive}
+  cllm_requests_total{..., dsl_family}
+  ```
+
+  `directive` carries the literal token (`tps=128`, `segment=-20:20`, `profile=fastest`); `dsl_family` collapses numeric values to the keyword (`tps`, `segment`, `profile=fastest`) for low-cardinality dashboards.
+
+This enables:
+
+* tracking directive usage across workloads
+* correlating directives with latency, TTFT, and throughput
+* debugging unexpected behavior introduced by prompt-level overrides
+
+---
+
+### 11.8 Use Cases
+
+The Replay DSL enables several high-value scenarios:
+
+* **Mixed workload simulation**
+  Different prompts in the same test can simulate interactive, batch, or degraded requests by selecting different profiles
+* **Fault injection**
+  Introduce stalls, jitter, or degraded throughput on a subset of requests
+* **A/B testing**
+  Compare scheduling policies or replay characteristics without changing global config
+* **Reproducible experiments**
+  Combined with cached workloads and a fixed jitter seed, DSL directives allow deterministic replay of complex scenarios
+* **Throughput sweeps**
+  The `tps-*` profile family lets a single benchmark script walk decode rates from 16 to 2048 tps with no configuration churn
+
+---
+
+### 11.9 Example Scenarios
+
+#### Interactive vs Batch
+
+```text
+:dsl profile=interactive
+Summarize this article.
+```
+
+```text
+:dsl tps=20 prefill=100
+Generate a long-form report on climate change.
+```
+
+---
+
+#### Fault Injection
+
+```text
+:dsl stall=10 jitter=30
+Explain distributed systems.
+```
+
+---
+
+#### Zero-Latency Replay
+
+```text
+:dsl no-delay no-tps
+Return cached result immediately.
+```
+
+---
+
+#### TPS Sweep with Reply Cap
+
+```text
+:dsl profile=tps-512 max-tokens=128
+Explain Azure.
+```
+
+---
+
+#### Symmetric Stream Jitter
+
+```text
+:dsl segment=-20:20
+Show me a streaming response that wobbles around real-time.
+```
+
+---
+
+### 11.10 Key Insight
+
+The Replay DSL extends cLLM from a configurable system into a **programmable execution environment**:
+
+* Global configuration controls system-wide behavior
+* DSL directives control per-request behavior
+* Profiles compose directives into reusable benchmark scenarios
+* Cache artifacts control workload identity
+
+Together, these allow **precise, reproducible, and composable experiments** on LLM inference systems—something that is difficult to achieve with real GPU-backed deployments alone.
+
+---
+
+## 12. Key Insights
 
 1. **LLM serving is dominated by scheduling and queueing, not raw compute**
 2. **Tokens are the correct unit of resource modeling**
@@ -422,7 +694,7 @@ While hardware-level details are abstracted, the simulator accurately reproduces
 
 ---
 
-## 12. Future Work
+## 13. Future Work
 
 * Multi-node routing across heterogeneous GPU clusters
 * KV cache and memory pressure modeling
@@ -431,6 +703,6 @@ While hardware-level details are abstracted, the simulator accurately reproduces
 
 ---
 
-## 13. Conclusion
+## 14. Conclusion
 
 cLLM is not just a simulator—it is a **controllable, instrumented, and validated LLM inference system** that enables the design, testing, and validation of scheduling and scaling decisions before deploying to real GPU infrastructure.

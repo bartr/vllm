@@ -33,7 +33,7 @@ func TestRoutes(t *testing.T) {
 		{name: "health", method: http.MethodGet, path: "/health", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "ready", method: http.MethodGet, path: "/ready", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"concurrent_requests":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"concurrent_requests":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1024`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"dsl_default_profile":""`}},
 		{name: "cache", method: http.MethodGet, path: "/cache", statusCode: http.StatusOK, bodyContains: []string{`"enabled":true`, `"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`}},
 		{name: "metrics", method: http.MethodGet, path: "/metrics", statusCode: http.StatusOK, bodyContains: []string{"# HELP cllm_http_requests_total", "cllm_http_inflight_requests", "cllm_queue_waiting_requests"}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
@@ -280,20 +280,20 @@ func TestBuildChatCompletionCacheKeyCanonicalizesEquivalentRequests(t *testing.T
 	equivalent := chatCompletionRequest{
 		Model: "model-b",
 		Messages: []chatCompletionMessage{
-			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "system", Content: "Different system prompt entirely."},
 			{Role: "user", Content: "Explain Azure"},
 		},
-		Temperature: 0.2,
-		MaxTokens:   4000,
-		Stream:      true,
+		Temperature: 0.9,
+		MaxTokens:   1234,
+		Stream:      false,
 	}
 
 	different := chatCompletionRequest{
 		Messages: []chatCompletionMessage{
 			{Role: "system", Content: "You are a helpful assistant."},
-			{Role: "user", Content: "Explain Azure"},
+			{Role: "user", Content: "Explain Kubernetes"},
 		},
-		Temperature: 0.0,
+		Temperature: 0.2,
 		MaxTokens:   4000,
 		Stream:      true,
 	}
@@ -333,7 +333,7 @@ func TestMetricsCollapseStreamModeAndKeepChatCompletionsDurationRoute(t *testing
 	nonStreamingRequest.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(httptest.NewRecorder(), nonStreamingRequest)
 
-	streamingBody := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700,"stream":true,"stream_options":{"include_usage":true}}`
+	streamingBody := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"world"}],"temperature":0.7,"max_tokens":700,"stream":true,"stream_options":{"include_usage":true}}`
 	streamingRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(streamingBody))
 	streamingRequest.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(httptest.NewRecorder(), streamingRequest)
@@ -509,6 +509,8 @@ func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
 	handler.SetRequestProcessingLimits(2, 10, 10, 0)
+	handler.SetPrefillSimulation(0, 0, 0, 1)
+	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	var sleeps []time.Duration
 	handler.sleep = func(_ context.Context, duration time.Duration) error {
 		sleeps = append(sleeps, duration)
@@ -552,7 +554,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	defer releaseOne()
 
 	expected := time.Duration(float64(2) * float64(time.Second) / calibratedTokensPerSecond(20))
-	if got := handler.cachedReplayDelay(2); got != expected {
+	if got := handler.cachedReplayDelay(2, replayOverrides{}); got != expected {
 		t.Fatalf("delay below threshold = %s, want %s", got, expected)
 	}
 
@@ -564,7 +566,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 
 	expectedTokensPerSecond := calibratedTokensPerSecond(20) * (1 - ((50.0 / 100.0) * ((0.2 - degradationThreshold) / (1 - degradationThreshold))))
 	expected = time.Duration(float64(2) * float64(time.Second) / expectedTokensPerSecond)
-	if got := handler.cachedReplayDelay(2); got != expected {
+	if got := handler.cachedReplayDelay(2, replayOverrides{}); got != expected {
 		t.Fatalf("delay above threshold = %s, want %s", got, expected)
 	}
 }
@@ -588,7 +590,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 	}()
 
 	expected := time.Duration(float64(10) * float64(time.Second) / calibratedTokensPerSecond(100))
-	if got := handler.cachedReplayDelay(10); got != expected {
+	if got := handler.cachedReplayDelay(10, replayOverrides{}); got != expected {
 		t.Fatalf("delay at threshold = %s, want %s", got, expected)
 	}
 
@@ -600,7 +602,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 
 	expectedTokensPerSecond := calibratedTokensPerSecond(100) * (1 - ((10.0 / 100.0) * (1.0 / float64(512-51))))
 	expected = time.Duration(float64(10) * float64(time.Second) / expectedTokensPerSecond)
-	if got := handler.cachedReplayDelay(10); got != expected {
+	if got := handler.cachedReplayDelay(10, replayOverrides{}); got != expected {
 		t.Fatalf("delay above whole-request threshold = %s, want %s", got, expected)
 	}
 }
@@ -708,6 +710,45 @@ func TestConfigEndpointUpdatesDownstreamTokenAndIgnoresStream(t *testing.T) {
 	}
 }
 
+func TestConfigEndpointSetsAndClearsDSLDefaultProfile(t *testing.T) {
+	handler := NewHandler()
+	handler.SetDSLProfiles(map[string][]string{"fast": {"tps=99"}})
+	router := handler.Routes()
+
+	// Set
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config?dsl-profile=fast", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"dsl_default_profile":"fast"`) {
+		t.Fatalf("expected dsl_default_profile=fast in body, got %s", rec.Body.String())
+	}
+	if got := handler.DSLDefaultProfile(); got != "fast" {
+		t.Fatalf("DSLDefaultProfile() = %q, want fast", got)
+	}
+
+	// snake_case alias also accepted
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config?dsl_profile=FAST", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("snake_case set status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := handler.DSLDefaultProfile(); got != "fast" {
+		t.Fatalf("DSLDefaultProfile() after snake_case = %q, want fast", got)
+	}
+
+	// Clear via empty value
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config?dsl-profile=", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := handler.DSLDefaultProfile(); got != "" {
+		t.Fatalf("DSLDefaultProfile() after clear = %q, want empty", got)
+	}
+}
+
 func TestConfigEndpointRejectsInvalidQueueValues(t *testing.T) {
 	tests := []struct {
 		name string
@@ -718,9 +759,10 @@ func TestConfigEndpointRejectsInvalidQueueValues(t *testing.T) {
 		{name: "concurrent above max", path: "/config?max-concurrent-requests=513", want: `max-concurrent-requests must be between 1 and 512`},
 		{name: "waiting below min", path: "/config?max-waiting-requests=-1", want: `max-waiting-requests must be between 0 and 1024`},
 		{name: "waiting above max", path: "/config?max-waiting-requests=1025", want: `max-waiting-requests must be between 0 and 1024`},
-		{name: "waiting too large for concurrent", path: "/config?max-concurrent-requests=64&max-waiting-requests=128", want: `max-waiting-requests must be less than 128`},
+		{name: "waiting too large for concurrent", path: "/config?max-concurrent-requests=64&max-waiting-requests=129", want: `max-waiting-requests must be ≤ 128`},
 		{name: "tokens per second above max", path: "/config?max-tokens-per-second=1001", want: `max-tokens-per-second must be between 0 and 1000`},
 		{name: "degradation above max", path: "/config?max-concurrent-requests=64&max-waiting-requests=96&max-degradation=96", want: `max-degradation must be between 0 and 95`},
+		{name: "unknown dsl-profile", path: "/config?dsl-profile=does-not-exist", want: `unknown dsl-profile "does-not-exist"`},
 	}
 
 	for _, test := range tests {
@@ -824,7 +866,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 	var logBuffer bytes.Buffer
 	originalLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(originalLogger)
 
 	scheduler := newRequestScheduler(1, 1)
@@ -857,11 +899,9 @@ func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 
 	logOutput := logBuffer.String()
 	for _, want := range []string{
-		`msg="request admitted" path=/one source=direct`,
-		`msg="request admitted" path=/two source=waiting_queue`,
-		`msg="request admitted" path=/two source=waiting_to_concurrent`,
-		`msg="request completed" path=/one`,
-		`msg="request completed" path=/two`,
+		`msg=admitted path=/one source=direct`,
+		`msg=queued path=/two`,
+		`msg=admitted path=/two source=waiting_to_concurrent`,
 	} {
 		if !strings.Contains(logOutput, want) {
 			t.Fatalf("log output %q does not contain %q", logOutput, want)
@@ -887,7 +927,7 @@ func TestConfigEndpointLogsQueueLimitChanges(t *testing.T) {
 		`msg="request queue limits updated"`,
 		`previous_max_concurrent_requests=512`,
 		`max_concurrent_requests=64`,
-		`previous_max_waiting_requests=1023`,
+		`previous_max_waiting_requests=1024`,
 		`max_waiting_requests=96`,
 		`concurrent_requests=0`,
 		`waiting_requests=0`,
@@ -961,7 +1001,7 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 func TestCachedReplayDelayDisabledWhenTokensPerSecondZero(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(0, 10, 10, 10)
-	if got := handler.cachedReplayDelay(20); got != 0 {
+	if got := handler.cachedReplayDelay(20, replayOverrides{}); got != 0 {
 		t.Fatalf("cached replay delay = %s, want 0", got)
 	}
 }
@@ -1199,7 +1239,7 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 		{name: "flag max concurrent requests too high", args: []string{"cllm", "--max-concurrent-requests", "513"}, wantErr: "max-concurrent-requests must be between 1 and 512"},
 		{name: "flag max waiting requests negative", args: []string{"cllm", "--max-waiting-requests", "-1"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
 		{name: "flag max waiting requests too high", args: []string{"cllm", "--max-waiting-requests", "1025"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
-		{name: "flag max waiting requests too large for concurrent", args: []string{"cllm", "--max-concurrent-requests", "64", "--max-waiting-requests", "128"}, wantErr: "max-waiting-requests must be less than 128"},
+		{name: "flag max waiting requests too large for concurrent", args: []string{"cllm", "--max-concurrent-requests", "64", "--max-waiting-requests", "129"}, wantErr: "max-waiting-requests must be ≤ 128"},
 		{name: "flag max degradation too high", args: []string{"cllm", "--max-degradation", "96"}, wantErr: "max-degradation must be between 0 and 95"},
 		{name: "invalid env temperature", args: []string{"cllm"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
 		{name: "flag max tokens out of range", args: []string{"cllm", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
@@ -1406,4 +1446,567 @@ func extractFirstStreamMetadata(t *testing.T, body string) (string, int64) {
 
 	t.Fatalf("stream body %q did not contain a data chunk", body)
 	return "", 0
+}
+
+func TestRequestIDValidation(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"abc-123_xyz", "abc-123_xyz"},
+		{"has space", ""},
+		{"has/slash", ""},
+		{strings.Repeat("a", 128), strings.Repeat("a", 128)},
+		{strings.Repeat("a", 129), ""},
+	}
+	for _, tc := range tests {
+		if got := validateRequestID(tc.input); got != tc.want {
+			t.Errorf("validateRequestID(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestNewULIDFormat(t *testing.T) {
+	id := newULID()
+	if len(id) != 26 {
+		t.Fatalf("len = %d, want 26", len(id))
+	}
+	for _, c := range id {
+		if !strings.ContainsRune(crockfordAlphabet, c) {
+			t.Fatalf("char %q not in crockford alphabet", c)
+		}
+	}
+}
+
+func TestRequestLoggerSetsRequestIDResponseHeader(t *testing.T) {
+	handler := NewHandler().Routes()
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(recorder, req)
+	if got := recorder.Header().Get(requestIDHeader); got == "" || len(got) != 26 {
+		t.Fatalf("X-Request-ID header = %q, want generated 26-char ULID", got)
+	}
+}
+
+func TestRequestLoggerPreservesValidInboundRequestID(t *testing.T) {
+	handler := NewHandler().Routes()
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(requestIDHeader, "client-supplied-123")
+	handler.ServeHTTP(recorder, req)
+	if got := recorder.Header().Get(requestIDHeader); got != "client-supplied-123" {
+		t.Fatalf("X-Request-ID header = %q, want %q", got, "client-supplied-123")
+	}
+}
+
+func TestRequestLoggerRegeneratesInvalidInboundRequestID(t *testing.T) {
+	handler := NewHandler().Routes()
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(requestIDHeader, "has space")
+	handler.ServeHTTP(recorder, req)
+	got := recorder.Header().Get(requestIDHeader)
+	if got == "has space" || len(got) != 26 {
+		t.Fatalf("X-Request-ID header = %q, want regenerated 26-char ULID", got)
+	}
+}
+
+func TestRequestLoggerSkipsRequestIDForNonChatEndpoints(t *testing.T) {
+	handler := NewHandler().Routes()
+	for _, path := range []string{"/health", "/ready", "/metrics", "/version", "/config", "/cache"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := recorder.Header().Get(requestIDHeader); got != "" {
+			t.Fatalf("path %s: X-Request-ID header = %q, want empty", path, got)
+		}
+	}
+}
+
+func TestChatCompletionsLifecycleEventsLogged(t *testing.T) {
+	var logBuffer bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(originalLogger)
+
+	vllmServer := newTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
+	body := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(requestIDHeader, "lifecycle-test-id")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	logOutput := logBuffer.String()
+	for _, want := range []string{
+		`request_id=lifecycle-test-id`,
+		`msg=admitted`,
+		`msg="request started"`,
+		`event=started`,
+		`msg="first token emitted"`,
+		`event=first_token`,
+		`source=downstream`,
+		`msg="request completed"`,
+		`event=completed outcome=completed`,
+		`prompt_tokens=5`,
+		`completion_tokens=1`,
+		`max_tokens=700`,
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("log output %q does not contain %q", logOutput, want)
+		}
+	}
+}
+
+func TestChatCompletionsRejectedOverCapacityEmitsLifecycleEvent(t *testing.T) {
+	var logBuffer bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
+	defer slog.SetDefault(originalLogger)
+
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(32, 1, 0, 0)
+	release, _, ok := handler.acquireRequestSlot(context.Background(), "/v1/chat/completions")
+	if !ok {
+		t.Fatal("failed to acquire baseline slot")
+	}
+	defer release()
+
+	router := handler.Routes()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(requestIDHeader, "rejected-id")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if got := recorder.Header().Get(requestIDHeader); got != "rejected-id" {
+		t.Fatalf("X-Request-ID = %q, want %q", got, "rejected-id")
+	}
+	logOutput := logBuffer.String()
+	for _, want := range []string{
+		`request_id=rejected-id`,
+		`msg="request rejected"`,
+		`event=rejected outcome=over_capacity`,
+		`status=429`,
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("log output %q does not contain %q", logOutput, want)
+		}
+	}
+}
+
+func TestChatCompletionsRejectedBadRequestEmitsLifecycleEvent(t *testing.T) {
+	var logBuffer bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
+	defer slog.SetDefault(originalLogger)
+
+	handler := NewHandler().Routes()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	logOutput := logBuffer.String()
+	if !strings.Contains(logOutput, `msg="request rejected"`) || !strings.Contains(logOutput, `event=rejected outcome=bad_request`) {
+		t.Fatalf("log output missing rejected event: %q", logOutput)
+	}
+}
+
+func TestLifecycleEventsCounter(t *testing.T) {
+	vllmServer := newTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	router := handler.Routes()
+	body := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(httptest.NewRecorder(), req)
+
+	metricsRecorder := httptest.NewRecorder()
+	router.ServeHTTP(metricsRecorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metricsBody := metricsRecorder.Body.String()
+	for _, want := range []string{
+		`cllm_request_lifecycle_events_total{endpoint="chat_completions",event="admitted",outcome=""} 1`,
+		`cllm_request_lifecycle_events_total{endpoint="chat_completions",event="first_token",outcome=""} 1`,
+		`cllm_request_lifecycle_events_total{endpoint="chat_completions",event="completed",outcome="completed"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics body missing %q\nbody:\n%s", want, metricsBody)
+		}
+	}
+}
+
+func TestCacheKeyIgnoresSystemMessageAndParameters(t *testing.T) {
+	a := chatCompletionRequest{
+		Model: "x",
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: "Be brief"},
+			{Role: "user", Content: "hi"},
+		},
+		Temperature: 0.1, MaxTokens: 100, Stream: false,
+	}
+	b := chatCompletionRequest{
+		Model: "y",
+		Messages: []chatCompletionMessage{
+			{Role: "system", Content: "Wholly different system prompt"},
+			{Role: "user", Content: "hi"},
+		},
+		Temperature: 0.9, MaxTokens: 5000, Stream: true,
+		StreamOptions: &chatCompletionStreamOptions{IncludeUsage: true},
+	}
+	c := chatCompletionRequest{
+		Messages: []chatCompletionMessage{{Role: "user", Content: "hi"}},
+	}
+	keyA, _ := buildChatCompletionCacheKey(a)
+	keyB, _ := buildChatCompletionCacheKey(b)
+	keyC, _ := buildChatCompletionCacheKey(c)
+	if keyA != keyB || keyA != keyC {
+		t.Fatalf("expected same key, got A=%s B=%s C=%s", keyA, keyB, keyC)
+	}
+}
+
+func TestReplayCachedStreamTruncatesAtMaxTokens(t *testing.T) {
+	cached := cachedVLLMResponse{
+		statusCode:  200,
+		contentType: "text/event-stream",
+		streaming:   true,
+		body: []byte("" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"c\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"d\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":4,\"total_tokens\":6}}\n\n" +
+			"data: [DONE]\n\n"),
+	}
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	recorder := httptest.NewRecorder()
+	handler.replayCachedStream(context.Background(), recorder, cached, replayOptions{maxTokens: 2, includeUsage: true, stream: true})
+	body := recorder.Body.String()
+	contentDeltas := strings.Count(body, `"content":`)
+	if contentDeltas != 2 {
+		t.Fatalf("expected 2 content deltas, got %d in %q", contentDeltas, body)
+	}
+	if !strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Fatalf("missing finish_reason=stop in %q", body)
+	}
+	if !strings.Contains(body, `"usage"`) {
+		t.Fatalf("missing usage chunk in %q", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Fatalf("missing [DONE] terminator in %q", body)
+	}
+}
+
+func TestReplayCachedStreamFromJSONCache(t *testing.T) {
+	cached := cachedVLLMResponse{
+		statusCode:  200,
+		contentType: "application/json",
+		streaming:   false,
+		body:        []byte(`{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`),
+	}
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	recorder := httptest.NewRecorder()
+	handler.replayCachedStream(context.Background(), recorder, cached, replayOptions{maxTokens: 0, includeUsage: true, stream: true})
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"role":"assistant"`) {
+		t.Fatalf("missing role chunk in %q", body)
+	}
+	if strings.Count(body, `"content":`) != 3 {
+		t.Fatalf("expected 3 content chunks for completion_tokens=3, got %d in %q", strings.Count(body, `"content":`), body)
+	}
+	if !strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Fatalf("missing finish chunk in %q", body)
+	}
+	if !strings.Contains(body, `"usage"`) {
+		t.Fatalf("missing usage chunk in %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("missing [DONE] in %q", body)
+	}
+}
+
+func TestReplayCachedResponseFromSSECache(t *testing.T) {
+	cached := cachedVLLMResponse{
+		statusCode:  200,
+		contentType: "text/event-stream",
+		streaming:   true,
+		body: []byte("" +
+			"data: {\"id\":\"x\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"id\":\"x\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"id\":\"x\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"id\":\"x\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n" +
+			"data: [DONE]\n\n"),
+	}
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	recorder := httptest.NewRecorder()
+	handler.replayCachedResponse(context.Background(), recorder, cached, replayOptions{maxTokens: 0, stream: false})
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("response is not JSON: %v\nbody: %s", err, recorder.Body.String())
+	}
+	choices := parsed["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "hello world" {
+		t.Fatalf("content = %v, want %q", msg["content"], "hello world")
+	}
+	usage := parsed["usage"].(map[string]any)
+	if usage["completion_tokens"].(float64) != 2 {
+		t.Fatalf("completion_tokens = %v, want 2", usage["completion_tokens"])
+	}
+}
+
+func TestReplayCachedResponseCapsPacingAtMaxTokens(t *testing.T) {
+	cached := cachedVLLMResponse{
+		statusCode:  200,
+		contentType: "application/json",
+		streaming:   false,
+		body:        []byte(`{"choices":[{"message":{"role":"assistant","content":"abc"}}],"usage":{"completion_tokens":100}}`),
+	}
+	handler := NewHandlerWithDependencies("", nil, 1, askOptions{})
+	handler.SetRequestProcessingLimits(50, 10, 10, 0)
+	var sleeps []time.Duration
+	handler.sleep = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		return nil
+	}
+	recorder := httptest.NewRecorder()
+	handler.replayCachedResponse(context.Background(), recorder, cached, replayOptions{maxTokens: 5})
+	if len(sleeps) != 1 {
+		t.Fatalf("expected 1 sleep, got %d", len(sleeps))
+	}
+	expected := time.Duration(float64(5) * float64(time.Second) / calibratedTokensPerSecond(50))
+	if sleeps[0] != expected {
+		t.Fatalf("sleep = %s, want %s", sleeps[0], expected)
+	}
+}
+
+func TestCacheKeyFuzzyMatchesEquivalentPrompts(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b string
+	}{
+		{"case_and_punctuation", "Explain Azure!", "explain azure"},
+		{"stop_words", "Please explain Azure to me", "explain azure"},
+		{"word_order", "Azure explain", "explain Azure"},
+		{"extra_whitespace", "  explain   azure  ", "explain azure"},
+		{"verbose_with_stops", "Could you please explain what Azure is?", "explain azure"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			keyA, err := buildChatCompletionCacheKey(chatCompletionRequest{
+				Messages: []chatCompletionMessage{{Role: "user", Content: tc.a}},
+			})
+			if err != nil {
+				t.Fatalf("buildChatCompletionCacheKey(a): %v", err)
+			}
+			keyB, err := buildChatCompletionCacheKey(chatCompletionRequest{
+				Messages: []chatCompletionMessage{{Role: "user", Content: tc.b}},
+			})
+			if err != nil {
+				t.Fatalf("buildChatCompletionCacheKey(b): %v", err)
+			}
+			if keyA != keyB {
+				t.Fatalf("expected same key for %q and %q, got %s vs %s", tc.a, tc.b, keyA, keyB)
+			}
+		})
+	}
+}
+
+func TestCacheKeyDistinguishesDifferentPrompts(t *testing.T) {
+	keyA, _ := buildChatCompletionCacheKey(chatCompletionRequest{
+		Messages: []chatCompletionMessage{{Role: "user", Content: "Explain Azure"}},
+	})
+	keyB, _ := buildChatCompletionCacheKey(chatCompletionRequest{
+		Messages: []chatCompletionMessage{{Role: "user", Content: "Explain Kubernetes"}},
+	})
+	if keyA == keyB {
+		t.Fatalf("expected different keys for distinct prompts, got %s", keyA)
+	}
+}
+
+func TestComputePrefillDelayScalesWithPromptTokens(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetPrefillSimulation(2.0, 50, 0, 60000)
+	handler.jitterSource = func() float64 { return 0 }
+
+	d10 := handler.computePrefillDelay(10, replayOverrides{})
+	d100 := handler.computePrefillDelay(100, replayOverrides{})
+	rate := calibratedTokensPerSecond(100) * 2.0
+	want10 := 50*time.Millisecond + time.Duration(float64(10)/rate*float64(time.Second))
+	want100 := 50*time.Millisecond + time.Duration(float64(100)/rate*float64(time.Second))
+	if d10 != want10 {
+		t.Fatalf("d10 = %s, want %s", d10, want10)
+	}
+	if d100 != want100 {
+		t.Fatalf("d100 = %s, want %s", d100, want100)
+	}
+}
+
+func TestComputePrefillDelayDisabledWhenMultiplierZero(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetPrefillSimulation(0, 100, 0, 60000)
+	if d := handler.computePrefillDelay(500, replayOverrides{}); d != 0 {
+		t.Fatalf("delay = %s, want 0 when multiplier=0", d)
+	}
+}
+
+func TestComputePrefillDelayDisabledWhenDecodeRateZero(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	handler.SetPrefillSimulation(2.0, 100, 0, 60000)
+	if d := handler.computePrefillDelay(500, replayOverrides{}); d != 0 {
+		t.Fatalf("delay = %s, want 0 when decode rate=0", d)
+	}
+}
+
+func TestComputePrefillDelayCappedAtMax(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(1, 10, 10, 0)
+	handler.SetPrefillSimulation(0.5, 0, 0, 200)
+	handler.jitterSource = func() float64 { return 0 }
+	if d := handler.computePrefillDelay(1000000, replayOverrides{}); d != 200*time.Millisecond {
+		t.Fatalf("delay = %s, want 200ms", d)
+	}
+}
+
+func TestSimulatePrefillDelayHonorsContextCancel(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetPrefillSimulation(1.0, 1000, 0, 60000)
+	handler.jitterSource = func() float64 { return 0 }
+	handler.sleep = func(_ context.Context, _ time.Duration) error {
+		return context.Canceled
+	}
+	delay, err := handler.simulatePrefillDelay(context.Background(), 10, replayOverrides{})
+	if err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if delay <= 0 {
+		t.Fatalf("delay = %s, want > 0", delay)
+	}
+}
+
+func TestComputePrefillDelayAppliesJitter(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetPrefillSimulation(1.0, 100, 50, 60000)
+	handler.jitterSource = func() float64 { return 1.0 } // +50%
+	dHigh := handler.computePrefillDelay(0, replayOverrides{})
+	handler.jitterSource = func() float64 { return -1.0 } // -50%
+	dLow := handler.computePrefillDelay(0, replayOverrides{})
+	if dHigh <= dLow {
+		t.Fatalf("expected high (%s) > low (%s)", dHigh, dLow)
+	}
+}
+
+func TestComputeStreamSegmentDelayBaseline(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetStreamRealism(0, 0, 0, 0, 0)
+	handler.jitterSource = func() float64 { return 0 }
+	delay, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	if stall != 0 {
+		t.Fatalf("stall = %s, want 0", stall)
+	}
+	want := handler.cachedReplayDelay(10, replayOverrides{})
+	if delay != want {
+		t.Fatalf("delay = %s, want %s", delay, want)
+	}
+}
+
+func TestComputeStreamSegmentDelayDisabledWhenRateZero(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	handler.SetStreamRealism(50, 50, 100, 100, 200)
+	handler.jitterSource = func() float64 { return 1 }
+	delay, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	if delay != 0 || stall != 0 {
+		t.Fatalf("delay=%s stall=%s, want 0,0 when rate=0", delay, stall)
+	}
+}
+
+func TestComputeStreamSegmentDelayVariabilitySigns(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetStreamRealism(50, 0, 0, 0, 0)
+	base := handler.cachedReplayDelay(10, replayOverrides{})
+
+	handler.jitterSource = func() float64 { return 1 }
+	high, _ := handler.computeStreamSegmentDelay(10, replayOverrides{})
+
+	handler.jitterSource = func() float64 { return -1 }
+	low, _ := handler.computeStreamSegmentDelay(10, replayOverrides{})
+
+	if !(low < base && base < high) {
+		t.Fatalf("expected low(%s) < base(%s) < high(%s)", low, base, high)
+	}
+}
+
+func TestComputeStreamSegmentDelayStallAlwaysFires(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetStreamRealism(0, 0, 100, 100, 100)
+	// Variability/jitter zero so first two draws are no-ops; stall draws use 3rd & 4th.
+	calls := 0
+	handler.jitterSource = func() float64 {
+		calls++
+		return 0 // (0+1)/2 = 0.5 — but with prob=100 we always stall; r=0.5 -> midpoint
+	}
+	delay, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	if stall != 100*time.Millisecond {
+		t.Fatalf("stall = %s, want 100ms (min==max)", stall)
+	}
+	base := handler.cachedReplayDelay(10, replayOverrides{})
+	if delay != base+stall {
+		t.Fatalf("delay = %s, want %s", delay, base+stall)
+	}
+	if calls < 2 {
+		t.Fatalf("jitter draws = %d, want >= 2", calls)
+	}
+}
+
+func TestComputeStreamSegmentDelayStallNeverFires(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetStreamRealism(0, 0, 0, 100, 200)
+	handler.jitterSource = func() float64 { return 1 }
+	_, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	if stall != 0 {
+		t.Fatalf("stall = %s, want 0 when probability=0", stall)
+	}
+}
+
+func TestThrottleStreamSegmentRecordsStallMetric(t *testing.T) {
+	handler := NewHandler()
+	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetStreamRealism(0, 0, 100, 50, 50)
+	handler.jitterSource = func() float64 { return 0 }
+	handler.sleep = func(_ context.Context, _ time.Duration) error { return nil }
+	if err := handler.throttleStreamSegment(context.Background(), 5, replayOverrides{}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
 }

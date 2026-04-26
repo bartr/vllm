@@ -58,6 +58,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
 	handler.SetRequestProcessingLimits(cfg.MaxTokensPerSecond, cfg.MaxConcurrentRequests, cfg.MaxWaitingRequests, cfg.MaxDegradation)
+	handler.SetPrefillSimulation(cfg.PrefillRateMultiplier, cfg.PrefillBaseOverheadMs, cfg.PrefillJitterPercent, cfg.PrefillMaxMs)
+	handler.SetStreamRealism(cfg.StreamVariabilityPercent, cfg.StreamJitterPercent, cfg.StreamStallProbabilityPercent, cfg.StreamStallMinMs, cfg.StreamStallMaxMs)
+	if cfg.DSLProfiles != nil {
+		handler.SetDSLProfiles(cfg.DSLProfiles)
+		logger.Info("loaded DSL profiles", "count", len(cfg.DSLProfiles))
+	} else {
+		logger.Warn("no DSL profiles loaded; configs/profiles.yaml not found")
+	}
+	if cfg.DSLProfile != "" {
+		if err := handler.SetDSLDefaultProfile(cfg.DSLProfile); err != nil {
+			logger.Error("install default DSL profile", "err", err, "dsl_profile", cfg.DSLProfile)
+			return 1
+		}
+		logger.Info("default DSL profile installed", "dsl_profile", handler.DSLDefaultProfile())
+	}
 	if err := loadStartupCache(logger, handler, cfg.CacheFilePath); err != nil {
 		logger.Error("load startup cache", "err", err, "cache_file_path", cfg.CacheFilePath)
 		return 1
@@ -87,6 +102,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"max_degradation", cfg.MaxDegradation,
 			"computed_degradation_percentage", processingStats.ComputedDegradationPercentage,
 			"temperature", cfg.Temperature,
+			"prefill_rate_multiplier", cfg.PrefillRateMultiplier,
+			"prefill_base_overhead_ms", cfg.PrefillBaseOverheadMs,
+			"prefill_jitter_percent", cfg.PrefillJitterPercent,
+			"prefill_max_ms", cfg.PrefillMaxMs,
+			"stream_variability_percent", cfg.StreamVariabilityPercent,
+			"stream_jitter_percent", cfg.StreamJitterPercent,
+			"stream_stall_probability_percent", cfg.StreamStallProbabilityPercent,
+			"stream_stall_min_ms", cfg.StreamStallMinMs,
+			"stream_stall_max_ms", cfg.StreamStallMaxMs,
 		)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

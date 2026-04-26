@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,11 +19,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -47,6 +50,29 @@ const (
 	defaultMaxConcurrentRequests      = runtimeconfig.DefaultMaxConcurrentRequests
 	defaultMaxWaitingRequests         = runtimeconfig.DefaultMaxWaitingRequests
 	defaultMaxDegradation             = runtimeconfig.DefaultMaxDegradation
+	defaultPrefillRateMultiplier      = runtimeconfig.DefaultPrefillRateMultiplier
+	defaultPrefillBaseOverheadMs      = runtimeconfig.DefaultPrefillBaseOverheadMs
+	defaultPrefillJitterPercent       = runtimeconfig.DefaultPrefillJitterPercent
+	defaultPrefillMaxMs               = runtimeconfig.DefaultPrefillMaxMs
+	minPrefillRateMultiplier          = runtimeconfig.MinPrefillRateMultiplier
+	maxPrefillRateMultiplier          = runtimeconfig.MaxPrefillRateMultiplier
+	minPrefillBaseOverheadMs          = runtimeconfig.MinPrefillBaseOverheadMs
+	maxPrefillBaseOverheadMs          = runtimeconfig.MaxPrefillBaseOverheadMs
+	minPrefillJitterPercent           = runtimeconfig.MinPrefillJitterPercent
+	maxPrefillJitterPercent           = runtimeconfig.MaxPrefillJitterPercent
+	defaultStreamVariabilityPercent      = runtimeconfig.DefaultStreamVariabilityPercent
+	defaultStreamJitterPercent           = runtimeconfig.DefaultStreamJitterPercent
+	defaultStreamStallProbabilityPercent = runtimeconfig.DefaultStreamStallProbabilityPercent
+	defaultStreamStallMinMs              = runtimeconfig.DefaultStreamStallMinMs
+	defaultStreamStallMaxMs              = runtimeconfig.DefaultStreamStallMaxMs
+	minStreamVariabilityPercent          = runtimeconfig.MinStreamVariabilityPercent
+	maxStreamVariabilityPercent          = runtimeconfig.MaxStreamVariabilityPercent
+	minStreamJitterPercent               = runtimeconfig.MinStreamJitterPercent
+	maxStreamJitterPercent               = runtimeconfig.MaxStreamJitterPercent
+	minStreamStallProbabilityPercent     = runtimeconfig.MinStreamStallProbabilityPercent
+	maxStreamStallProbabilityPercent     = runtimeconfig.MaxStreamStallProbabilityPercent
+	minStreamStallMs                     = runtimeconfig.MinStreamStallMs
+	maxStreamStallMs                     = runtimeconfig.MaxStreamStallMs
 	degradationThreshold              = 0.10
 	replayTokensPerSecondCompensation = 1.025
 )
@@ -84,8 +110,20 @@ type Handler struct {
 	modelsCache                               *cachedModelsResponse
 	maxTokensPerSecond                        int
 	maxDegradation                            int
+	prefillRateMultiplier                     float64
+	prefillBaseOverhead                       time.Duration
+	prefillJitterPercent                      int
+	prefillMaxDuration                        time.Duration
+	streamVariabilityPercent                  int
+	streamJitterPercent                       int
+	streamStallProbabilityPercent             int
+	streamStallMin                            time.Duration
+	streamStallMax                            time.Duration
 	scheduler                                 *requestScheduler
 	sleep                                     func(context.Context, time.Duration) error
+	jitterSource                              func() float64
+	dslProfiles                               map[string][]string
+	dslDefaultProfile                         string
 	lastLoggedComputedDegradationMilliPercent atomic.Int64
 }
 
@@ -99,10 +137,22 @@ func NewHandler() *Handler {
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
 	handler.maxTokensPerSecond = defaultMaxTokensPerSecond
 	handler.maxDegradation = defaultMaxDegradation
+	handler.prefillRateMultiplier = defaultPrefillRateMultiplier
+	handler.prefillBaseOverhead = time.Duration(defaultPrefillBaseOverheadMs) * time.Millisecond
+	handler.prefillJitterPercent = defaultPrefillJitterPercent
+	handler.prefillMaxDuration = time.Duration(defaultPrefillMaxMs) * time.Millisecond
+	handler.streamVariabilityPercent = defaultStreamVariabilityPercent
+	handler.streamJitterPercent = defaultStreamJitterPercent
+	handler.streamStallProbabilityPercent = defaultStreamStallProbabilityPercent
+	handler.streamStallMin = time.Duration(defaultStreamStallMinMs) * time.Millisecond
+	handler.streamStallMax = time.Duration(defaultStreamStallMaxMs) * time.Millisecond
 	handler.scheduler = newRequestScheduler(defaultMaxConcurrentRequests, defaultMaxWaitingRequests)
 	handler.sleep = sleepWithContext
+	handler.jitterSource = defaultJitterSource
+	handler.dslProfiles = cloneDSLProfiles(DefaultDSLProfiles)
 	handler.lastLoggedComputedDegradationMilliPercent.Store(-1)
 	handler.metrics = newHandlerMetrics(handler)
+	handler.scheduler.metrics = handler.metrics
 	return handler
 }
 
@@ -113,7 +163,7 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRe
 	if maxConcurrentRequests < minMaxConcurrentRequests || maxConcurrentRequests > maxMaxConcurrentRequests {
 		maxConcurrentRequests = defaultMaxConcurrentRequests
 	}
-	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests || maxWaitingRequests >= 2*maxConcurrentRequests {
+	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests || maxWaitingRequests > 2*maxConcurrentRequests {
 		maxWaitingRequests = defaultMaxWaitingRequests
 	}
 	if maxDegradation < minMaxDegradation {
@@ -128,6 +178,7 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRe
 	h.maxDegradation = maxDegradation
 	if h.scheduler == nil {
 		h.scheduler = newRequestScheduler(maxConcurrentRequests, maxWaitingRequests)
+		h.scheduler.metrics = h.metrics
 	} else {
 		h.scheduler.Reconfigure(maxConcurrentRequests, maxWaitingRequests)
 	}
@@ -231,6 +282,62 @@ func (h *Handler) SetCacheFilePath(path string) {
 	h.cacheFilePath = path
 }
 
+// SetDSLProfiles replaces the active map of named DSL profile bundles.
+// Passing a nil or empty map restores the built-in defaults. Profile names
+// are matched case-insensitively. Each value is the slice of directive
+// tokens that the profile expands into; tokens unknown to the parser are
+// silently ignored at request time.
+func (h *Handler) SetDSLProfiles(profiles map[string][]string) {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if len(profiles) == 0 {
+		h.dslProfiles = cloneDSLProfiles(DefaultDSLProfiles)
+		return
+	}
+	h.dslProfiles = cloneDSLProfiles(profiles)
+}
+
+// SetDSLDefaultProfile installs a profile bundle that is implicitly
+// expanded for every request that omits the `:dsl` marker. Pass an empty
+// string to disable. Returns an error if the named profile is not present
+// in the currently loaded profile map. Names are matched
+// case-insensitively.
+func (h *Handler) SetDSLDefaultProfile(name string) error {
+	name = strings.ToLower(strings.TrimSpace(name))
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if name == "" {
+		h.dslDefaultProfile = ""
+		return nil
+	}
+	if _, ok := h.dslProfiles[name]; !ok {
+		return fmt.Errorf("unknown DSL profile %q", name)
+	}
+	h.dslDefaultProfile = name
+	return nil
+}
+
+// DSLDefaultProfile returns the currently configured default DSL profile
+// name (empty when none is set).
+func (h *Handler) DSLDefaultProfile() string {
+	h.configMu.RLock()
+	defer h.configMu.RUnlock()
+	return h.dslDefaultProfile
+}
+
+// DSLProfileNames returns the sorted list of currently loaded DSL profile
+// names. Used by the HTML config form to populate a dropdown.
+func (h *Handler) DSLProfileNames() []string {
+	h.configMu.RLock()
+	defer h.configMu.RUnlock()
+	names := make([]string, 0, len(h.dslProfiles))
+	for name := range h.dslProfiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func NewHandlerWithDependencies(vllmURL string, httpClient *http.Client, cacheSize int, defaults askOptions) *Handler {
 	handler := NewHandler()
 	if vllmURL != "" {
@@ -263,6 +370,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /cache", h.cacheEndpoint)
 	mux.HandleFunc("GET /cache/{key}", h.cacheItemEndpoint)
 	mux.HandleFunc("GET /config", h.config)
+	mux.HandleFunc("POST /config", h.configPost)
 	mux.HandleFunc("GET /health", h.healthEndpoint)
 	mux.Handle("GET /metrics", h.metrics.Handler())
 	mux.HandleFunc("GET /ready", h.readyEndpoint)
@@ -289,6 +397,16 @@ type runtimeConfig struct {
 	MaxDegradation                int     `json:"max_degradation"`
 	ComputedDegradationPercentage float64 `json:"computed_degradation_percentage"`
 	Temperature                   float64 `json:"temperature"`
+	PrefillRateMultiplier         float64 `json:"prefill_rate_multiplier"`
+	PrefillBaseOverheadMs         int     `json:"prefill_base_overhead_ms"`
+	PrefillJitterPercent          int     `json:"prefill_jitter_percent"`
+	PrefillMaxMs                  int     `json:"prefill_max_ms"`
+	StreamVariabilityPercent      int     `json:"stream_variability_percent"`
+	StreamJitterPercent           int     `json:"stream_jitter_percent"`
+	StreamStallProbabilityPercent int     `json:"stream_stall_probability_percent"`
+	StreamStallMinMs              int     `json:"stream_stall_min_ms"`
+	StreamStallMaxMs              int     `json:"stream_stall_max_ms"`
+	DSLDefaultProfile             string  `json:"dsl_default_profile"`
 }
 
 type cacheEntrySummary struct {
@@ -368,14 +486,87 @@ func (h *Handler) version(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) config(w http.ResponseWriter, r *http.Request) {
+	wantsHTML := preferHTML(r.Header.Get("Accept"))
+
 	if _, err := h.applyConfigQuery(r); err != nil {
 		markCacheHit(w, false)
+		if wantsHTML {
+			h.renderConfigHTML(w, r, configFormState{
+				Edit:    true,
+				Values:  r.URL.Query(),
+				Error:   err.Error(),
+				Status:  http.StatusBadRequest,
+			})
+			return
+		}
 		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
 		return
 	}
 
 	markCacheHit(w, false)
+	if wantsHTML {
+		edit := r.URL.Query().Get("edit") == "1"
+		h.renderConfigHTML(w, r, configFormState{Edit: edit, Status: http.StatusOK})
+		return
+	}
 	writeJSON(w, http.StatusOK, h.currentConfig())
+}
+
+// configPost handles the HTML edit form submission. Validation re-uses the
+// same applyConfigValues logic that backs the GET query-string API.
+func (h *Handler) configPost(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusBadRequest, "invalid form: "+err.Error()+"\n")
+		return
+	}
+	wantsHTML := preferHTML(r.Header.Get("Accept")) || r.Header.Get("Content-Type") == "application/x-www-form-urlencoded"
+
+	if _, err := h.applyConfigValues(r.PostForm); err != nil {
+		markCacheHit(w, false)
+		if wantsHTML {
+			h.renderConfigHTML(w, r, configFormState{
+				Edit:   true,
+				Values: r.PostForm,
+				Error:  err.Error(),
+				Status: http.StatusBadRequest,
+			})
+			return
+		}
+		writePlainText(w, http.StatusBadRequest, err.Error()+"\n")
+		return
+	}
+
+	markCacheHit(w, false)
+	if wantsHTML {
+		// Post/Redirect/Get: send the browser back to read-only view.
+		http.Redirect(w, r, "/config", http.StatusSeeOther)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.currentConfig())
+}
+
+// preferHTML returns true when the Accept header lists text/html with a
+// quality factor strictly higher than application/json (or before it). It
+// is intentionally permissive: any browser request gets the form, while
+// `curl` (which sends `*/*` or no Accept) keeps the JSON contract.
+func preferHTML(accept string) bool {
+	if accept == "" {
+		return false
+	}
+	// Cheap parse: if text/html appears before any application/json or */*,
+	// prefer HTML. Browsers send `text/html,application/xhtml+xml,...` so
+	// the substring check is sufficient.
+	lower := strings.ToLower(accept)
+	htmlIdx := strings.Index(lower, "text/html")
+	if htmlIdx < 0 {
+		return false
+	}
+	jsonIdx := strings.Index(lower, "application/json")
+	if jsonIdx >= 0 && jsonIdx < htmlIdx {
+		return false
+	}
+	return true
 }
 
 func (h *Handler) cacheEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -439,39 +630,103 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	const endpoint = "chat_completions"
+	const endpoint = chatCompletionEndpoint
+	ctx := r.Context()
+	receivedAt := time.Now()
 
 	var requestPayload chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&requestPayload); err != nil {
+		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "bad_request", "request rejected",
+			"status", http.StatusBadRequest,
+			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
+		)
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v\n", err))
 		return
 	}
 
 	if len(requestPayload.Messages) == 0 {
+		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "missing_messages", "request rejected",
+			"status", http.StatusBadRequest,
+			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
+		)
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusBadRequest, "missing messages\n")
 		return
 	}
 
-	release, queueWait, ok := h.acquireRequestSlot(r.Context(), r.URL.RequestURI())
+	// Parse DSL before scheduler admission so directive families are
+	// available on rejection paths too. Parsing has no side effects beyond
+	// stripping the DSL tokens from message contents.
+	h.configMu.RLock()
+	dslDraw := h.jitterSource
+	dslProfiles := h.dslProfiles
+	dslDefaultProfile := h.dslDefaultProfile
+	h.configMu.RUnlock()
+	cleanedMessages, replayDSL := parseDSLWithDefaultProfile(requestPayload.Messages, dslDraw, dslProfiles, dslDefaultProfile)
+	requestPayload.Messages = cleanedMessages
+	dslFamily := dslFamilies(replayDSL.directives)
+	if replayDSL.active() {
+		h.emitLifecycleEvent(ctx, slog.LevelInfo, "dsl_applied", "", "replay DSL applied",
+			"directives", strings.Join(replayDSL.directives, " "),
+		)
+		if h.metrics != nil {
+			for _, d := range replayDSL.directives {
+				h.metrics.observeDSLDirective(endpoint, d)
+			}
+		}
+	}
+	if replayDSL.maxTokensOverride > 0 {
+		requestPayload.MaxTokens = replayDSL.maxTokensOverride
+	}
+
+	mode := modeLabel(requestPayload.Stream)
+	requestedMaxTokens := requestPayload.MaxTokens
+
+	release, queueWait, ok := h.acquireRequestSlot(ctx, r.URL.RequestURI())
 	if !ok {
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
+		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
+		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "over_capacity", "request rejected",
+			"status", http.StatusTooManyRequests,
+			"mode", mode,
+			"max_tokens", requestedMaxTokens,
+			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
+		)
 		markCacheHit(w, false)
 		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
 		return
 	}
 	defer release()
-	mode := modeLabel(requestPayload.Stream)
 	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
 	if queueWait > 0 {
 		h.metrics.observeQueueWait(endpoint, queueWait)
 	}
 	processingStartedAt := time.Now()
+	h.emitLifecycleEvent(ctx, slog.LevelInfo, "started", "", "request started",
+		"mode", mode,
+		"max_tokens", requestedMaxTokens,
+		"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
+	)
 
-	requestPayload, err := h.populateChatCompletionDefaults(r.Context(), requestPayload)
+	emitCompleted := func(level slog.Level, outcome, source string, status int, promptTokens, completionTokens int) {
+		h.emitLifecycleEvent(ctx, level, "completed", outcome, "request completed",
+			"source", source,
+			"mode", mode,
+			"status", status,
+			"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
+			"duration_ms", float64(time.Since(processingStartedAt))/float64(time.Millisecond),
+			"prompt_tokens", promptTokens,
+			"completion_tokens", completionTokens,
+			"max_tokens", requestPayload.MaxTokens,
+		)
+	}
+
+	requestPayload, err := h.populateChatCompletionDefaults(ctx, requestPayload)
 	if err != nil {
 		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
+		emitCompleted(slog.LevelInfo, "failed", "downstream", http.StatusBadGateway, 0, 0)
 		markCacheHit(w, false)
 		http.Error(w, fmt.Sprintf("prepare chat completion: %v", err), http.StatusBadGateway)
 		return
@@ -480,29 +735,80 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	cacheKey, err := buildChatCompletionCacheKey(requestPayload)
 	if err != nil {
 		h.metrics.observeJob(endpoint, "failed", "none", mode, time.Since(processingStartedAt))
+		h.metrics.observeDSLJobDuration(endpoint, "none", "failed", dslFamily, time.Since(processingStartedAt))
+		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
+		emitCompleted(slog.LevelInfo, "failed", "none", http.StatusInternalServerError, 0, 0)
 		markCacheHit(w, false)
 		http.Error(w, fmt.Sprintf("cache chat completion request: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if h.cache != nil {
+	if h.cache != nil && !replayDSL.noCache {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			h.metrics.observeCacheLookup(endpoint, "hit")
 			markCacheHit(w, true)
 			completionTokens := cachedResponseCompletionTokens(cachedResponse)
-			timedWriter := newFirstByteMetricsWriter(w, func() {
-				h.metrics.observeTimeToFirstByte(endpoint, "cache", modeLabel(cachedResponse.streaming), time.Since(processingStartedAt))
-			})
-			if cachedResponse.streaming {
-				h.replayCachedStream(r.Context(), timedWriter, cachedResponse)
-				h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
-				h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(true), time.Since(processingStartedAt))
+			promptTokens := cachedResponsePromptTokens(cachedResponse)
+			if promptTokens <= 0 {
+				promptTokens = estimatePromptTokensFromRequest(requestPayload)
+			}
+			cachedSource := "cache"
+			cachedMode := mode
+
+			prefillDelay, prefillErr := h.simulatePrefillDelay(ctx, promptTokens, replayDSL)
+			if prefillDelay > 0 {
+				h.metrics.observePrefillDuration(endpoint, cachedSource, prefillDelay)
+				h.emitLifecycleEvent(ctx, slog.LevelInfo, "prefill", "", "prefill simulated",
+					"source", cachedSource,
+					"mode", cachedMode,
+					"prompt_tokens", promptTokens,
+					"prefill_ms", float64(prefillDelay)/float64(time.Millisecond),
+				)
+			}
+			if prefillErr != nil {
+				h.metrics.observeJob(endpoint, "failed", "cache", mode, time.Since(processingStartedAt))
+				h.metrics.observeDSLJobDuration(endpoint, "cache", "failed", dslFamily, time.Since(processingStartedAt))
+				h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
+				emitCompleted(slog.LevelInfo, "failed", "cache", http.StatusServiceUnavailable, promptTokens, 0)
 				return
 			}
 
-			h.replayCachedResponse(r.Context(), timedWriter, cachedResponse)
+			timedWriter := newFirstByteMetricsWriter(w, func() {
+				ttfb := time.Since(processingStartedAt)
+				h.metrics.observeTimeToFirstByte(endpoint, cachedSource, cachedMode, ttfb)
+				h.metrics.observeDSLTimeToFirstByte(endpoint, cachedSource, dslFamily, ttfb)
+				h.emitLifecycleEvent(ctx, slog.LevelInfo, "first_token", "", "first token emitted",
+					"source", cachedSource,
+					"mode", cachedMode,
+					"ttfb_ms", float64(ttfb)/float64(time.Millisecond),
+				)
+			})
+			replay := replayOptions{
+				maxTokens:    requestPayload.MaxTokens,
+				includeUsage: requestPayload.StreamOptions != nil && requestPayload.StreamOptions.IncludeUsage,
+				stream:       requestPayload.Stream,
+				overrides:    replayDSL,
+			}
+			if requestPayload.Stream {
+				h.replayCachedStream(ctx, timedWriter, cachedResponse, replay)
+				deliveredTokens := completionTokens
+				if replay.maxTokens > 0 && deliveredTokens > replay.maxTokens {
+					deliveredTokens = replay.maxTokens
+				}
+				h.metrics.observeCompletionTokens(endpoint, "cache", deliveredTokens)
+				h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(true), time.Since(processingStartedAt))
+				h.metrics.observeDSLJobDuration(endpoint, "cache", "completed", dslFamily, time.Since(processingStartedAt))
+				h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
+				emitCompleted(slog.LevelInfo, "completed", "cache", cachedResponse.statusCode, promptTokens, deliveredTokens)
+				return
+			}
+
+			h.replayCachedResponse(ctx, timedWriter, cachedResponse, replay)
 			h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
 			h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(false), time.Since(processingStartedAt))
+			h.metrics.observeDSLJobDuration(endpoint, "cache", "completed", dslFamily, time.Since(processingStartedAt))
+			h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
+			emitCompleted(slog.LevelInfo, "completed", "cache", cachedResponse.statusCode, promptTokens, completionTokens)
 			return
 		}
 		h.metrics.observeCacheLookup(endpoint, "miss")
@@ -510,15 +816,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	markCacheHit(w, false)
 	timedWriter := newFirstByteMetricsWriter(w, func() {
-		h.metrics.observeTimeToFirstByte(endpoint, "downstream", mode, time.Since(processingStartedAt))
+		ttfb := time.Since(processingStartedAt)
+		h.metrics.observeTimeToFirstByte(endpoint, "downstream", mode, ttfb)
+		h.metrics.observeDSLTimeToFirstByte(endpoint, "downstream", dslFamily, ttfb)
+		h.emitLifecycleEvent(ctx, slog.LevelInfo, "first_token", "", "first token emitted",
+			"source", "downstream",
+			"mode", mode,
+			"ttfb_ms", float64(ttfb)/float64(time.Millisecond),
+		)
 	})
 
 	if requestPayload.Stream {
 		downstreamStartedAt := time.Now()
-		cachedResponse, err := h.streamChatCompletion(r.Context(), timedWriter, requestPayload)
+		cachedResponse, err := h.streamChatCompletion(ctx, timedWriter, requestPayload)
 		h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 		if err != nil {
 			h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+			h.metrics.observeDSLJobDuration(endpoint, "downstream", "failed", dslFamily, time.Since(processingStartedAt))
+			h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
+			emitCompleted(slog.LevelInfo, "failed", "downstream", http.StatusBadGateway, 0, 0)
 			http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 			return
 		}
@@ -526,16 +842,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cache != nil {
 			h.cache.Add(cacheKey, cachedResponse)
 		}
-		h.metrics.observeCompletionTokens(endpoint, "downstream", cachedResponseCompletionTokens(cachedResponse))
+		completionTokens := cachedResponseCompletionTokens(cachedResponse)
+		promptTokens := cachedResponsePromptTokens(cachedResponse)
+		h.metrics.observeCompletionTokens(endpoint, "downstream", completionTokens)
 		h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
+		h.metrics.observeDSLJobDuration(endpoint, "downstream", "completed", dslFamily, time.Since(processingStartedAt))
+		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
+		emitCompleted(slog.LevelInfo, "completed", "downstream", cachedResponse.statusCode, promptTokens, completionTokens)
 		return
 	}
 
 	downstreamStartedAt := time.Now()
-	responseBody, statusCode, contentType, err := h.createChatCompletion(r.Context(), requestPayload)
+	responseBody, statusCode, contentType, err := h.createChatCompletion(ctx, requestPayload)
 	h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 	if err != nil {
 		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+		h.metrics.observeDSLJobDuration(endpoint, "downstream", "failed", dslFamily, time.Since(processingStartedAt))
+		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
+		emitCompleted(slog.LevelInfo, "failed", "downstream", http.StatusBadGateway, 0, 0)
 		http.Error(timedWriter, fmt.Sprintf("query downstream: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -547,8 +871,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	timedWriter.Header().Set("Content-Type", contentType)
 	timedWriter.WriteHeader(statusCode)
 	_, _ = timedWriter.Write(responseBody)
-	h.metrics.observeCompletionTokens(endpoint, "downstream", cachedJSONTokenCount(responseBody))
+	completionTokens := cachedJSONTokenCount(responseBody)
+	promptTokens := cachedJSONPromptTokens(responseBody)
+	h.metrics.observeCompletionTokens(endpoint, "downstream", completionTokens)
 	h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
+	h.metrics.observeDSLJobDuration(endpoint, "downstream", "completed", dslFamily, time.Since(processingStartedAt))
+	h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
+	emitCompleted(slog.LevelInfo, "completed", "downstream", statusCode, promptTokens, completionTokens)
 }
 
 func (h *Handler) getDefaults() askOptions {
@@ -656,6 +985,19 @@ func (h *Handler) currentConfig() runtimeConfig {
 	downstreamModel := h.downstreamModel
 	h.modelsMu.RUnlock()
 
+	h.configMu.RLock()
+	prefillRateMultiplier := h.prefillRateMultiplier
+	prefillBaseOverhead := h.prefillBaseOverhead
+	prefillJitterPercent := h.prefillJitterPercent
+	prefillMaxDuration := h.prefillMaxDuration
+	streamVariabilityPercent := h.streamVariabilityPercent
+	streamJitterPercent := h.streamJitterPercent
+	streamStallProbabilityPercent := h.streamStallProbabilityPercent
+	streamStallMin := h.streamStallMin
+	streamStallMax := h.streamStallMax
+	dslDefaultProfile := h.dslDefaultProfile
+	h.configMu.RUnlock()
+
 	return runtimeConfig{
 		ConcurrentRequests:            processingStats.ConcurrentRequests,
 		WaitingRequests:               processingStats.WaitingRequests,
@@ -673,6 +1015,16 @@ func (h *Handler) currentConfig() runtimeConfig {
 		MaxDegradation:                processingStats.MaxDegradation,
 		ComputedDegradationPercentage: processingStats.ComputedDegradationPercentage,
 		Temperature:                   defaults.temperature,
+		PrefillRateMultiplier:         prefillRateMultiplier,
+		PrefillBaseOverheadMs:         int(prefillBaseOverhead / time.Millisecond),
+		PrefillJitterPercent:          prefillJitterPercent,
+		PrefillMaxMs:                  int(prefillMaxDuration / time.Millisecond),
+		StreamVariabilityPercent:      streamVariabilityPercent,
+		StreamJitterPercent:           streamJitterPercent,
+		StreamStallProbabilityPercent: streamStallProbabilityPercent,
+		StreamStallMinMs:              int(streamStallMin / time.Millisecond),
+		StreamStallMaxMs:              int(streamStallMax / time.Millisecond),
+		DSLDefaultProfile:             dslDefaultProfile,
 	}
 }
 
@@ -783,7 +1135,10 @@ func (h *Handler) replaceCache(capacity int, entries []cacheSnapshotEntry) int {
 }
 
 func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
-	queryValues := r.URL.Query()
+	return h.applyConfigValues(r.URL.Query())
+}
+
+func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	if len(queryValues) == 0 {
 		return false, nil
 	}
@@ -849,8 +1204,8 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 		}
 		maxWaitingRequests = parsed
 	}
-	if maxWaitingRequests >= 2*maxConcurrentRequests {
-		return false, fmt.Errorf("max-waiting-requests must be less than %d", 2*maxConcurrentRequests)
+	if maxWaitingRequests > 2*maxConcurrentRequests {
+		return false, fmt.Errorf("max-waiting-requests must be ≤ %d", 2*maxConcurrentRequests)
 	}
 
 	if maxDegradationRaw := configQueryValue(queryValues, "max-degradation", "max_degradation"); maxDegradationRaw != "" {
@@ -870,6 +1225,124 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 			return false, fmt.Errorf("invalid temperature %q", temperatureRaw)
 		}
 		defaults.temperature = temperature
+	}
+
+	h.configMu.RLock()
+	prefillRateMultiplier := h.prefillRateMultiplier
+	prefillBaseOverheadMs := int(h.prefillBaseOverhead / time.Millisecond)
+	prefillJitterPercent := h.prefillJitterPercent
+	prefillMaxMs := int(h.prefillMaxDuration / time.Millisecond)
+	h.configMu.RUnlock()
+	prefillChanged := false
+
+	if raw := configQueryValue(queryValues, "prefill-rate-multiplier", "prefill_rate_multiplier"); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return false, fmt.Errorf("invalid prefill-rate-multiplier %q", raw)
+		}
+		if parsed < minPrefillRateMultiplier || parsed > maxPrefillRateMultiplier {
+			return false, fmt.Errorf("prefill-rate-multiplier must be between %g and %g", minPrefillRateMultiplier, maxPrefillRateMultiplier)
+		}
+		prefillRateMultiplier = parsed
+		prefillChanged = true
+	}
+	if raw := configQueryValue(queryValues, "prefill-base-overhead-ms", "prefill_base_overhead_ms"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid prefill-base-overhead-ms %q", raw)
+		}
+		if parsed < minPrefillBaseOverheadMs || parsed > maxPrefillBaseOverheadMs {
+			return false, fmt.Errorf("prefill-base-overhead-ms must be between %d and %d", minPrefillBaseOverheadMs, maxPrefillBaseOverheadMs)
+		}
+		prefillBaseOverheadMs = parsed
+		prefillChanged = true
+	}
+	if raw := configQueryValue(queryValues, "prefill-jitter-percent", "prefill_jitter_percent"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid prefill-jitter-percent %q", raw)
+		}
+		if parsed < minPrefillJitterPercent || parsed > maxPrefillJitterPercent {
+			return false, fmt.Errorf("prefill-jitter-percent must be between %d and %d", minPrefillJitterPercent, maxPrefillJitterPercent)
+		}
+		prefillJitterPercent = parsed
+		prefillChanged = true
+	}
+	if raw := configQueryValue(queryValues, "prefill-max-ms", "prefill_max_ms"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid prefill-max-ms %q", raw)
+		}
+		if parsed < 1 {
+			return false, fmt.Errorf("prefill-max-ms must be positive")
+		}
+		prefillMaxMs = parsed
+		prefillChanged = true
+	}
+
+	h.configMu.RLock()
+	streamVariabilityPercent := h.streamVariabilityPercent
+	streamJitterPercent := h.streamJitterPercent
+	streamStallProbabilityPercent := h.streamStallProbabilityPercent
+	streamStallMinMs := int(h.streamStallMin / time.Millisecond)
+	streamStallMaxMs := int(h.streamStallMax / time.Millisecond)
+	h.configMu.RUnlock()
+	streamChanged := false
+
+	if raw := configQueryValue(queryValues, "stream-variability-percent", "stream_variability_percent"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid stream-variability-percent %q", raw)
+		}
+		if parsed < minStreamVariabilityPercent || parsed > maxStreamVariabilityPercent {
+			return false, fmt.Errorf("stream-variability-percent must be between %d and %d", minStreamVariabilityPercent, maxStreamVariabilityPercent)
+		}
+		streamVariabilityPercent = parsed
+		streamChanged = true
+	}
+	if raw := configQueryValue(queryValues, "stream-jitter-percent", "stream_jitter_percent"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid stream-jitter-percent %q", raw)
+		}
+		if parsed < minStreamJitterPercent || parsed > maxStreamJitterPercent {
+			return false, fmt.Errorf("stream-jitter-percent must be between %d and %d", minStreamJitterPercent, maxStreamJitterPercent)
+		}
+		streamJitterPercent = parsed
+		streamChanged = true
+	}
+	if raw := configQueryValue(queryValues, "stream-stall-probability-percent", "stream_stall_probability_percent"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid stream-stall-probability-percent %q", raw)
+		}
+		if parsed < minStreamStallProbabilityPercent || parsed > maxStreamStallProbabilityPercent {
+			return false, fmt.Errorf("stream-stall-probability-percent must be between %d and %d", minStreamStallProbabilityPercent, maxStreamStallProbabilityPercent)
+		}
+		streamStallProbabilityPercent = parsed
+		streamChanged = true
+	}
+	if raw := configQueryValue(queryValues, "stream-stall-min-ms", "stream_stall_min_ms"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid stream-stall-min-ms %q", raw)
+		}
+		if parsed < minStreamStallMs || parsed > maxStreamStallMs {
+			return false, fmt.Errorf("stream-stall-min-ms must be between %d and %d", minStreamStallMs, maxStreamStallMs)
+		}
+		streamStallMinMs = parsed
+		streamChanged = true
+	}
+	if raw := configQueryValue(queryValues, "stream-stall-max-ms", "stream_stall_max_ms"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid stream-stall-max-ms %q", raw)
+		}
+		if parsed < minStreamStallMs || parsed > maxStreamStallMs {
+			return false, fmt.Errorf("stream-stall-max-ms must be between %d and %d", minStreamStallMs, maxStreamStallMs)
+		}
+		streamStallMaxMs = parsed
+		streamChanged = true
 	}
 
 	cacheSize, _ := h.cacheStats()
@@ -899,6 +1372,24 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 		downstreamModel = downstreamModelRaw
 	}
 
+	// dsl-profile uses Has(...) rather than the value-presence helper so an
+	// explicit `?dsl-profile=` (empty value) clears the default. Validate
+	// against the currently loaded profile map before committing.
+	dslProfileChanged := false
+	dslProfileNew := ""
+	if queryValues.Has("dsl-profile") || queryValues.Has("dsl_profile") {
+		dslProfileChanged = true
+		dslProfileNew = configQueryValue(queryValues, "dsl-profile", "dsl_profile")
+		if dslProfileNew != "" {
+			h.configMu.RLock()
+			_, ok := h.dslProfiles[strings.ToLower(strings.TrimSpace(dslProfileNew))]
+			h.configMu.RUnlock()
+			if !ok {
+				return false, fmt.Errorf("unknown dsl-profile %q", dslProfileNew)
+			}
+		}
+	}
+
 	h.configMu.Lock()
 	h.defaults = defaults
 	h.configMu.Unlock()
@@ -907,6 +1398,16 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.SetDownstreamToken(downstreamToken)
 	h.SetDownstreamModel(downstreamModel)
 	h.SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRequests, maxWaitingRequests, maxDegradation)
+	if prefillChanged {
+		h.SetPrefillSimulation(prefillRateMultiplier, prefillBaseOverheadMs, prefillJitterPercent, prefillMaxMs)
+	}
+	if streamChanged {
+		h.SetStreamRealism(streamVariabilityPercent, streamJitterPercent, streamStallProbabilityPercent, streamStallMinMs, streamStallMaxMs)
+	}
+	if dslProfileChanged {
+		// Validation already passed above; ignore the error path.
+		_ = h.SetDSLDefaultProfile(dslProfileNew)
+	}
 	updatedMaxConcurrentRequests, updatedConcurrentRequests, updatedMaxWaitingRequests, updatedWaitingRequests := h.RequestQueueStats()
 	if updatedMaxConcurrentRequests != previousMaxConcurrentRequests || updatedMaxWaitingRequests != previousMaxWaitingRequests {
 		slog.Info(
@@ -965,10 +1466,7 @@ type chatCompletionMessage struct {
 }
 
 type chatCompletionCacheKey struct {
-	Messages    []chatCompletionMessage `json:"messages"`
-	Temperature float64                 `json:"temperature"`
-	MaxTokens   int                     `json:"max_tokens"`
-	Stream      bool                    `json:"stream"`
+	Messages []chatCompletionMessage `json:"messages"`
 }
 
 func (h *Handler) fetchModel(ctx context.Context) (string, error) {
@@ -1104,6 +1602,12 @@ func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWrite
 		return cachedVLLMResponse{}, fmt.Errorf("build chat request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	// Disable transparent gzip on the upstream SSE stream. Go's default
+	// transport advertises Accept-Encoding: gzip and decodes inline, but
+	// gzip block boundaries buffer multiple SSE chunks together, which
+	// destroys per-token TTFT. Asking for identity guarantees vLLM emits
+	// the same wire bytes our reader hands to the client.
+	request.Header.Set("Accept-Encoding", "identity")
 	h.applyDownstreamAuth(request)
 
 	response, err := h.httpClient.Do(request)
@@ -1122,6 +1626,11 @@ func (h *Handler) streamChatCompletion(ctx context.Context, w http.ResponseWrite
 
 	contentType := contentTypeOrDefault(response.Header.Get("Content-Type"), "text/event-stream")
 	w.Header().Set("Content-Type", contentType)
+	// SSE anti-buffering hints: disable client/intermediary caches and
+	// disable nginx response buffering so each chunk reaches the client
+	// as it is written.
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(response.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -1176,12 +1685,17 @@ func (h *Handler) populateChatCompletionDefaults(ctx context.Context, requestPay
 }
 
 func buildChatCompletionCacheKey(requestPayload chatCompletionRequest) (string, error) {
-	requestBody, err := json.Marshal(chatCompletionCacheKey{
-		Messages:    requestPayload.Messages,
-		Temperature: requestPayload.Temperature,
-		MaxTokens:   requestPayload.MaxTokens,
-		Stream:      requestPayload.Stream,
-	})
+	filtered := make([]chatCompletionMessage, 0, len(requestPayload.Messages))
+	for _, message := range requestPayload.Messages {
+		if message.Role == "system" {
+			continue
+		}
+		filtered = append(filtered, chatCompletionMessage{
+			Role:    message.Role,
+			Content: normalizeCacheKeyContent(message.Content),
+		})
+	}
+	requestBody, err := json.Marshal(chatCompletionCacheKey{Messages: filtered})
 	if err != nil {
 		return "", fmt.Errorf("marshal chat completion cache key: %w", err)
 	}
@@ -1190,37 +1704,471 @@ func buildChatCompletionCacheKey(requestPayload chatCompletionRequest) (string, 
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
-	w.Header().Set("Content-Type", contentTypeOrDefault(cachedResponse.contentType, "text/event-stream"))
+// normalizeCacheKeyContent reduces a message's content to a fuzzy canonical
+// form so semantically-equivalent prompts collapse to the same cache key:
+//   - lowercased
+//   - punctuation and symbols stripped (Unicode-aware)
+//   - tokens split on whitespace
+//   - English stop words removed
+//   - remaining tokens sorted and space-joined
+func normalizeCacheKeyContent(content string) string {
+	lowered := strings.ToLower(content)
+	var b strings.Builder
+	b.Grow(len(lowered))
+	for _, r := range lowered {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+			b.WriteRune(r)
+		case unicode.IsSpace(r):
+			b.WriteRune(' ')
+		default:
+			// drop punctuation, symbols, control characters
+			b.WriteRune(' ')
+		}
+	}
+	fields := strings.Fields(b.String())
+	tokens := fields[:0]
+	for _, f := range fields {
+		if _, isStop := cacheKeyStopWords[f]; isStop {
+			continue
+		}
+		tokens = append(tokens, f)
+	}
+	sort.Strings(tokens)
+	return strings.Join(tokens, " ")
+}
+
+// cacheKeyStopWords is a compact English stop-word set used only for
+// computing fuzzy cache keys. Keep it short and stable; changing this set
+// invalidates existing cache entries.
+var cacheKeyStopWords = map[string]struct{}{
+	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {},
+	"be": {}, "but": {}, "by": {},
+	"can": {}, "could": {},
+	"did": {}, "do": {}, "does": {},
+	"for": {}, "from": {},
+	"had": {}, "has": {}, "have": {}, "he": {}, "her": {}, "hers": {}, "him": {}, "his": {}, "how": {},
+	"i": {}, "if": {}, "in": {}, "into": {}, "is": {}, "it": {}, "its": {},
+	"just": {},
+	"me": {}, "my": {},
+	"no": {}, "not": {},
+	"of": {}, "on": {}, "or": {}, "our": {}, "ours": {},
+	"please": {},
+	"she": {}, "should": {}, "so": {},
+	"than": {}, "that": {}, "the": {}, "their": {}, "them": {}, "then": {}, "there": {}, "these": {}, "they": {}, "this": {}, "those": {}, "to": {},
+	"us":  {},
+	"was": {}, "we": {}, "were": {}, "what": {}, "when": {}, "where": {}, "which": {}, "who": {}, "why": {}, "will": {}, "with": {}, "would": {},
+	"you": {}, "your": {}, "yours": {},
+}
+
+type replayOptions struct {
+	maxTokens    int
+	includeUsage bool
+	stream       bool
+	overrides    replayOverrides
+}
+
+func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, opts replayOptions) {
+	w.Header().Set("Content-Type", contentTypeOrDefault("text/event-stream", "text/event-stream"))
+	// Match the live-stream path's anti-buffering hints so cache replays
+	// flush per-token to the client too.
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(cachedResponse.statusCode)
 
 	flusher, _ := w.(http.Flusher)
 	streamID := newChatCompletionID()
 	createdAt := time.Now().UnixMilli()
-	segments := parseCachedStreamReplaySegments(cachedResponse.body)
 
+	var segments []replayStreamSegment
+	if cachedResponse.streaming {
+		segments = parseCachedStreamReplaySegments(cachedResponse.body)
+	} else {
+		segments = synthesizeStreamSegmentsFromJSON(cachedResponse.body)
+	}
+
+	contentEmitted := 0
 	for _, segment := range segments {
-		if err := h.throttleCachedReplay(ctx, segment.tokenCount); err != nil {
+		kind := classifyStreamSegment(segment.line)
+		switch kind {
+		case streamSegmentKindContent:
+			if opts.maxTokens > 0 && contentEmitted > 0 && contentEmitted+segment.tokenCount > opts.maxTokens {
+				continue
+			}
+			contentEmitted += segment.tokenCount
+		case streamSegmentKindFinish:
+			// always emit finish chunk
+		case streamSegmentKindUsage:
+			// Skip cached usage chunks; we synthesize one below so completion_tokens
+			// reflects what was actually delivered (truncation may have occurred).
+			continue
+		case streamSegmentKindDone:
+			// Defer [DONE] until after the synthesized usage chunk.
+			continue
+		}
+
+		if len(segment.line) == 0 {
+			continue
+		}
+		rewritten := rewriteSSEDataLine(segment.line, true, streamID, createdAt)
+		_, _ = w.Write(rewritten)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		// Throttle AFTER emitting the chunk, not before. This matches the
+		// timing of a real LLM stream: prefill delay covers the time to the
+		// first token (handled separately by simulatePrefillDelay before the
+		// replay loop starts), and the per-segment decode delay paces the
+		// gap between consecutive chunks. Throttling before the first
+		// content write would double-count prefill and inflate TTFT
+		// proportional to however many tokens happened to be packed into
+		// the first cached SSE chunk.
+		if err := h.throttleStreamSegment(ctx, segment.tokenCount, opts.overrides); err != nil {
 			return
 		}
-		if len(segment.line) > 0 {
-			rewritten := rewriteSSEDataLine(segment.line, true, streamID, createdAt)
-			_, _ = w.Write(rewritten)
+	}
+
+	// Emit a usage segment when the client asked for it, with completion_tokens
+	// reflecting the actual number of tokens delivered after any truncation.
+	if opts.includeUsage {
+		promptTokens := cachedResponsePromptTokens(cachedResponse)
+		usagePayload := map[string]any{
+			"id":      streamID,
+			"object":  "chat.completion.chunk",
+			"created": createdAt,
+			"choices": []any{},
+			"usage": map[string]any{
+				"prompt_tokens":     promptTokens,
+				"completion_tokens": contentEmitted,
+				"total_tokens":      promptTokens + contentEmitted,
+			},
+			"cache": true,
+		}
+		if line := encodeSSELine(usagePayload); line != nil {
+			_, _ = w.Write(line)
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 	}
+
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
-func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse) {
-	body := rewriteJSONCacheField(cachedResponse.body, true)
-	if err := h.throttleCachedReplay(ctx, cachedJSONTokenCount(cachedResponse.body)); err != nil {
+func (h *Handler) replayCachedResponse(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, opts replayOptions) {
+	body, contentType := canonicalJSONResponse(cachedResponse)
+	body = rewriteJSONCacheField(body, true)
+
+	pacingTokens := cachedJSONTokenCount(body)
+	if opts.maxTokens > 0 && pacingTokens > opts.maxTokens {
+		pacingTokens = opts.maxTokens
+	}
+	if err := h.throttleCachedReplay(ctx, pacingTokens, opts.overrides); err != nil {
 		return
 	}
-	w.Header().Set("Content-Type", cachedResponse.contentType)
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(cachedResponse.statusCode)
 	_, _ = w.Write(body)
+}
+
+type streamSegmentKind int
+
+const (
+	streamSegmentKindOther streamSegmentKind = iota
+	streamSegmentKindContent
+	streamSegmentKindFinish
+	streamSegmentKindUsage
+	streamSegmentKindDone
+)
+
+func classifyStreamSegment(line []byte) streamSegmentKind {
+	trimmed := bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return streamSegmentKindOther
+	}
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return streamSegmentKindDone
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return streamSegmentKindOther
+	}
+	if chunk.Usage != nil && len(chunk.Choices) == 0 {
+		return streamSegmentKindUsage
+	}
+	for _, choice := range chunk.Choices {
+		if choice.Delta.Content != "" {
+			return streamSegmentKindContent
+		}
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			return streamSegmentKindFinish
+		}
+	}
+	return streamSegmentKindOther
+}
+
+func synthesizeStreamSegmentsFromJSON(body []byte) []replayStreamSegment {
+	var response struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || len(response.Choices) == 0 {
+		return nil
+	}
+	role := response.Choices[0].Message.Role
+	if role == "" {
+		role = "assistant"
+	}
+	finishReason := response.Choices[0].FinishReason
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	completionTokens := response.Usage.CompletionTokens
+	if completionTokens <= 0 {
+		completionTokens = estimateTextTokens(response.Choices[0].Message.Content)
+	}
+	if completionTokens <= 0 {
+		completionTokens = 1
+	}
+
+	segments := make([]replayStreamSegment, 0, completionTokens+4)
+	roleLine := encodeSSELine(map[string]any{
+		"object": "chat.completion.chunk",
+		"model":  response.Model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{"role": role},
+			"finish_reason": nil,
+		}},
+	})
+	if roleLine != nil {
+		segments = append(segments, replayStreamSegment{line: roleLine, tokenCount: 0})
+	}
+
+	contentChunks := splitContentByCount(response.Choices[0].Message.Content, completionTokens)
+	for _, chunk := range contentChunks {
+		line := encodeSSELine(map[string]any{
+			"object": "chat.completion.chunk",
+			"model":  response.Model,
+			"choices": []any{map[string]any{
+				"index":         0,
+				"delta":         map[string]any{"content": chunk},
+				"finish_reason": nil,
+			}},
+		})
+		if line == nil {
+			continue
+		}
+		segments = append(segments, replayStreamSegment{line: line, tokenCount: 1})
+	}
+
+	finishLine := encodeSSELine(map[string]any{
+		"object": "chat.completion.chunk",
+		"model":  response.Model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": finishReason,
+		}},
+	})
+	if finishLine != nil {
+		segments = append(segments, replayStreamSegment{line: finishLine, tokenCount: 0})
+	}
+
+	usageLine := encodeSSELine(map[string]any{
+		"object":  "chat.completion.chunk",
+		"model":   response.Model,
+		"choices": []any{},
+		"usage": map[string]any{
+			"prompt_tokens":     response.Usage.PromptTokens,
+			"completion_tokens": response.Usage.CompletionTokens,
+			"total_tokens":      response.Usage.TotalTokens,
+		},
+	})
+	if usageLine != nil {
+		segments = append(segments, replayStreamSegment{line: usageLine, tokenCount: 0})
+	}
+
+	segments = append(segments, replayStreamSegment{line: []byte("data: [DONE]\n\n"), tokenCount: 0})
+	return segments
+}
+
+func splitContentByCount(content string, count int) []string {
+	if count <= 0 {
+		return nil
+	}
+	runes := []rune(content)
+	if len(runes) == 0 {
+		out := make([]string, count)
+		for i := range out {
+			out[i] = ""
+		}
+		return out
+	}
+	if count >= len(runes) {
+		out := make([]string, len(runes))
+		for i, r := range runes {
+			out[i] = string(r)
+		}
+		return out
+	}
+	out := make([]string, count)
+	base := len(runes) / count
+	extra := len(runes) % count
+	pos := 0
+	for i := 0; i < count; i++ {
+		size := base
+		if i < extra {
+			size++
+		}
+		out[i] = string(runes[pos : pos+size])
+		pos += size
+	}
+	return out
+}
+
+func encodeSSELine(payload map[string]any) []byte {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	out := make([]byte, 0, len(encoded)+10)
+	out = append(out, []byte("data: ")...)
+	out = append(out, encoded...)
+	out = append(out, []byte("\n\n")...)
+	return out
+}
+
+func canonicalJSONResponse(cachedResponse cachedVLLMResponse) ([]byte, string) {
+	if !cachedResponse.streaming {
+		return cachedResponse.body, contentTypeOrDefault(cachedResponse.contentType, "application/json")
+	}
+	body := convertSSEToChatCompletionJSON(cachedResponse.body)
+	return body, "application/json"
+}
+
+func convertSSEToChatCompletionJSON(body []byte) []byte {
+	reader := bytes.NewReader(body)
+	contentBuilder := strings.Builder{}
+	model := ""
+	id := ""
+	created := int64(0)
+	finishReason := "stop"
+	role := "assistant"
+	var promptTokens, completionTokens, totalTokens int
+	for {
+		line, err := readSSELine(reader)
+		if len(line) > 0 {
+			trimmed := bytes.TrimRight(line, "\r\n")
+			if bytes.HasPrefix(trimmed, []byte("data: ")) {
+				payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+				if !bytes.Equal(payload, []byte("[DONE]")) {
+					var chunk struct {
+						ID      string `json:"id"`
+						Created int64  `json:"created"`
+						Model   string `json:"model"`
+						Choices []struct {
+							Delta struct {
+								Role    string `json:"role"`
+								Content string `json:"content"`
+							} `json:"delta"`
+							FinishReason *string `json:"finish_reason"`
+						} `json:"choices"`
+						Usage *struct {
+							PromptTokens     int `json:"prompt_tokens"`
+							CompletionTokens int `json:"completion_tokens"`
+							TotalTokens      int `json:"total_tokens"`
+						} `json:"usage"`
+					}
+					if jsonErr := json.Unmarshal(payload, &chunk); jsonErr == nil {
+						if chunk.ID != "" {
+							id = chunk.ID
+						}
+						if chunk.Created != 0 {
+							created = chunk.Created
+						}
+						if chunk.Model != "" {
+							model = chunk.Model
+						}
+						for _, choice := range chunk.Choices {
+							if choice.Delta.Role != "" {
+								role = choice.Delta.Role
+							}
+							if choice.Delta.Content != "" {
+								contentBuilder.WriteString(choice.Delta.Content)
+							}
+							if choice.FinishReason != nil && *choice.FinishReason != "" {
+								finishReason = *choice.FinishReason
+							}
+						}
+						if chunk.Usage != nil {
+							promptTokens = chunk.Usage.PromptTokens
+							completionTokens = chunk.Usage.CompletionTokens
+							totalTokens = chunk.Usage.TotalTokens
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if id == "" {
+		id = newChatCompletionID()
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	out := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index": 0,
+			"message": map[string]any{
+				"role":    role,
+				"content": contentBuilder.String(),
+			},
+			"finish_reason": finishReason,
+		}},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      totalTokens,
+		},
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return encoded
 }
 
 func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), time.Duration, bool) {
@@ -1241,18 +2189,45 @@ func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), 
 	}, queueWait, true
 }
 
-func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int) error {
+func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int, overrides replayOverrides) error {
 	if tokenCount < 1 {
 		return nil
 	}
-	if delay := h.cachedReplayDelay(tokenCount); delay > 0 {
-		return h.sleep(ctx, delay)
+	delay := h.cachedReplayDelay(tokenCount, overrides)
+	if delay <= 0 {
+		return nil
 	}
-	return nil
+	if overrides.delayScaleFn != nil {
+		delay = time.Duration(float64(delay) * overrides.delayScaleFn())
+		if delay < 0 {
+			delay = 0
+		}
+	}
+	if delay <= 0 {
+		return nil
+	}
+	return h.sleep(ctx, delay)
 }
 
-func (h *Handler) cachedReplayDelay(tokenCount int) time.Duration {
+func (h *Handler) throttleStreamSegment(ctx context.Context, tokenCount int, overrides replayOverrides) error {
 	if tokenCount < 1 {
+		return nil
+	}
+	delay, stall := h.computeStreamSegmentDelay(tokenCount, overrides)
+	if delay <= 0 {
+		return nil
+	}
+	if stall > 0 && h.metrics != nil {
+		h.metrics.observeStreamStall(chatCompletionsRouteLabel, "cache", stall)
+	}
+	return h.sleep(ctx, delay)
+}
+
+func (h *Handler) cachedReplayDelay(tokenCount int, overrides replayOverrides) time.Duration {
+	if tokenCount < 1 {
+		return 0
+	}
+	if overrides.noTPS {
 		return 0
 	}
 
@@ -1261,6 +2236,10 @@ func (h *Handler) cachedReplayDelay(tokenCount int) time.Duration {
 	maxDegradation := h.maxDegradation
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
+
+	if overrides.tpsOverride > 0 {
+		baseTokensPerSecond = overrides.tpsOverride
+	}
 
 	effectiveTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
 	if baseTokensPerSecond == 0 {
@@ -1290,6 +2269,216 @@ func sleepWithContext(ctx context.Context, duration time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// defaultJitterSource returns a uniform float64 in [-1.0, 1.0).
+func defaultJitterSource() float64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	// Convert 8 random bytes to a uniform [0, 1) float, then map to [-1, 1).
+	u := binary.BigEndian.Uint64(b[:]) >> 11 // 53 bits of mantissa precision
+	f := float64(u) / float64(uint64(1)<<53)
+	return f*2 - 1
+}
+
+// SetPrefillSimulation configures the simulated prefill latency model used on
+// cache hits. The effective prefill rate is rateMultiplier * max-tokens-per-second.
+// A rateMultiplier of 0 disables prefill simulation entirely.
+func (h *Handler) SetPrefillSimulation(rateMultiplier float64, baseOverheadMs, jitterPercent, maxMs int) {
+	if rateMultiplier < minPrefillRateMultiplier || rateMultiplier > maxPrefillRateMultiplier {
+		rateMultiplier = defaultPrefillRateMultiplier
+	}
+	if baseOverheadMs < minPrefillBaseOverheadMs || baseOverheadMs > maxPrefillBaseOverheadMs {
+		baseOverheadMs = defaultPrefillBaseOverheadMs
+	}
+	if jitterPercent < minPrefillJitterPercent || jitterPercent > maxPrefillJitterPercent {
+		jitterPercent = defaultPrefillJitterPercent
+	}
+	if maxMs < 1 {
+		maxMs = defaultPrefillMaxMs
+	}
+
+	h.configMu.Lock()
+	h.prefillRateMultiplier = rateMultiplier
+	h.prefillBaseOverhead = time.Duration(baseOverheadMs) * time.Millisecond
+	h.prefillJitterPercent = jitterPercent
+	h.prefillMaxDuration = time.Duration(maxMs) * time.Millisecond
+	h.configMu.Unlock()
+}
+
+// computePrefillDelay returns the simulated prefill latency for the given
+// prompt token count. A return of 0 means prefill simulation is disabled.
+func (h *Handler) computePrefillDelay(promptTokens int, overrides replayOverrides) time.Duration {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if overrides.noPrefill {
+		return 0
+	}
+
+	h.configMu.RLock()
+	rateMultiplier := h.prefillRateMultiplier
+	base := h.prefillBaseOverhead
+	jitterPercent := h.prefillJitterPercent
+	maxDuration := h.prefillMaxDuration
+	baseTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	jitterSource := h.jitterSource
+	h.configMu.RUnlock()
+
+	if overrides.tpsOverride > 0 {
+		baseTokensPerSecond = overrides.tpsOverride
+	}
+
+	if rateMultiplier <= 0 || baseTokensPerSecond <= 0 {
+		return 0
+	}
+
+	effectiveDecodeRate := calibratedTokensPerSecond(baseTokensPerSecond)
+	if scheduler != nil {
+		effectiveDecodeRate = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
+	}
+	prefillRate := effectiveDecodeRate * rateMultiplier
+	if prefillRate <= 0 {
+		return 0
+	}
+
+	delay := base + time.Duration(float64(promptTokens)/prefillRate*float64(time.Second))
+	if jitterPercent > 0 && jitterSource != nil {
+		j := jitterSource() // [-1, 1)
+		delay = time.Duration(float64(delay) * (1 + j*float64(jitterPercent)/100))
+	}
+	if overrides.prefillDurationScale > 0 && overrides.prefillDurationScale != 1 {
+		delay = time.Duration(float64(delay) * overrides.prefillDurationScale)
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	if maxDuration > 0 && delay > maxDuration {
+		delay = maxDuration
+	}
+	return delay
+}
+
+func (h *Handler) simulatePrefillDelay(ctx context.Context, promptTokens int, overrides replayOverrides) (time.Duration, error) {
+	delay := h.computePrefillDelay(promptTokens, overrides)
+	if delay <= 0 {
+		return 0, nil
+	}
+	if err := h.sleep(ctx, delay); err != nil {
+		return delay, err
+	}
+	return delay, nil
+}
+
+// SetStreamRealism configures variability, jitter, and partial-stall behavior
+// applied per content segment during cached stream replay. Setting all knobs
+// to zero (or rate-multiplier-equivalent: max-tokens-per-second to 0) disables
+// stream realism beyond the base pacing model.
+func (h *Handler) SetStreamRealism(variabilityPercent, jitterPercent, stallProbabilityPercent, stallMinMs, stallMaxMs int) {
+	if variabilityPercent < minStreamVariabilityPercent || variabilityPercent > maxStreamVariabilityPercent {
+		variabilityPercent = defaultStreamVariabilityPercent
+	}
+	if jitterPercent < minStreamJitterPercent || jitterPercent > maxStreamJitterPercent {
+		jitterPercent = defaultStreamJitterPercent
+	}
+	if stallProbabilityPercent < minStreamStallProbabilityPercent || stallProbabilityPercent > maxStreamStallProbabilityPercent {
+		stallProbabilityPercent = defaultStreamStallProbabilityPercent
+	}
+	if stallMinMs < minStreamStallMs || stallMinMs > maxStreamStallMs {
+		stallMinMs = defaultStreamStallMinMs
+	}
+	if stallMaxMs < minStreamStallMs || stallMaxMs > maxStreamStallMs {
+		stallMaxMs = defaultStreamStallMaxMs
+	}
+	if stallMaxMs < stallMinMs {
+		stallMaxMs = stallMinMs
+	}
+
+	h.configMu.Lock()
+	h.streamVariabilityPercent = variabilityPercent
+	h.streamJitterPercent = jitterPercent
+	h.streamStallProbabilityPercent = stallProbabilityPercent
+	h.streamStallMin = time.Duration(stallMinMs) * time.Millisecond
+	h.streamStallMax = time.Duration(stallMaxMs) * time.Millisecond
+	h.configMu.Unlock()
+}
+
+// computeStreamSegmentDelay returns the simulated delay for one streamed
+// content segment, plus any stall added on top. The stall component is
+// returned separately so callers can record metrics distinct from the base
+// pacing delay. Returns (0, 0) when pacing is disabled (rate=0) or when the
+// segment carries no tokens.
+func (h *Handler) computeStreamSegmentDelay(tokenCount int, overrides replayOverrides) (total, stall time.Duration) {
+	if tokenCount < 1 {
+		return 0, 0
+	}
+	if overrides.noTPS {
+		return 0, 0
+	}
+	base := h.cachedReplayDelay(tokenCount, overrides)
+	if base <= 0 {
+		return 0, 0
+	}
+
+	h.configMu.RLock()
+	variabilityPercent := overrides.resolveVariabilityPercent(h.streamVariabilityPercent)
+	jitterPercent := overrides.resolveJitterPercent(h.streamJitterPercent)
+	stallProbPercent := overrides.resolveStallPercent(h.streamStallProbabilityPercent)
+	stallMin := h.streamStallMin
+	stallMax := h.streamStallMax
+	jitterSource := h.jitterSource
+	h.configMu.RUnlock()
+
+	delay := base
+	if variabilityPercent > 0 && jitterSource != nil {
+		v := jitterSource() // [-1, 1)
+		delay = time.Duration(float64(delay) * (1 + v*float64(variabilityPercent)/100))
+	}
+	if jitterPercent > 0 && jitterSource != nil {
+		j := jitterSource() // [-1, 1)
+		delay = time.Duration(float64(delay) * (1 + j*float64(jitterPercent)/100))
+	}
+	if delay < 0 {
+		delay = 0
+	}
+
+	if stallProbPercent > 0 && jitterSource != nil {
+		// jitterSource returns [-1, 1); shift to [0, 1) for the probability draw.
+		p := (jitterSource() + 1) / 2
+		if p < float64(stallProbPercent)/100 {
+			// Map a second draw into [stallMin, stallMax].
+			r := (jitterSource() + 1) / 2
+			if stallMax < stallMin {
+				stallMax = stallMin
+			}
+			stall = stallMin + time.Duration(r*float64(stallMax-stallMin))
+			delay += stall
+		}
+	}
+	if overrides.delayScaleFn != nil {
+		delay = time.Duration(float64(delay) * overrides.delayScaleFn())
+		if delay < 0 {
+			delay = 0
+		}
+	}
+	return delay, stall
+}
+
+// estimatePromptTokensFromRequest is used as a fallback when the cached
+// response does not record prompt_tokens.
+func estimatePromptTokensFromRequest(payload chatCompletionRequest) int {
+	parts := make([]string, 0, len(payload.Messages))
+	for _, m := range payload.Messages {
+		if m.Content == "" {
+			continue
+		}
+		parts = append(parts, m.Content)
+	}
+	return estimateTextTokens(strings.Join(parts, " "))
 }
 
 func (h *Handler) logComputedDegradationIfChanged(source string) {
@@ -1348,6 +2537,7 @@ type requestScheduler struct {
 	maxWaiting    int
 	inFlight      int
 	waiting       int
+	metrics       *handlerMetrics
 }
 
 type waitingRequest struct {
@@ -1357,6 +2547,7 @@ type waitingRequest struct {
 	admitted   bool
 	enqueuedAt time.Time
 	queueWait  time.Duration
+	logger     *slog.Logger
 }
 
 func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *requestScheduler {
@@ -1374,24 +2565,28 @@ func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *request
 }
 
 func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func(), time.Duration, bool) {
+	logger := loggerFromContext(ctx)
 	s.mu.Lock()
 	if s.inFlight < s.maxConcurrent {
 		s.inFlight++
-		slog.Info("request admitted", "path", path, "source", "direct", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		inFlight, maxConcurrent, waiting, maxWaiting := s.inFlight, s.maxConcurrent, s.waiting, s.maxWaiting
 		s.mu.Unlock()
+		logger.Info("admitted", "path", path, "source", "direct", "queue_wait_ms", 0.0, "concurrent_requests", inFlight, "max_concurrent_requests", maxConcurrent, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
+		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "admitted", "")
 		return s.releaseFunc(path), 0, true
 	}
 	if s.waiting >= s.maxWaiting {
-		slog.Warn("request admission rejected", "path", path, "reason", "over_capacity", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
 		s.mu.Unlock()
 		return nil, 0, false
 	}
 
-	request := &waitingRequest{path: path, ready: make(chan struct{}), enqueuedAt: time.Now()}
+	request := &waitingRequest{path: path, ready: make(chan struct{}), enqueuedAt: time.Now(), logger: logger}
 	request.element = s.queue.PushBack(request)
 	s.waiting++
-	slog.Info("request admitted", "path", path, "source", "waiting_queue", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+	inFlight, maxConcurrent, waiting, maxWaiting := s.inFlight, s.maxConcurrent, s.waiting, s.maxWaiting
 	s.mu.Unlock()
+	logger.Info("queued", "path", path, "concurrent_requests", inFlight, "max_concurrent_requests", maxConcurrent, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
+	s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "queued", "")
 
 	select {
 	case <-request.ready:
@@ -1439,7 +2634,6 @@ func (s *requestScheduler) releaseFunc(path string) func() {
 		if s.inFlight > 0 {
 			s.inFlight--
 		}
-		slog.Info("request completed", "path", path, "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
 		s.promoteWaitingLocked()
 		s.mu.Unlock()
 	}
@@ -1455,7 +2649,12 @@ func (s *requestScheduler) promoteWaitingLocked() {
 		request.queueWait = time.Since(request.enqueuedAt)
 		s.waiting--
 		s.inFlight++
-		slog.Info("request admitted", "path", request.path, "source", "waiting_to_concurrent", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		logger := request.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Info("admitted", "path", request.path, "source", "waiting_to_concurrent", "queue_wait_ms", float64(request.queueWait)/float64(time.Millisecond), "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
+		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "admitted", "")
 		close(request.ready)
 	}
 }
@@ -1595,6 +2794,62 @@ func cachedResponseCompletionTokens(cachedResponse cachedVLLMResponse) int {
 		return cachedStreamTokenCount(cachedResponse.body)
 	}
 	return cachedJSONTokenCount(cachedResponse.body)
+}
+
+func cachedJSONPromptTokens(body []byte) int {
+	var response struct {
+		Usage struct {
+			PromptTokens int `json:"prompt_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0
+	}
+	return response.Usage.PromptTokens
+}
+
+func cachedStreamPromptTokens(body []byte) int {
+	reader := bytes.NewReader(body)
+	prompt := 0
+	for {
+		line, err := readSSELine(reader)
+		if len(line) > 0 {
+			if value := inspectSSEPromptTokens(line); value > 0 {
+				prompt = value
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return prompt
+}
+
+func inspectSSEPromptTokens(line []byte) int {
+	trimmed := bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return 0
+	}
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return 0
+	}
+	var chunk struct {
+		Usage struct {
+			PromptTokens int `json:"prompt_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return 0
+	}
+	return chunk.Usage.PromptTokens
+}
+
+func cachedResponsePromptTokens(cachedResponse cachedVLLMResponse) int {
+	if cachedResponse.streaming {
+		return cachedStreamPromptTokens(cachedResponse.body)
+	}
+	return cachedJSONPromptTokens(cachedResponse.body)
 }
 
 func cachedResponseContent(cachedResponse cachedVLLMResponse) string {
@@ -1887,6 +3142,17 @@ func (w *loggingResponseWriter) Write(body []byte) (int, error) {
 	return bytesWritten, err
 }
 
+// Flush forwards to the underlying ResponseWriter when it supports
+// http.Flusher. Without this explicit method, type-assertions through
+// the wrapper chain (loggingResponseWriter -> firstByteMetricsWriter)
+// fail and SSE chunks accumulate in the server's 32 KiB write buffer
+// instead of being pushed to the client per-token.
+func (w *loggingResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func markCacheHit(w http.ResponseWriter, cacheHit bool) {
 	cacheAwareWriter, ok := w.(interface{ SetCacheHit(bool) })
 	if !ok {
@@ -1899,6 +3165,14 @@ func markCacheHit(w http.ResponseWriter, cacheHit bool) {
 func requestLogger(next http.Handler, metrics *handlerMetrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedAt := time.Now()
+
+		var requestID string
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+			requestID = resolveRequestID(r)
+			w.Header().Set(requestIDHeader, requestID)
+			r = r.WithContext(withRequestID(r.Context(), requestID))
+		}
+
 		if metrics != nil {
 			metrics.httpInflightRequests.Inc()
 			defer metrics.httpInflightRequests.Dec()
@@ -1915,14 +3189,18 @@ func requestLogger(next http.Handler, metrics *handlerMetrics) http.Handler {
 			metrics.observeHTTPRequest(routeLabel(r), r.Method, statusCode, time.Since(startedAt), responseWriter.bytes)
 		}
 
-		attrs := []any{
+		attrs := make([]any, 0, 14)
+		if requestID != "" {
+			attrs = append(attrs, requestIDLogKey, requestID)
+		}
+		attrs = append(attrs,
 			"method", r.Method,
 			"path", r.URL.RequestURI(),
 			"status", statusCode,
 			"bytes", responseWriter.bytes,
 			"cache", responseWriter.cacheHit,
-			"duration_ms", float64(time.Since(startedAt)) / float64(time.Millisecond),
-		}
+			"duration_ms", float64(time.Since(startedAt))/float64(time.Millisecond),
+		)
 
 		switch {
 		case statusCode == http.StatusNotFound:

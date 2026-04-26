@@ -1,0 +1,53 @@
+# DSL profile bundles loaded at startup by cllm.
+#
+# Each entry is `name: tokens`, where tokens is either a space-separated
+# string of DSL directives or a YAML list of directive strings. Profile
+# names are matched case-insensitively. Profiles are expanded after the
+# explicit DSL directives in the prompt, so explicit prompt directives
+# always win on conflicts (first-wins per class).
+#
+# See cllm/README.md for the full DSL grammar.
+
+# ---- Built-in style profiles ----------------------------------------------
+
+# Snappy chat: smooth stream.
+interactive: "no-stall no-jitter"
+
+# Throughput-oriented: skip prefill simulation, no stalls/jitter.
+# Useful for cache-warm benchmarks. (Equivalent to the `no-delay` macro.)
+batch: "no-delay"
+
+# Pathological streaming: bumps stall probability and jitter.
+stall-heavy: "stall=50 jitter=30 variability=20"
+
+# Slow first byte: scales prefill duration up significantly.
+prefill-heavy: "prefill=200"
+
+# ---- Speed sweeps ---------------------------------------------------------
+# Each profile shrinks (fast) or grows (slow) the per-segment delay scale
+# AND the prefill duration by a uniform random percent in the indicated
+# band. `segment=` is drawn fresh per segment; `prefill=` is drawn once
+# per request.
+
+fast:    "segment=-10:0   prefill=-10:0"     # 0-10% faster
+faster:  "segment=-25:-10 prefill=-25:-10"   # 10-25% faster
+fastest: "segment=-50:-25 prefill=-50:-25"   # 25-50% faster
+
+slow:    "segment=0:10    prefill=0:10"      # 0-10% slower
+slower:  "segment=10:25   prefill=10:25"     # 10-25% slower
+slowest: "segment=25:50   prefill=25:50"     # 25-50% slower
+
+# ---- TPS sweeps -----------------------------------------------------------
+# Pure-rate profiles: pin tokens-per-second and disable all streaming
+# realism (prefill/jitter/variability/stall) for clean throughput tests.
+# `no-delay` is a macro for `no-prefill no-jitter no-variability no-stall`.
+
+tps-16:   "no-delay tps=16"
+tps-32:   "no-delay tps=32"
+tps-64:   "no-delay tps=64"
+tps-128:  "no-delay tps=128"
+tps-256:  "no-delay tps=256"
+tps-512:  "no-delay tps=512"
+tps-1024: "no-delay tps=1024"
+tps-1536: "no-delay tps=1536"
+tps-2048: "no-delay tps=2048"

@@ -176,15 +176,15 @@ http -a admin:change-me http://vllm.local/v1/models
 
 These `http` examples are for interactive API checks. The helper script below uses `curl` and can call the local `cllm` cache service or another compatible endpoint.
 
-Send a chat completion request with [ask.sh](/home/bartr/vllm/ask.sh):
+Send a chat completion request with [scripts/ask](/home/bartr/vllm/scripts/ask):
 
 `sudo ./scripts/base.sh` installs `glow`, so the script can render Markdown responses in the terminal.
 
 ```bash
-./ask.sh
+./scripts/ask
 ```
 
-By default, `ask.sh` targets `http://localhost:8080` through `ASK_URL`, which is expected to be the local `cllm` service.
+`scripts/ask` is a thin wrapper around the Go binary at [cllm/cmd/ask](/home/bartr/vllm/cllm/cmd/ask). It runs both single-shot requests and concurrent benchmarks. By default it targets `http://localhost:8088` (the local `cllm` service); set `CLLM_URL` to point elsewhere.
 
 For an in-cluster `cllm` deployment, use the manifests in [clusters/z01/cllm](/home/bartr/vllm/clusters/z01/cllm). They deploy the local image `cllm:0.1.0` with `imagePullPolicy: Never` and expose it through a dedicated Traefik entrypoint on port `8088`.
 
@@ -209,78 +209,56 @@ Then call `cllm` through the Traefik external IP on port `8088`:
 curl -i http://192.168.68.63:8088/health
 ```
 
-If `ASK_TOKEN` is set, `ask.sh` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints.
-
-If you point `ASK_URL` at `https://api.openai.com`, set `ASK_MODEL` to a model you have access to, such as `gpt-4.1`.
+If `CLLM_TOKEN` is set, `ask` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints. If you point `CLLM_URL` at `https://api.openai.com`, set `CLLM_MODEL` to a model you have access to, such as `gpt-4.1`.
 
 You can also pass the user context directly:
 
 ```bash
-ASK_TOKEN='your-api-token' ./ask.sh "Give me three uses for an edge-hosted LLM."
+CLLM_TOKEN='your-api-token' ./scripts/ask "Give me three uses for an edge-hosted LLM."
 ```
 
 OpenAI example:
 
 ```bash
-ASK_URL='https://api.openai.com' \
-ASK_TOKEN='your-api-token' \
-ASK_MODEL='gpt-4.1' \
-./ask.sh "Give me three uses for an edge-hosted LLM."
+CLLM_URL='https://api.openai.com' \
+CLLM_TOKEN='your-api-token' \
+CLLM_MODEL='gpt-4.1' \
+./scripts/ask "Give me three uses for an edge-hosted LLM."
 ```
 
-Benchmark an OpenAI-compatible endpoint with [scripts/benchmark.sh](/home/bartr/vllm/scripts/benchmark.sh):
+Benchmark an OpenAI-compatible endpoint with the same tool:
 
 ```bash
-./scripts/benchmark.sh --concurrency 10
+./scripts/ask --bench 10 --duration 30s --prompt 'explain azure'
 ```
 
-It runs a fixed number of concurrent workers until you press `Ctrl-C` or until an optional `--duration` expires. Each completed request prints the worker thread number, returned completion tokens, TTFT, request duration, per-request tokens/sec, and aggregate tokens/sec over the last 15 seconds.
+Bench mode runs a fixed number of concurrent workers, optionally ramped up over time, until any of `--duration`, `--count`, or `Ctrl-C` fires. Each completed request prints the worker thread number, returned completion tokens, TTFT, request duration, per-request tokens/sec, aggregate tokens/sec over the last 15 seconds, and cache hit/miss; a P50/P95/P99 summary report prints at the end.
 
-If you want to exercise `cllm` queueing, `/metrics`, or `/config` state instead of benchmarking the downstream vLLM server directly, point the benchmark at `http://localhost:8080`:
+Common bench shapes:
 
 ```bash
-VLLM_BENCH_URL=http://127.0.0.1:8080 ./scripts/benchmark.sh --concurrency 10
+# Linear ramp from 1 to 50 workers over 30s, then run for 2 minutes
+./scripts/ask --bench 50 --ramp 1:50 --ramp-duration 30s --duration 2m --prompt 'hi'
+
+# Walk a YAML prompt list once across 8 workers
+./scripts/ask --bench 8 --file prompts.yaml
+
+# Loop the list 5 times, or pick randomly per request
+./scripts/ask --bench 8 --file prompts.yaml --loop 5
+./scripts/ask --bench 8 --file prompts.yaml --random --duration 1m
 ```
 
+YAML prompt file format:
 
-Example with smaller test settings:
-
-```bash
-VLLM_BENCH_CONCURRENCY=2 \
-VLLM_BENCH_MAX_TOKENS=64 \
-./scripts/benchmark.sh
+```yaml
+- prompt: "Explain Azure"
+  dsl: "profile=fast"
+- prompt: "What is Kubernetes?"
+- prompt: "Compare AWS and GCP"
+  dsl: "tps=20"
 ```
 
-Example with streaming enabled so TTFT is measured:
-
-```bash
-VLLM_BENCH_STREAM=1 \
-VLLM_BENCH_START=2 \
-VLLM_BENCH_MAX_CONCURRENCY=8 \
-./scripts/benchmark-vllm.sh
-```
-
-Use `./scripts/benchmark-vllm.sh --help` for all options, including an explicit model, bearer token, custom prompt, and concurrency controls.
-
-It will:
-
-- prompt for the user context
-- send a streaming chat completion request to the configured endpoint
-- authenticate with `ASK_TOKEN` when it is set
-- support `ASK_URL`, `ASK_TOKEN`, `ASK_MODEL`, `ASK_SYSTEM_PROMPT`, `ASK_MAX_TOKENS`, `ASK_TEMPERATURE`, and `ASK_DEBUG`
-- fall back to the older `CACHE_*` and `VLLM_*` variables for compatibility
-- print the streamed assistant content first, then a metrics footer with elapsed time, cache hit state, and token usage
-
-Example footer:
-
-```text
-------------------
-elapsed_ms: 26
-cache: true
-prompt_tokens: 21
-completion_tokens: 405
-total_tokens: 426
-```
+Use `./scripts/ask --help` for the full flag list.
 
 On the first startup, expect a delay while vLLM pulls the container image, downloads model weights, compiles kernels, and captures CUDA graphs. On this 8 GB GPU, the large 7B AWQ profile took about 150 seconds to download weights and about 56 seconds to finish engine initialization after that.
 
