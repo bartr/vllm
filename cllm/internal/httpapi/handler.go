@@ -3,12 +3,13 @@ package httpapi
 import (
 	"bytes"
 	"cllm/internal/buildinfo"
-	"context"
+	"cllm/internal/runtimeconfig"
 	"container/list"
-	"crypto/sha256"
+	"context"
 	"crypto/rand"
-	"encoding/json"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,28 +26,28 @@ import (
 )
 
 const (
-	defaultVLLMURL          = "http://localhost:8000"
-	defaultCacheSize        = 100
-	defaultCacheFilePath    = "/var/lib/cllm/cache.json"
-	defaultSystemPrompt     = "You are a helpful assistant."
-	minMaxTokens            = 100
-	maxMaxTokens            = 4000
-	minMaxTokensPerSecond   = 0
-	maxMaxTokensPerSecond   = 1000
-	minMaxConcurrentRequests = 1
-	maxMaxConcurrentRequests = 512
-	minMaxWaitingRequests   = 0
-	maxMaxWaitingRequests   = 1024
-	minMaxDegradation       = 0
-	maxMaxDegradation       = 95
-	defaultMaxTokens        = 4000
-	defaultTemperature      = 0.2
-	defaultVLLMHTTPTimeout  = 120 * time.Second
-	defaultMaxTokensPerSecond = 32
-	defaultMaxConcurrentRequests = 512
-	defaultMaxWaitingRequests = 1023
-	defaultMaxDegradation = 10
-	degradationThreshold = 0.10
+	defaultVLLMURL                    = runtimeconfig.DefaultDownstreamURL
+	defaultCacheSize                  = runtimeconfig.DefaultCacheSize
+	defaultCacheFilePath              = runtimeconfig.DefaultCacheFilePath
+	defaultSystemPrompt               = runtimeconfig.DefaultSystemPrompt
+	minMaxTokens                      = runtimeconfig.MinMaxTokens
+	maxMaxTokens                      = runtimeconfig.MaxMaxTokens
+	minMaxTokensPerSecond             = runtimeconfig.MinMaxTokensPerSecond
+	maxMaxTokensPerSecond             = runtimeconfig.MaxMaxTokensPerSecond
+	minMaxConcurrentRequests          = runtimeconfig.MinMaxConcurrentRequests
+	maxMaxConcurrentRequests          = runtimeconfig.MaxMaxConcurrentRequests
+	minMaxWaitingRequests             = runtimeconfig.MinMaxWaitingRequests
+	maxMaxWaitingRequests             = runtimeconfig.MaxMaxWaitingRequests
+	minMaxDegradation                 = runtimeconfig.MinMaxDegradation
+	maxMaxDegradation                 = runtimeconfig.MaxMaxDegradation
+	defaultMaxTokens                  = runtimeconfig.DefaultMaxTokens
+	defaultTemperature                = runtimeconfig.DefaultTemperature
+	defaultVLLMHTTPTimeout            = 120 * time.Second
+	defaultMaxTokensPerSecond         = runtimeconfig.DefaultMaxTokensPerSecond
+	defaultMaxConcurrentRequests      = runtimeconfig.DefaultMaxConcurrentRequests
+	defaultMaxWaitingRequests         = runtimeconfig.DefaultMaxWaitingRequests
+	defaultMaxDegradation             = runtimeconfig.DefaultMaxDegradation
+	degradationThreshold              = 0.10
 	replayTokensPerSecondCompensation = 1.025
 )
 
@@ -54,7 +55,6 @@ type askOptions struct {
 	systemPrompt string
 	maxTokens    int
 	temperature  float64
-	stream       bool
 }
 
 func trimTrailingSlash(rawURL string) string {
@@ -70,22 +70,22 @@ func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askO
 }
 
 type Handler struct {
-	ready      atomic.Bool
-	cache      *lruCache
-	cacheFilePath string
-	metrics    *handlerMetrics
-	configMu   sync.RWMutex
-	defaults   askOptions
-	vllmURL    string
-	downstreamToken string
-	downstreamModel string
-	httpClient *http.Client
-	modelsMu   sync.RWMutex
-	modelsCache *cachedModelsResponse
-	maxTokensPerSecond int
-	maxDegradation int
-	scheduler *requestScheduler
-	sleep func(context.Context, time.Duration) error
+	ready                                     atomic.Bool
+	cache                                     *lruCache
+	cacheFilePath                             string
+	metrics                                   *handlerMetrics
+	configMu                                  sync.RWMutex
+	defaults                                  askOptions
+	vllmURL                                   string
+	downstreamToken                           string
+	downstreamModel                           string
+	httpClient                                *http.Client
+	modelsMu                                  sync.RWMutex
+	modelsCache                               *cachedModelsResponse
+	maxTokensPerSecond                        int
+	maxDegradation                            int
+	scheduler                                 *requestScheduler
+	sleep                                     func(context.Context, time.Duration) error
 	lastLoggedComputedDegradationMilliPercent atomic.Int64
 }
 
@@ -273,23 +273,22 @@ func (h *Handler) Routes() http.Handler {
 }
 
 type runtimeConfig struct {
-	CacheSize       int     `json:"cache_size"`
-	CacheEntries    int     `json:"cache_entries"`
-	CacheFilePath   string  `json:"cache_file_path"`
-	DownstreamURL string  `json:"downstream_url"`
-	DownstreamModel string `json:"downstream_model"`
-	SystemPrompt   string  `json:"system_prompt"`
-	MaxTokens      int     `json:"max_tokens"`
-	MaxTokensPerSecond int `json:"max_tokens_per_second"`
-	EffectiveTokensPerSecond float64 `json:"effective_tokens_per_second"`
-	MaxConcurrentRequests int `json:"max_concurrent_requests"`
-	ConcurrentRequests int `json:"concurrent_requests"`
-	MaxWaitingRequests int `json:"max_waiting_requests"`
-	WaitingRequests int `json:"waiting_requests"`
-	MaxDegradation int `json:"max_degradation"`
+	ConcurrentRequests            int     `json:"concurrent_requests"`
+	WaitingRequests               int     `json:"waiting_requests"`
+	Version                       string  `json:"version"`
+	CacheSize                     int     `json:"cache_size"`
+	CacheEntries                  int     `json:"cache_entries"`
+	DownstreamURL                 string  `json:"downstream_url"`
+	DownstreamModel               string  `json:"downstream_model"`
+	SystemPrompt                  string  `json:"system_prompt"`
+	MaxTokens                     int     `json:"max_tokens"`
+	MaxTokensPerSecond            int     `json:"max_tokens_per_second"`
+	EffectiveTokensPerSecond      float64 `json:"effective_tokens_per_second"`
+	MaxConcurrentRequests         int     `json:"max_concurrent_requests"`
+	MaxWaitingRequests            int     `json:"max_waiting_requests"`
+	MaxDegradation                int     `json:"max_degradation"`
 	ComputedDegradationPercentage float64 `json:"computed_degradation_percentage"`
-	Temperature    float64 `json:"temperature"`
-	Stream         bool    `json:"stream"`
+	Temperature                   float64 `json:"temperature"`
 }
 
 type cacheEntrySummary struct {
@@ -303,19 +302,19 @@ type cacheEntrySummary struct {
 }
 
 type cacheResponse struct {
-	Enabled     bool                `json:"enabled"`
-	CacheSize   int                 `json:"cache_size"`
-	CacheEntries int                `json:"cache_entries"`
-	CacheFilePath string            `json:"cache_file_path"`
-	Keys        []cacheEntrySummary `json:"keys"`
-	Action      *cacheActionResult  `json:"action,omitempty"`
+	Enabled       bool                `json:"enabled"`
+	CacheSize     int                 `json:"cache_size"`
+	CacheEntries  int                 `json:"cache_entries"`
+	CacheFilePath string              `json:"cache_file_path"`
+	Keys          []cacheEntrySummary `json:"keys"`
+	Action        *cacheActionResult  `json:"action,omitempty"`
 }
 
 type cacheActionResult struct {
-	Name         string `json:"name"`
+	Name          string `json:"name"`
 	CacheFilePath string `json:"cache_file_path"`
-	SavedEntries int    `json:"saved_entries,omitempty"`
-	LoadedEntries int   `json:"loaded_entries,omitempty"`
+	SavedEntries  int    `json:"saved_entries,omitempty"`
+	LoadedEntries int    `json:"loaded_entries,omitempty"`
 }
 
 type cacheItemResponse struct {
@@ -593,12 +592,12 @@ func (h *Handler) currentCache(actionResult *cacheActionResult) cacheResponse {
 	}
 
 	return cacheResponse{
-		Enabled:      true,
-		CacheSize:    capacity,
-		CacheEntries: len(keys),
+		Enabled:       true,
+		CacheSize:     capacity,
+		CacheEntries:  len(keys),
 		CacheFilePath: cacheFilePath,
-		Keys:         keys,
-		Action:       actionResult,
+		Keys:          keys,
+		Action:        actionResult,
 	}
 }
 
@@ -638,8 +637,8 @@ func (h *Handler) applyCacheQuery(r *http.Request) (*cacheActionResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid size %q", sizeRaw)
 		}
-		if size < 0 || size > 10000 {
-			return nil, fmt.Errorf("size must be between %d and %d", 0, 10000)
+		if size < runtimeconfig.MinCacheSize || size > runtimeconfig.MaxCacheSize {
+			return nil, fmt.Errorf("size must be between %d and %d", runtimeconfig.MinCacheSize, runtimeconfig.MaxCacheSize)
 		}
 		h.SetCacheSize(size)
 	}
@@ -658,23 +657,22 @@ func (h *Handler) currentConfig() runtimeConfig {
 	h.modelsMu.RUnlock()
 
 	return runtimeConfig{
-		CacheSize: cacheSize,
-		CacheEntries: cacheEntries,
-		CacheFilePath: h.getCacheFilePath(),
-		DownstreamURL: downstreamURL,
-		DownstreamModel: downstreamModel,
-		SystemPrompt:   defaults.systemPrompt,
-		MaxTokens:      defaults.maxTokens,
-		MaxTokensPerSecond: processingStats.MaxTokensPerSecond,
-		EffectiveTokensPerSecond: processingStats.EffectiveTokensPerSecond,
-		MaxConcurrentRequests: processingStats.MaxConcurrentRequests,
-		ConcurrentRequests: processingStats.ConcurrentRequests,
-		MaxWaitingRequests: processingStats.MaxWaitingRequests,
-		WaitingRequests: processingStats.WaitingRequests,
-		MaxDegradation: processingStats.MaxDegradation,
+		ConcurrentRequests:            processingStats.ConcurrentRequests,
+		WaitingRequests:               processingStats.WaitingRequests,
+		Version:                       buildinfo.Version,
+		CacheSize:                     cacheSize,
+		CacheEntries:                  cacheEntries,
+		DownstreamURL:                 downstreamURL,
+		DownstreamModel:               downstreamModel,
+		SystemPrompt:                  defaults.systemPrompt,
+		MaxTokens:                     defaults.maxTokens,
+		MaxTokensPerSecond:            processingStats.MaxTokensPerSecond,
+		EffectiveTokensPerSecond:      processingStats.EffectiveTokensPerSecond,
+		MaxConcurrentRequests:         processingStats.MaxConcurrentRequests,
+		MaxWaitingRequests:            processingStats.MaxWaitingRequests,
+		MaxDegradation:                processingStats.MaxDegradation,
 		ComputedDegradationPercentage: processingStats.ComputedDegradationPercentage,
-		Temperature:    defaults.temperature,
-		Stream:         defaults.stream,
+		Temperature:                   defaults.temperature,
 	}
 }
 
@@ -874,14 +872,6 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 		defaults.temperature = temperature
 	}
 
-	if streamRaw := configQueryValue(queryValues, "stream"); streamRaw != "" {
-		stream, err := strconv.ParseBool(streamRaw)
-		if err != nil {
-			return false, fmt.Errorf("invalid stream %q", streamRaw)
-		}
-		defaults.stream = stream
-	}
-
 	cacheSize, _ := h.cacheStats()
 	if cacheSizeRaw := configQueryValue(queryValues, "cache-size", "cache_size"); cacheSizeRaw != "" {
 		parsed, err := strconv.Atoi(cacheSizeRaw)
@@ -896,10 +886,14 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 
 	h.modelsMu.RLock()
 	downstreamURL := h.vllmURL
+	downstreamToken := h.downstreamToken
 	downstreamModel := h.downstreamModel
 	h.modelsMu.RUnlock()
 	if downstreamURLRaw := configQueryValue(queryValues, "downstream-url", "downstream_url"); downstreamURLRaw != "" {
 		downstreamURL = downstreamURLRaw
+	}
+	if downstreamTokenRaw := configQueryValue(queryValues, "downstream-token", "downstream_token"); downstreamTokenRaw != "" {
+		downstreamToken = downstreamTokenRaw
 	}
 	if downstreamModelRaw := configQueryValue(queryValues, "downstream-model", "downstream_model"); downstreamModelRaw != "" {
 		downstreamModel = downstreamModelRaw
@@ -910,6 +904,7 @@ func (h *Handler) applyConfigQuery(r *http.Request) (bool, error) {
 	h.configMu.Unlock()
 	h.SetCacheSize(cacheSize)
 	h.SetDownstreamURL(downstreamURL)
+	h.SetDownstreamToken(downstreamToken)
 	h.SetDownstreamModel(downstreamModel)
 	h.SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRequests, maxWaitingRequests, maxDegradation)
 	updatedMaxConcurrentRequests, updatedConcurrentRequests, updatedMaxWaitingRequests, updatedWaitingRequests := h.RequestQueueStats()
@@ -945,18 +940,18 @@ type modelsResponse struct {
 }
 
 type cachedModelsResponse struct {
-	body        []byte
-	statusCode  int
-	contentType string
+	body         []byte
+	statusCode   int
+	contentType  string
 	defaultModel string
 }
 
 type chatCompletionRequest struct {
-	Model         string                      `json:"model"`
-	Messages      []chatCompletionMessage     `json:"messages"`
-	Temperature   float64                     `json:"temperature"`
-	MaxTokens     int                         `json:"max_tokens"`
-	Stream        bool                        `json:"stream,omitempty"`
+	Model         string                       `json:"model"`
+	Messages      []chatCompletionMessage      `json:"messages"`
+	Temperature   float64                      `json:"temperature"`
+	MaxTokens     int                          `json:"max_tokens"`
+	Stream        bool                         `json:"stream,omitempty"`
 	StreamOptions *chatCompletionStreamOptions `json:"stream_options,omitempty"`
 }
 
@@ -1347,21 +1342,21 @@ func calibratedTokensPerSecond(configuredTokensPerSecond int) float64 {
 }
 
 type requestScheduler struct {
-	mu sync.Mutex
-	queue *list.List
+	mu            sync.Mutex
+	queue         *list.List
 	maxConcurrent int
-	maxWaiting int
-	inFlight int
-	waiting int
+	maxWaiting    int
+	inFlight      int
+	waiting       int
 }
 
 type waitingRequest struct {
-	path string
-	ready chan struct{}
-	element *list.Element
-	admitted bool
+	path       string
+	ready      chan struct{}
+	element    *list.Element
+	admitted   bool
 	enqueuedAt time.Time
-	queueWait time.Duration
+	queueWait  time.Duration
 }
 
 func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *requestScheduler {
@@ -1372,14 +1367,10 @@ func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *request
 		maxWaitingRequests = 0
 	}
 	return &requestScheduler{
-		queue: list.New(),
+		queue:         list.New(),
 		maxConcurrent: maxConcurrentRequests,
-		maxWaiting: maxWaitingRequests,
+		maxWaiting:    maxWaitingRequests,
 	}
-}
-
-func (s *requestScheduler) Acquire(ctx context.Context) (func(), time.Duration, bool) {
-	return s.AcquirePath(ctx, "")
 }
 
 func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func(), time.Duration, bool) {
@@ -1400,7 +1391,7 @@ func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func()
 	request.element = s.queue.PushBack(request)
 	s.waiting++
 	slog.Info("request admitted", "path", path, "source", "waiting_queue", "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
-		s.mu.Unlock()
+	s.mu.Unlock()
 
 	select {
 	case <-request.ready:
@@ -1520,7 +1511,7 @@ func (s *requestScheduler) degradationMetricsLocked(baseTokensPerSecond, maxDegr
 }
 
 type replayStreamSegment struct {
-	line []byte
+	line       []byte
 	tokenCount int
 }
 
@@ -1930,7 +1921,7 @@ func requestLogger(next http.Handler, metrics *handlerMetrics) http.Handler {
 			"status", statusCode,
 			"bytes", responseWriter.bytes,
 			"cache", responseWriter.cacheHit,
-			"duration_ms", float64(time.Since(startedAt))/float64(time.Millisecond),
+			"duration_ms", float64(time.Since(startedAt)) / float64(time.Millisecond),
 		}
 
 		switch {

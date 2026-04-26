@@ -11,9 +11,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"strings"
 	"testing"
 	"time"
 )
@@ -33,7 +33,7 @@ func TestRoutes(t *testing.T) {
 		{name: "health", method: http.MethodGet, path: "/health", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "ready", method: http.MethodGet, path: "/ready", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"waiting_requests":0`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"stream":false`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"concurrent_requests":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1023`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`}},
 		{name: "cache", method: http.MethodGet, path: "/cache", statusCode: http.StatusOK, bodyContains: []string{`"enabled":true`, `"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`}},
 		{name: "metrics", method: http.MethodGet, path: "/metrics", statusCode: http.StatusOK, bodyContains: []string{"# HELP cllm_http_requests_total", "cllm_http_inflight_requests", "cllm_queue_waiting_requests"}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
@@ -490,7 +490,6 @@ func TestChatCompletionsStreamCachesReplay(t *testing.T) {
 	}
 }
 
-
 func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 	vllmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -606,7 +605,6 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 	}
 }
 
-
 func TestRoutesNotFoundLogging(t *testing.T) {
 	var logBuffer bytes.Buffer
 	originalLogger := slog.Default()
@@ -633,12 +631,11 @@ func TestRoutesNotFoundLogging(t *testing.T) {
 	}
 }
 
-
 func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_per_second=48&max_concurrent_requests=64&max_waiting_requests=96&max_degradation=25", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_per_second=48&max_concurrent_requests=64&max_waiting_requests=96&max_degradation=25&downstream_token=secret-token", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -677,6 +674,37 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	}
 	if got.MaxDegradation != 25 {
 		t.Fatalf("max degradation = %d, want %d", got.MaxDegradation, 25)
+	}
+}
+
+func TestConfigEndpointUpdatesDownstreamTokenAndIgnoresStream(t *testing.T) {
+	vllmServer, captured := newCapturingTestVLLMServer(t)
+	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	router := handler.Routes()
+
+	configRecorder := httptest.NewRecorder()
+	router.ServeHTTP(configRecorder, httptest.NewRequest(http.MethodGet, "/config?downstream_token=updated-token&stream=true", nil))
+	if configRecorder.Code != http.StatusOK {
+		t.Fatalf("config status code = %d, want %d", configRecorder.Code, http.StatusOK)
+	}
+	if strings.Contains(configRecorder.Body.String(), `"stream"`) {
+		t.Fatalf("config body unexpectedly contained stream field: %s", configRecorder.Body.String())
+	}
+
+	body := `{"messages":[{"role":"system","content":"Be precise"},{"role":"user","content":"hello"}],"temperature":0.7,"max_tokens":700}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("chat status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("captured requests = %d, want 1", len(*captured))
+	}
+	if (*captured)[0].Authorization != "Bearer updated-token" {
+		t.Fatalf("authorization = %q, want %q", (*captured)[0].Authorization, "Bearer updated-token")
 	}
 }
 
@@ -726,7 +754,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	}
 
 	type acquiredRelease struct {
-		path string
+		path    string
 		release func()
 	}
 	acquired := make(chan acquiredRelease, 2)
@@ -938,7 +966,6 @@ func TestCachedReplayDelayDisabledWhenTokensPerSecondZero(t *testing.T) {
 	}
 }
 
-
 func TestLoadConfigCacheSize(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
@@ -1047,7 +1074,6 @@ func TestModelsEndpointDoesNotRefreshWithoutRestart(t *testing.T) {
 		t.Fatalf("models requests = %d, want 1", got)
 	}
 }
-
 
 func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	originalArgs := os.Args
@@ -1251,12 +1277,12 @@ type vllmCounters struct {
 }
 
 type capturedChatRequest struct {
-	MaxTokens    int
-	Model        string
-	SystemPrompt string
-	Temperature  float64
-	UserContent  string
-	Stream       bool
+	MaxTokens     int
+	Model         string
+	SystemPrompt  string
+	Temperature   float64
+	UserContent   string
+	Stream        bool
 	Authorization string
 }
 
@@ -1332,12 +1358,12 @@ func newCapturingTestVLLMServer(t *testing.T) (*httptest.Server, *[]capturedChat
 
 			mu.Lock()
 			captured = append(captured, capturedChatRequest{
-				Model:        requestBody.Model,
-				SystemPrompt: requestBody.Messages[0].Content,
-				UserContent:  requestBody.Messages[1].Content,
-				Temperature:  requestBody.Temperature,
-				MaxTokens:    requestBody.MaxTokens,
-				Stream:       requestBody.Stream,
+				Model:         requestBody.Model,
+				SystemPrompt:  requestBody.Messages[0].Content,
+				UserContent:   requestBody.Messages[1].Content,
+				Temperature:   requestBody.Temperature,
+				MaxTokens:     requestBody.MaxTokens,
+				Stream:        requestBody.Stream,
 				Authorization: r.Header.Get("Authorization"),
 			})
 			mu.Unlock()

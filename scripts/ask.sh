@@ -41,8 +41,9 @@ require_command() {
   fi
 }
 
-require_command curl
-require_command python3
+for cmd in curl python3 jq; do
+  require_command "$cmd"
+done
 
 build_curl_args() {
   curl_args=(-sS -N)
@@ -110,6 +111,16 @@ http_code_file=$(mktemp)
 stream_fifo=$(mktemp -u)
 mkfifo "$stream_fifo"
 
+consumer_pid=""
+cleanup() {
+  if [[ -n "$consumer_pid" ]] && kill -0 "$consumer_pid" 2>/dev/null; then
+    kill "$consumer_pid" 2>/dev/null || true
+    wait "$consumer_pid" 2>/dev/null || true
+  fi
+  rm -f "$response_body" "$http_code_file" "$stream_fifo"
+}
+trap cleanup EXIT
+
 tee "$response_body" < "$stream_fifo" | python3 -c '
 import json
 import os
@@ -140,14 +151,6 @@ for raw_line in sys.stdin:
 ' &
 consumer_pid=$!
 
-cleanup() {
-  rm -f "$response_body" "$http_code_file"
-  if [[ -p "$stream_fifo" ]]; then
-    rm -f "$stream_fifo"
-  fi
-}
-trap cleanup EXIT
-
 curl "${curl_args[@]}" \
   -o "$stream_fifo" \
   -w '%{http_code}' \
@@ -163,6 +166,7 @@ fi
 end_ms=$(date +%s%3N)
 elapsed_ms=$((end_ms - start_ms))
 http_code=$(cat "$http_code_file")
+http_code=${http_code:-0}
 
 if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
   echo "Request was rejected by the chat service. Set ASK_TOKEN to a valid bearer token and retry." >&2

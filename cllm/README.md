@@ -61,10 +61,10 @@ For a local vLLM source, omit the downstream token and model settings and keep t
 You can inspect or update the live handler config at runtime:
 
 ```bash
-curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=256&max-waiting-requests=512&max-degradation=15&temperature=0.7&stream=true'
+curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=256&max-waiting-requests=512&max-degradation=15&temperature=0.7'
 ```
 
-`/config` now also returns `cache_file_path`, `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_concurrent_requests`, `concurrent_requests`, `max_waiting_requests`, `waiting_requests`, `max_degradation`, and `computed_degradation_percentage`, and you can update the configurable values live with either hyphenated or snake_case query params.
+`/config` now returns `concurrent_requests`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_concurrent_requests`, `max_waiting_requests`, `max_degradation`, and `computed_degradation_percentage`. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `max-tokens-per-second`, `max-concurrent-requests`, `max-waiting-requests`, `max-degradation`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, and `downstream-model`.
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
@@ -101,13 +101,13 @@ curl 'http://127.0.0.1:8080/cache?size=200'
 Example switching the downstream source to OpenAI-compatible settings at runtime:
 
 ```bash
-curl 'http://127.0.0.1:8080/config?downstream-url=https%3A%2F%2Fapi.openai.com&downstream-model=gpt-4.1'
+curl 'http://127.0.0.1:8080/config?downstream-url=https%3A%2F%2Fapi.openai.com&downstream-token=your-token&downstream-model=gpt-4.1'
 ```
 
 Equivalent snake_case form:
 
 ```bash
-curl 'http://127.0.0.1:8080/config?downstream_url=https%3A%2F%2Fapi.openai.com&downstream_model=gpt-4.1'
+curl 'http://127.0.0.1:8080/config?downstream_url=https%3A%2F%2Fapi.openai.com&downstream_token=your-token&downstream_model=gpt-4.1'
 ```
 
 Example shrinking the cache to a single entry at runtime:
@@ -116,7 +116,7 @@ Example shrinking the cache to a single entry at runtime:
 curl 'http://127.0.0.1:8080/config?cache-size=1'
 ```
 
-The downstream token is intentionally not returned by `/config`.
+The downstream token is intentionally not returned by `/config`, but it can be updated through `/config?downstream-token=...` or `/config?downstream_token=...`.
 
 Prometheus scraping is exposed at `/metrics`. In addition to the standard Go and process collectors, `cllm` exports HTTP request metrics and service-specific metrics covering queue wait time, in-flight and waiting request counts, effective token throughput, cache hit and miss counts, downstream request latency, time to first byte, and overall job duration for `/v1/chat/completions`.
 
@@ -126,19 +126,19 @@ Prometheus scraping is exposed at `/metrics`. In addition to the standard Go and
 make build
 ```
 
-This builds the local container image `cllm:0.1.0`.
+This builds the local container image `cllm:0.5.0`.
 
-To import that image into the local k3s container runtime:
+To build and import that image into the local k3s container runtime:
 
 ```bash
-make import
+make deploy
 ```
 
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.1.0 .
-docker save cllm:0.1.0 | sudo k3s ctr images import -
+docker build -t cllm:0.5.0 .
+docker save cllm:0.5.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -150,11 +150,13 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.1.0 .
-docker run --rm -p 8080:8080 cllm:0.1.0
+docker build -t cllm:0.5.0 .
+docker run --rm -p 8080:8080 cllm:0.5.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
+
+That image-bundled seed only applies when nothing else is mounted at `/var/lib/cllm`. In the local Kubernetes deployment below, the PVC is mounted at that same path, so the live pod reads and writes the PVC-backed `cache.json` instead of the file baked into the image.
 
 ## Kubernetes
 
@@ -162,11 +164,14 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.1.0`
+- deploy `cllm:0.5.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
+- mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path
 - expose it internally on service port `8080`
 - expose it through a dedicated Traefik `cllm` entrypoint on external port `8080`
+
+If you want Kubernetes to start with a preloaded cache, seed the PVC-backed file rather than relying on the image copy. The repository helper [scripts/export-cache.sh](/home/bartr/vllm/scripts/export-cache.sh) exports the current PVC-backed cache back into [cllm/cache.json](/home/bartr/vllm/cllm/cache.json); the inverse flow is to write the desired `cache.json` into the mounted volume before or after deployment.
 
 Apply the manifests with:
 

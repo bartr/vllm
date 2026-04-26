@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,25 @@ import (
 	"cllm/internal/config"
 	"cllm/internal/httpapi"
 )
+
+// syncBuffer is a thread-safe wrapper around bytes.Buffer for tests where a
+// background goroutine writes to the same buffer the test goroutine reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestRunHelp(t *testing.T) {
 	var stdout bytes.Buffer
@@ -209,7 +229,7 @@ func TestLoadStartupCacheLoadsPersistedEntries(t *testing.T) {
 }
 
 func TestStartQueueDepthLoggerLogsQueueDepth(t *testing.T) {
-	var logBuffer bytes.Buffer
+	var logBuffer syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
 	handler := httpapi.NewHandler()
 

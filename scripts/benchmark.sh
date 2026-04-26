@@ -237,12 +237,6 @@ wait_for_endpoint() {
       fi
     fi
 
-    if output=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' "$VLLM_BENCH_URL/health" 2>&1); then
-      if [[ "$output" == "200" ]]; then
-        return 0
-      fi
-    fi
-
     if (( attempt == attempts )); then
       echo "endpoint did not become ready at $VLLM_BENCH_URL/health after $attempts attempts." >&2
       echo "$output" >&2
@@ -513,23 +507,24 @@ import signal
 import sys
 
 fifo_path = sys.argv[1]
-window_ns = 15 * 1_000_000_000
+WINDOW_SECONDS = 15
+window_ns = WINDOW_SECONDS * 1_000_000_000
 completion_window = deque()
 
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
-def total_tps_last_minute(end_ns: int) -> float:
-  window_start_ns = end_ns - window_ns
-  while completion_window and completion_window[0][0] < window_start_ns:
-    completion_window.popleft()
-  if not completion_window:
+def total_tps_window(end_ns: int) -> float:
+    window_start_ns = end_ns - window_ns
+    while completion_window and completion_window[0][0] < window_start_ns:
+        completion_window.popleft()
+    if not completion_window:
         return 0.0
-  total_tokens = sum(tokens for _, tokens in completion_window)
-  covered_start_ns = max(window_start_ns, completion_window[0][0])
-  elapsed_ns = end_ns - covered_start_ns
-  if elapsed_ns <= 0:
-    return 0.0
-  return total_tokens / (elapsed_ns / 1_000_000_000)
+    total_tokens = sum(tokens for _, tokens in completion_window)
+    covered_start_ns = max(window_start_ns, completion_window[0][0])
+    elapsed_ns = end_ns - covered_start_ns
+    if elapsed_ns <= 0:
+        return 0.0
+    return total_tokens / (elapsed_ns / 1_000_000_000)
 
 print("")
 print(f"{'thread':<8} {'tokens':<8} {'ttft_ms':<10} {'duration_ms':<12} {'req_tok/s':<12} {'total_tok/s':<12}")
@@ -546,13 +541,13 @@ with open(fifo_path, encoding="utf-8") as handle:
         completion_tokens = int(item.get("completion_tokens", 0))
 
         if item.get("ok"):
-          completion_window.append((ended_at_ns, completion_tokens))
+            completion_window.append((ended_at_ns, completion_tokens))
 
         req_tps = 0.0
         if duration_ns > 0:
             req_tps = completion_tokens / (duration_ns / 1_000_000_000)
 
-        total_tps = total_tps_last_minute(ended_at_ns)
+        total_tps = total_tps_window(ended_at_ns)
         ttft_ns = item.get("ttft_ns")
         ttft_display = "n/a" if ttft_ns is None else f"{int(ttft_ns) / 1_000_000:.2f}"
         duration_display = f"{duration_ns / 1_000_000:.2f}"
@@ -638,8 +633,7 @@ if [[ "$VLLM_BENCH_WARMUP" == "1" ]]; then
   run_request "$warmup_request_body" 0 >/dev/null
 fi
 
-stop_file=$(mktemp)
-rm -f "$stop_file"
+stop_file=$(mktemp -u)
 result_fifo=$(mktemp -u)
 mkfifo "$result_fifo"
 
