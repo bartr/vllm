@@ -1,21 +1,57 @@
-# cLLM: A Controllable LLM Inference Control Plane for Scheduling and Scaling Experiments
+# cLLM: A GPU-Calibrated Experimentation Platform for LLM Inference
+
+## TL;DR
+
+cLLM is a Kubernetes-native, OpenAI-compatible **GPU experimentation platform** for LLM serving. A single physical GPU calibrates a synthetic execution path; that path then scales to model 2×, 4×, or 16× GPU deployments — on the same machine, at no additional GPU cost.
+
+What it buys an engineering team:
+
+* **Tokens are the resource, not requests.** The shift from CPU serving to GPU-backed LLM serving is a shift in the unit of accounting: one 4k-token request can displace dozens of small ones from KV cache and prefill, so RPS-based limits silently mis-allocate the fleet. cLLM treats `prompt + min(max_tokens, p95)` as the admission cost everywhere — admission, fairness, capacity scaling, and the DSL all speak the same currency.
+* **Calibrate once, experiment forever.** One real-GPU benchmark anchors the synthetic envelope; every subsequent scheduling, fairness, admission, or capacity-scaling experiment runs against that envelope without renting more hardware.
+* **Multi-target benchmarks without multi-target hardware.** Real vLLM, pass-through, and synthetic streams run side-by-side in one time window, on one GPU host, against one three-layer dashboard stack (cLLM, vLLM, GPU).
+* **A per-request experiment surface.** A small in-prompt DSL (`:dsl tps=…`, `no-cache`, `re-cache`, profiles) composes with live `/config` knobs, so mixed workloads, A/B comparisons, and targeted fault injection run inside a single deployment with no restarts.
+* **Validation is a primitive, not a milestone.** The same `:dsl no-cache` mechanism that calibrates the system also validates and reproduces it — any operator can re-validate at the cost of a single benchmark run.
+* **Reproducible workloads survive cluster rebuilds.** Cached prompts are versioned artifacts; a snapshot loaded on different hardware reproduces the same synthetic envelope.
+* **Runs almost anywhere.** Because the synthetic path needs no GPU at runtime, a calibrated cache library replays on engineering laptops (macOS, Windows, Linux), CPU-only CI runners, and air-gapped hosts — the calibration host is the only paid GPU hour, and one calibration host serves the whole organization (§13).
+
+What it is not: a kernel-level GPU simulator. Micro-architectural effects (KV-cache pressure spikes, batch-scheduler interleaving) are intentionally abstracted; *system* dynamics — admission, queueing, fairness, backpressure, capacity scaling — are faithfully modeled and continuously validated against a real vLLM running on the same GPU.
+
+---
 
 ## 1. Abstract
 
 Modern LLM serving systems are often evaluated through real GPU-backed deployments, which are expensive, non-deterministic, and difficult to experiment with safely. cLLM is a Kubernetes-native LLM inference control plane designed to model serving as a **token-throughput–constrained scheduling problem over shared GPU resources**.
 
-The system provides an OpenAI-compatible API and supports both real backends (e.g., vLLM) and a synthetic execution mode that replays cached responses under a global tokens-per-second constraint. By decoupling system behavior from model execution, cLLM enables controlled, reproducible experiments on scheduling, routing, fairness, and backpressure—while still reproducing the system-level dynamics of real GPU inference.
+The system provides an OpenAI-compatible API and supports both real backends (e.g., vLLM) and a synthetic execution mode that replays cached responses under per-request rate pacing, cost-based admission, and per-tenant fairness, with controlled prefill, jitter, and stall injection. By decoupling system behavior from model execution, cLLM enables controlled, reproducible experiments on scheduling, routing, fairness, and backpressure — including capacity-scaling experiments calibrated against a real GPU baseline on the same hardware — while still reproducing the system-level dynamics of real GPU inference. Because the synthetic path requires no GPU at runtime, the calibration host is the only paid GPU hour: experiments replay on laptops, CI runners, and air-gapped hosts at no additional GPU cost (§13).
 
 ---
 
-## 2. Problem Statement
+## 2. Key Insights
+
+1. **LLM serving is dominated by scheduling and queueing, not raw compute.** Throughput plateaus and tail-latency growth come from admission contention, queue dynamics, and per-tenant fairness — not from how fast a single token is generated. This is why cLLM models *system* behavior with high fidelity while abstracting micro-architectural GPU effects.
+2. **Tokens are the correct unit of resource modeling.** Cost-based admission (`prompt + min(max_tokens, p95)`) reflects how KV-cache and prefill compute actually scale, so one large request can correctly displace many small ones — a property that count-based limits cannot express (§6.1, §6.3).
+3. **Latency is primarily driven by queueing under contention.** The per-request rate curve under `f(load)` is linear past the activation threshold; it is the queue/admission interaction on top of that curve that produces the soft-saturation, non-linear TTFT growth observed on real systems (§6.2, §6.4).
+4. **Small scheduling changes can significantly impact fairness and tail latency.** Per-tenant token buckets gate eligibility into the global FIFO without disturbing in-active-set ordering, isolating noisy tenants without a stateful weighted scheduler. Tenant refunds on global rejection preserve work conservation (§6.5).
+5. **A single physical GPU is enough to model an N-GPU deployment.** Calibrating the synthetic envelope against a `:dsl no-cache` run on real hardware lets `tps=N` simulate 2×, 4×, 16× GPU counts on the same machine — capacity-scaling experiments without provisioning capacity (§6.6).
+6. **Per-request reconfiguration is more powerful than global reconfiguration.** The Replay DSL composes with `/config` so a single deployment runs mixed workloads, A/B comparisons, and targeted fault injection in the same time window — turning the control plane into a per-request experiment surface (§9.1, §12).
+7. **Reproducibility is a property of cached workloads, not just stored prompts.** A pass-through real-backend run captures ground truth into the cache, after which the same prompts replay synthetically at the calibrated envelope at zero GPU cost. Cache snapshots (`action=save`/`load`) make the workload library portable across machines and CI runs (§10.1).
+8. **Concurrent multi-target benchmarking is what makes the platform a platform.** Real, pass-through, and synthetic streams run side-by-side on the same GPU host, sharing one time axis and one dashboard stack — direct cross-validation, no time-stitched runs, no extra hardware (§10.2, §11.3).
+9. **Three-layer observability closes the loop.** `cllm-overview`, `vllm-overview`, and `gpu-overview` answer "what did the system do?", "what did the serving stack do?", and "what did the GPU do?" on a shared time axis with shared request-correlation IDs and DSL-family partitioning, so every experiment is interpretable end-to-end (§8.4).
+10. **Deterministic simulation enables safer and faster iteration than GPU-only testing.** Combined with side-by-side validation against vLLM, the synthetic path matches real-system dynamics at the shape level while staying honest about what it does not model (KV-cache pressure spikes, batch-scheduler interleaving, content-dependent decode variance — §6.6, §11.4).
+11. **The cost of experimentation is decoupled from the cost of the system being experimented on.** Calibration is the only paid GPU hour; subsequent scheduling, fairness, and capacity-scaling experiments run on the cached library at no additional GPU cost. Because the synthetic path needs no GPU at runtime, experiments replay on laptops, CPU-only CI runners, and air-gapped hosts — removing GPU provisioning, quota, and tear-down churn from the experiment loop (§13).
+
+---
+
+## 3. Problem Statement
 
 LLM serving systems exhibit complex behavior under load:
 
 * Throughput saturates at GPU capacity
 * Latency increases non-linearly beyond saturation
-* Long requests can dominate compute
-* Multi-tenant workloads introduce fairness challenges
+* Long requests can dominate compute under count-based admission
+* Multi-tenant workloads introduce noisy-neighbor effects that count-based limits cannot isolate
+* Workload identity (the prompt) and execution behavior (pacing, faults) are usually entangled, hurting reproducibility
+* Configuration changes typically require redeployment, lengthening experiment cycles
 
 Traditional approaches to evaluating these systems suffer from:
 
@@ -27,13 +63,18 @@ The goal of cLLM is to provide a **deterministic, controllable environment** tha
 
 ---
 
-## 3. System Goals
+## 4. System Goals
 
 ### Functional Goals
 
 * OpenAI-compatible API for seamless integration
-* Support both real inference backends and synthetic execution
-* Model token-based throughput constraints
+* Per-request routing across an OpenAI-compatible upstream and a synthetic cache-replay path
+* Token-based throughput constraints with cost-based admission
+* Per-request behavioral overrides via an in-prompt **DSL directive system** (`:dsl …`)
+* Per-tenant fairness with independent rate/burst buckets
+* Live runtime configuration over HTTP without redeploy
+* Realistic generation mechanics: prefill simulation, inter-token pacing, jitter, and stream stalls
+* Capacity-scaling sandbox: simulate N×GPU deployments calibrated against a measured single-GPU baseline
 
 ### Non-Functional Goals
 
@@ -41,43 +82,63 @@ The goal of cLLM is to provide a **deterministic, controllable environment** tha
 * Realistic latency and streaming behavior
 * Fine-grained observability (per-request + system-level)
 * Safe experimentation via live configuration
+* Calibration against a real GPU baseline on the same hardware
 
 ---
 
-## 4. Architecture Overview
+## 5. Architecture Overview
 
 cLLM consists of three primary components:
 
-### 4.1 Control Plane
+### 5.1 Control Plane
 
-* Request admission and scheduling
+* Request admission and scheduling (cost-based global gate)
 * Token-based throughput allocation
-* Multi-tenant fairness enforcement
+* Multi-tenant fairness enforcement (per-tenant token buckets)
+* DSL directive parser for per-request behavioral overrides
+* Live runtime configuration endpoints (`GET /config`, `POST /config`)
+* Cache inspection endpoints (`GET /cache`, `GET /cache/{key}`)
 
-### 4.2 Execution Layer
+### 5.2 Execution Layer
 
-* Real mode: routes to vLLM / OpenAI
-* Synthetic mode: replays cached responses with controlled timing
+Routing is **per-request**, not a deployment-time mode switch. Each `POST /v1/chat/completions` request is dispatched as follows:
 
-### 4.3 Observability Layer
+* **Cache hit** (and no `:dsl no-cache` / `:dsl re-cache` directive): the cached response is replayed synthetically under per-request TPS pacing, prefill simulation, inter-token jitter, and configurable stream stalls.
+* **Cache miss, or `:dsl no-cache`, or `:dsl re-cache`**: the request is forwarded to the configured OpenAI-compatible upstream (e.g., vLLM). On success, the response is written back to the cache unless `no-cache` was specified (`re-cache` writes back; `no-cache` does neither lookup nor write).
 
-* Prometheus metrics (tokens/sec, TTFT, queue depth, latency)
-* Grafana dashboards
-* Structured logging with correlation IDs
+Execution-layer mechanics that shape observed latency and throughput:
 
-The system is deployed alongside a real vLLM instance in Kubernetes, allowing **side-by-side comparison of simulated and real behavior on the same hardware**.
+* TPS pacing of streamed tokens (per-request `tps`)
+* Prefill duration simulation (TTFT shaping)
+* Inter-token jitter
+* Configurable stream stalls (frequency × duration)
+
+### 5.3 Observability Layer
+
+* Prometheus metrics across multiple families:
+  * **HTTP / lifecycle:** `cllm_http_requests_total`, `cllm_http_inflight_requests`, `cllm_http_request_duration_seconds`, `cllm_request_lifecycle_events_total`
+  * **Throughput / latency:** `cllm_completion_tokens_total`, `cllm_time_to_first_byte_seconds`, `cllm_job_duration_seconds`, `cllm_queue_wait_duration_seconds`
+  * **Generation simulation:** `cllm_prefill_duration_seconds`, `cllm_stream_stalls_total`, `cllm_stream_stall_duration_seconds`
+  * **Cache:** `cllm_cache_lookups_total`
+  * **DSL:** `cllm_dsl_directives_total`, `cllm_dsl_requests_total`, `cllm_dsl_time_to_first_byte_seconds`, `cllm_dsl_job_duration_seconds`
+  * **Tenants:** `cllm_tenant_admissions_total`, `cllm_tenant_rejections_total`
+  * **Upstream:** `cllm_downstream_request_duration_seconds`
+* Grafana dashboards: `cllm-overview`, `vllm-overview`, `gpu-overview`, plus DSL-specific panels for per-directive request rate, rejection rate, TTFT P95, and latency P95.
+* Structured logging with correlation IDs (`X-Request-ID`, propagated via context and slog)
+
+The system is deployed alongside a real vLLM instance in Kubernetes, allowing **side-by-side comparison of synthetic and real behavior on the same hardware**.
 
 ---
 
-## 5. Scheduling and Admission Control
+## 6. Scheduling and Admission Control
 
-### 5.1 Core Capacity Model
+### 6.1 Core Capacity Model
 
 cLLM models inference capacity along **two independent axes**: a *stock* of token-cost that may be in flight at any instant, and a *flow* of tokens generated per second. Each axis has its own knob and binds in different regimes; together with a load-dependent degradation function they reproduce the soft-saturation behavior of real GPU-backed inference.
 
 * **`max_tokens_in_flight`** — the admission stock. The total estimated token cost (prompt + projected completion) the system will admit concurrently. Bound by the cost-based admission gate; binds first when many requests overlap.
 * **`max_tokens_per_second`** — the replay flow. The ideal token *generation* rate of an isolated request on the synthetic execution path; binds during streaming.
-* **`f(load)`** — a configurable degradation function that scales the *effective* per-request flow downward as the in-flight stock approaches saturation.
+* **`f(load)`** — a saturation curve that scales the *effective* per-request flow downward as the in-flight stock approaches saturation. In the current implementation this is a single scalar knob, `max_degradation` (percent, default `10`, range `0`–`95`): zero degradation until in-flight cost exceeds 10% of `max_tokens_in_flight`, then a linear ramp to `max_degradation`% at full budget. The shape is fixed; the magnitude is configurable.
 
 The effective per-request streaming rate is therefore:
 
@@ -97,7 +158,7 @@ Unlike a fixed concurrent-requests or fixed global tokens-per-second model, this
 
 ---
 
-### 5.2 Capacity Regimes and System Behavior
+### 6.2 Capacity Regimes and System Behavior
 
 This model allows the system to simulate distinct operating regimes:
 
@@ -160,13 +221,14 @@ bounds how fast each one streams. As load increases, `f(load)` reduces the per-r
 
 ---
 
-### 5.3 Queue Structure and Admission Control
+### 6.3 Queue Structure and Admission Control
 
-The scheduler maintains three request states:
+The scheduler maintains four request states:
 
 * **Active set**: requests currently consuming token-cost capacity
 * **Waiting queue**: buffered requests awaiting admission, served strictly FIFO
 * **Rejected requests**: requests refused at the gate and returned as HTTP 429
+* **Cancelled requests**: client-disconnect mid-flight; the request returns its `cost` to the global budget so the next waiting request can proceed without delay
 
 Admission is **cost-based** rather than count-based. Each incoming request is assigned an estimated token cost:
 
@@ -189,26 +251,30 @@ Backpressure is therefore enforced on three independent dimensions — per-tenan
 
 ---
 
-### 5.4 Throughput Degradation
+### 6.4 Throughput Degradation
 
-As concurrency increases beyond optimal levels:
+As in-flight cost rises toward the admission ceiling, cLLM scales each cached-replay request's streaming rate down to simulate GPU contention:
 
 ```text
-tokens/sec per request ↓
-latency ↑
+effective_tokens_per_second = max_tokens_per_second × (1 − d(load))
 ```
 
-The degradation behavior is controlled by a configurable function `f(load)`, which allows the system to simulate:
+where `d(load)` is a piecewise-linear curve driven by the single `max_degradation` knob (equivalently, `f(load) = 1 − d(load)` from §6.1):
 
-* gradual contention
-* soft saturation
-* non-linear latency growth
+* **`load = in_flight_cost / max_tokens_in_flight`**
+* **`load ≤ 0.10`** → `d = 0` (no degradation while the budget is mostly free)
+* **`load > 0.10`** → `d` ramps linearly from `0` to `max_degradation`% as `load` goes from `0.10` to `1.0`
+* **`max_degradation = 0`** disables degradation entirely
 
-This avoids unrealistic “hard cliff” capacity limits and better reflects real GPU scheduling dynamics.
+Defaults: `max_degradation = 10` (percent), range `0`–`95`. The shape is fixed in code; only the magnitude and on/off are operator-tunable. The current value is exposed live as `computed_degradation_percentage` on `GET /config` and the config HTML page, so operators can watch the curve activate under load.
+
+Degradation applies on the **cached-replay path only** — the upstream (vLLM/OpenAI) path is paced by the real backend, not by `f(load)`. Together with the queue/admission gates, this produces the system-level non-linear latency growth described in §6.2: the per-request rate curve itself is linear past the 10% threshold, but the queue-bound regime amplifies it into the soft-saturation behavior real GPU schedulers exhibit.
+
+This avoids unrealistic “hard cliff” capacity limits while staying honest about what the simulation actually models: a calibrated throughput envelope with a tunable contention slope, not a learned GPU scheduler.
 
 ---
 
-### 5.5 Multi-Tenant Fairness
+### 6.5 Multi-Tenant Fairness
 
 To support multi-tenant workloads and heterogeneous request sizes, cLLM enforces fairness at admission via a per-tenant token bucket. Each request is tagged with an `X-Tenant-Id` header (case-insensitive, validated against `[a-z0-9_-]{1,64}`); unknown, missing, or malformed values route to a built-in `default` tenant, which prevents Prometheus label cardinality attacks and keeps unauthenticated traffic on a single shared lane.
 
@@ -234,58 +300,69 @@ The result is a realistic simulation of fairness in shared inference systems wit
 
 ---
 
-## 6. Realistic Generation and Execution Model
+### 6.6 Calibrated Capacity Scaling
+
+A single physical GPU acts as the system's calibration baseline. Running the benchmark suite with `:dsl no-cache` routes every request through the real backend (e.g., vLLM) without touching the cache, producing a measured throughput envelope on the reference hardware (for example, ~32 tokens/sec/request observed on a single consumer GPU running Qwen2.5-3B-Instruct). Removing the DSL directive switches identical prompts onto the synthetic path: the same cached responses are replayed under per-request TPS pacing, prefill simulation, and the cost-based admission stock, reproducing that envelope at the same scale on the same machine.
+
+Increasing the configured per-request rate — `:dsl tps=96` on the prompt, the `tps-*` profiles, or a runtime `POST /config` update — multiplies the simulated capacity proportionally, modeling additional GPUs without provisioning them. A measured baseline of 32 tps/request becomes a 3-GPU deployment at `tps=96`, an 8-GPU deployment at `tps=256`, and so on. Latency curves, queue dynamics, and tenant fairness can be evaluated at 2×, 4×, or 16× the baseline GPU count on a single physical machine, and the calibration anchor remains available at any time — re-running with `:dsl no-cache` re-measures the real backend so the synthetic envelope can be revalidated after model, prompt, or vLLM-version changes.
+
+The mechanism turns the platform into a **capacity-scaling sandbox**: experiments that would otherwise require buying, deploying, and tuning N×GPUs reduce to a single config change against a calibrated baseline. The same workflow supports the inverse direction — running `:dsl re-cache` refreshes a stale cached response with a fresh real-backend call so the cached library tracks the real model over time without dropping the synthetic path.
+
+**Scope and limits.** This calibration models *system-level* dynamics — queueing, admission, tenant fairness, tail latency, throughput degradation under load — and reproduces them with high fidelity at scaled-up GPU counts. It does **not** model micro-architectural GPU effects: KV-cache pressure spikes, batch-scheduler interleaving inside vLLM, or content-dependent decode-time variance. Synthetic capacity scales the throughput *envelope*, not the underlying compute, so power, thermal, and per-token cost comparisons against real N-GPU deployments require separate calibration. Real GPU clusters also scale sublinearly past some point due to interconnect, KV-cache contention, and batching limits; cLLM expresses that explicitly through the `f(load)` degradation curve (§6.4), so the linear `tps ≈ k × GPU_count` mapping is a starting point that operators tune against measured multi-GPU runs, not a permanent assumption.
+
+---
+
+## 7. Realistic Generation and Execution Model
 
 cLLM models inference as a two-phase process—**prefill** and **decode (streaming)**—with both phases driven by the same underlying capacity and load dynamics. Rather than treating latency as a fixed delay, the system applies **load-aware degradation and controlled variability** to reproduce the non-ideal behavior of real inference systems.
 
 ---
 
-### 6.1 Prefill Latency
+### 7.1 Prefill Latency
 
-Prefill latency is modeled as a **load-dependent startup cost** proportional to prompt size:
+Prefill latency is modeled as a load-dependent startup cost proportional to prompt size, computed on the cached-replay path before the first byte:
 
 ```text
-prefill_time ∝ prompt_tokens / effective_prefill_rate
+prefill_time = base_overhead
+             + prompt_tokens / (effective_decode_rate × prefill_rate_multiplier)
+             × (1 + jitter)        # jitter ∈ [−prefill_jitter_percent, +prefill_jitter_percent]
+             capped at prefill_max_ms
 ```
 
 Where:
 
-* **effective_prefill_rate** is derived from the system’s capacity model and degrades as concurrency increases
-* prefill latency increases under load, reflecting contention for CPU resources, memory bandwidth, and attention setup
+* **`effective_decode_rate = max_tokens_per_second × (1 − d(load))`** — the same rate used by streaming (§6.4), so prefill and decode share one capacity model.
+* **`prefill_rate_multiplier`** — how much faster prefill is than decode on the simulated GPU. Default `0` (prefill **disabled**); range `0`–`20`. Operators set this to a non-zero value to enable prefill simulation.
+* **`prefill_base_overhead_ms`** — a flat additive term per request to model fixed setup cost (default `0`, max `60000`).
+* **`prefill_jitter_percent`** — stochastic variation around the computed delay (default `0`, max `100`).
+* **`prefill_max_ms`** — hard ceiling on prefill duration (default `3000`) so a pathologically large prompt cannot block a worker indefinitely.
 
-To capture real-world variability, prefill includes:
-
-* **Load-dependent degradation** — latency increases as system pressure rises
-* **Jitter** — stochastic variation to simulate CPU scheduling, caching effects, and runtime overhead
-
-Prefill is **coupled to the global capacity model**, ensuring that changes in throughput, concurrency limits, or degradation curves consistently affect both startup and generation behavior.
+Because `effective_decode_rate` is what `f(load)` already shapes, prefill latency rises automatically as the in-flight token budget fills — reflecting contention for compute, memory bandwidth, and attention setup without a separate degradation curve.
 
 ---
 
-### 6.2 Decode and Streaming Behavior
+### 7.2 Decode and Streaming Behavior
 
-After prefill, requests enter the decode phase, where tokens are emitted over time based on allocated throughput.
+After prefill, requests enter the decode phase, where tokens are emitted from the cached response over time. The active set is served **strictly FIFO** — there is no weighted decode-time scheduler. Tenant fairness is enforced at **admission** (§6.5), not at decode; once a request enters the active set, all admitted requests stream against the same capacity model.
 
-Token emission is governed by:
+Per-request streaming rate is the same `effective_tokens_per_second` from §6.4:
 
-* **Allocated tokens/sec** from the scheduler
-* **Weighted fairness**, based on tenant priority, request size, and queue age
-* **System load**, via the degradation function
+```text
+effective_tokens_per_second = max_tokens_per_second × (1 − d(load))
+```
 
-Streaming behavior includes:
+Layered on top of that base pacing are four opt-in realism knobs that perturb individual content segments during cache replay:
 
-* **Jitter and burstiness** — tokens are emitted in uneven intervals rather than a fixed cadence
-* **Partial stalls** — probabilistic pauses that simulate:
+* **`stream_variability_percent`** — systematic per-segment rate variation (default `0`).
+* **`stream_jitter_percent`** — zero-mean stochastic variation around each segment’s scheduled delay (default `0`, max `100`).
+* **`stream_stall_probability_percent`** — chance that a segment is followed by a partial stall (default `0`, max `100`).
+* **`stream_stall_min_ms` / `stream_stall_max_ms`** — stall duration range when triggered (defaults `100`/`800`, max `60000`).
 
-  * attention bottlenecks
-  * memory pressure
-  * scheduling delays
-
-These effects ensure that token generation reflects the variability of real GPU-backed inference rather than idealized constant-rate output.
+Stalls simulate attention bottlenecks, KV-cache pressure, and scheduling delays observed in real GPU-backed inference. With all four knobs at their defaults, decode emits tokens at a strict per-request TPS cadence under `f(load)` only — the predictable baseline described in §7.5.
 
 ---
 
-### 6.3 Unified Load-Driven Behavior
+### 7.3 Unified Load-Driven Behavior
 
 Both prefill and decode phases are driven by the same underlying capacity model:
 
@@ -309,7 +386,7 @@ This unified model ensures that all phases of request execution respond consiste
 
 ---
 
-### 6.4 Latency Decomposition
+### 7.4 Latency Decomposition
 
 Total request latency is decomposed into:
 
@@ -334,7 +411,7 @@ This decomposition allows precise attribution of latency to specific system beha
 
 ---
 
-### 6.5 Realism Is Opt-In by Default
+### 7.5 Realism Is Opt-In by Default
 
 The realism mechanisms described above (prefill simulation, jitter, rate variability, partial stalls) are **disabled by default**. Out of the box the system replays cached responses at a strict per-request TPS cadence with global degradation `f(load)` still applied; nothing else perturbs the schedule. This is intentional:
 
@@ -346,11 +423,13 @@ In short: TPS pacing and load-driven degradation are always on; everything else 
 
 ---
 
-## 7. Observability and Traceability
+## 8. Observability and Traceability
 
-### 7.1 Request-Level Tracing
+cLLM is a **fully instrumented GPU experimentation platform**, not just a service that exports metrics. Every experiment is observable on the same time axis at three layers — the synthetic admission/replay system, the real serving stack (vLLM), and the underlying physical GPU — and a shared request-correlation ID ties Prometheus series, structured logs, and the request-lifecycle event stream together. The result is a workflow where a single benchmark run produces directly comparable evidence across all three layers, partitioned by DSL directive family, tenant, and outcome.
 
-Each request is assigned a **correlation ID** and tracked through:
+### 8.1 Request-Level Tracing
+
+Each request is assigned a **correlation ID** (`X-Request-ID`, propagated via context and slog) and tracked through:
 
 ```text
 received → [queued] → admitted → started → [dsl_applied] → [prefill] → first_token → completed | rejected
@@ -358,7 +437,13 @@ received → [queued] → admitted → started → [dsl_applied] → [prefill] �
 
 Bracketed events are conditional: `queued` fires only when the global gate forces a wait (so an immediately-admitted request emits only `admitted`); `dsl_applied` fires when one or more DSL directives are parsed; `prefill` fires only on cache hits with prefill simulation enabled. `rejected` is a terminal event that may replace any later event when admission, validation, or downstream processing fails.
 
-This enables root-cause analysis of latency:
+The same `request_id` appears on three surfaces:
+
+* **Structured logs** — `event=… outcome=… request_id=… tenant=… cost=…`
+* **Prometheus** — `cllm_request_lifecycle_events_total{event, outcome}` counters
+* **HTTP** — echoed back as the `X-Request-ID` response header on every reply, including 429s
+
+This three-way join enables root-cause analysis of latency:
 
 * queueing delay
 * scheduling delay
@@ -368,23 +453,26 @@ This enables root-cause analysis of latency:
 
 ---
 
-### 7.2 System-Level Metrics
+### 8.2 System-Level Metrics
 
-Key metrics include:
+cLLM exports more than 20 Prometheus series organized by family (HTTP/lifecycle, throughput, generation simulation, cache, DSL, tenant, upstream — see §5.3). The series most often used in experiment analysis:
 
-* tokens/sec (global + per request)
-* TTFT (proxy for queueing delay)
-* queue depth and wait time
-* latency percentiles (P50/P95/P99)
-* stall and prefill histograms
-* **token-cost in flight** vs `max_tokens_in_flight` (admission saturation)
-* **per-tenant admissions and rejections** via `cllm_tenant_admissions_total{tenant}` and `cllm_tenant_rejections_total{tenant, reason}` where `reason ∈ {tenant_rate, over_capacity}`
+* tokens/sec (global + per request) — `cllm_completion_tokens_total`
+* TTFT (proxy for queueing + prefill) — `cllm_time_to_first_byte_seconds`
+* queue depth and wait time — `cllm_queue_wait_duration_seconds`
+* latency percentiles (P50/P95/P99) — `cllm_job_duration_seconds`, `cllm_http_request_duration_seconds`
+* stall and prefill histograms — `cllm_stream_stall_duration_seconds`, `cllm_prefill_duration_seconds`
+* **token-cost in flight** vs `max_tokens_in_flight` — admission saturation
+* **per-tenant admissions and rejections** — `cllm_tenant_admissions_total{tenant}`, `cllm_tenant_rejections_total{tenant, reason}` with `reason ∈ {tenant_rate, over_capacity}`
 
-Lifecycle log events include `tenant` and `cost` fields for every request, so per-tenant attribution is available in both metrics and logs.
+Two cross-cutting label dimensions make these metrics directly comparable inside a single time window:
+
+* **DSL family.** Every DSL-aware histogram and counter (`cllm_dsl_requests_total`, `cllm_dsl_time_to_first_byte_seconds`, `cllm_dsl_job_duration_seconds`) is partitioned by `family` (e.g. `tps`, `prefill`, `stall`, `no-cache`, `re-cache`, `none`). A single benchmark that mixes prompt variants produces side-by-side latency and rejection curves per variant — no separate runs, no time-aligned overlay required.
+* **Tenant + outcome.** Lifecycle log events include `tenant` and `cost` fields for every request, mirroring the metric labels, so per-tenant attribution is available identically in metrics, logs, and dashboards.
 
 ---
 
-### 7.3 Latency Decomposition
+### 8.3 Latency Decomposition
 
 ```text
 Total Latency = TTFT + Streaming Duration
@@ -399,66 +487,199 @@ This decomposition enables precise reasoning about system bottlenecks.
 
 ---
 
-## 8. Live Reconfiguration and Experimentation
+### 8.4 Three-Layer Observability
 
-The system exposes a `/config` API allowing runtime changes to:
+The deployment ships three Grafana dashboards designed to be read together:
 
-* token capacity (`max_tokens_in_flight`, `max_tokens_per_second`, `max_waiting_requests`)
-* degradation curves
-* DSL default profile
-* realism parameters (prefill, jitter, stalls)
+| Dashboard | Source | Answers |
+| --- | --- | --- |
+| **`cllm-overview`** | `cllm_*` Prometheus series + DSL-family panels | What did *the system* do? Admission, queue, fairness, per-DSL-family latency, cache lookups, downstream timing. |
+| **`vllm-overview`** | upstream vLLM `/metrics` | What did *the real serving stack* do? Running/queued requests, KV-cache usage, request success rate, token throughput, latency p95, HTTP rate, request outcomes. |
+| **`gpu-overview`** | DCGM exporter | What did *the physical GPU* do? Utilization, framebuffer memory, power draw, temperature, peak utilization/memory/power/temp per GPU. |
 
-Tenant rate/burst are loaded from `configs/tenants.yaml` at startup and are not currently editable through `/config`; updates require a restart or a programmatic call to `Handler.SetTenants`.
+The dashboards share a time axis, so a single experiment is interpretable end-to-end without correlation work. This is what makes the calibration loop from §6.6 actually closed:
 
-This enables:
+* A `:dsl no-cache` benchmark run forces every request to vLLM. All three dashboards light up: `cllm-overview` shows admission and queue behavior; `vllm-overview` shows running requests, KV-cache pressure, and real token throughput; `gpu-overview` shows utilization, power, and thermals at that workload. The measured envelope (e.g. ~32 tokens/sec/request on a single GPU) is the calibration anchor.
+* Removing the directive switches identical prompts to the synthetic replay path. `cllm-overview` reproduces the same envelope on the same machine; `vllm-overview` and `gpu-overview` go quiet (no upstream traffic, no GPU work). Side-by-side, this is the proof that the synthetic path tracks the real backend.
+* Increasing per-request TPS (`tps=96`, `tps=256`, …) scales the synthetic capacity proportionally, simulating N×GPU deployments while `gpu-overview` continues to show only the single physical GPU's actual cost.
 
-* A/B testing of scheduling policies
-* rapid iteration without restarts
-* real-time observation of system behavior changes
+The combination — a synthetic system instrumented identically to the real one, side-by-side dashboards, shared request correlation, and DSL-family partitioning — is what turns cLLM from a load generator into an experimentation platform: scheduling, fairness, backpressure, and capacity-scaling experiments are reproducible, attributable, and observable across all three layers in the same run.
 
 ---
 
-## 9. Reproducible Workloads
+## 9. Live Reconfiguration and Experimentation
+
+cLLM exposes the entire experiment surface as **live state**. Operators can change scheduling, admission, generation realism, downstream targeting, and cache contents at runtime, with **no restarts and no redeploys** — either programmatically (`GET /config?key=value`, `POST /config` with a form body) or interactively from a browser via the `/config` HTML page that reflects current values, valid ranges, and live-computed quantities.
+
+The full set of live-tunable knobs (each validated against the bounds defined in `runtimeconfig`):
+
+**Capacity and admission**
+
+* `max_tokens_in_flight` — global cost budget (admission stock)
+* `max_tokens_per_second` — per-request streaming rate
+* `max_waiting_requests` — bounded FIFO depth
+* `max_degradation` — throughput-degradation magnitude (§6.4)
+
+**Prefill simulation** (§7.1)
+
+* `prefill_rate_multiplier`, `prefill_base_overhead_ms`, `prefill_jitter_percent`, `prefill_max_ms`
+
+**Stream realism** (§7.2)
+
+* `stream_variability_percent`, `stream_jitter_percent`, `stream_stall_probability_percent`, `stream_stall_min_ms`, `stream_stall_max_ms`
+
+**Per-request defaults**
+
+* `system_prompt`, `max_tokens`, `temperature`
+
+**Backend targeting**
+
+* `downstream_url`, `downstream_token`, `downstream_model`
+
+**DSL**
+
+* `dsl_profile` — the default DSL profile applied when a request omits its own directive (composes with per-request `:dsl …`)
+
+**Cache**
+
+* `cache_size` (capacity), plus three actions invoked through `POST /config` with `action=`:
+  * `clear` — empty the in-memory cache
+  * `save` — write the in-memory cache to disk
+  * `load` — reload the cache from the on-disk file
+
+The `/config` GET response also exposes **live-derived quantities** — `effective_tokens_per_second`, `computed_degradation_percentage`, current `tokens_in_flight`, `waiting_requests`, `cache_entries`, build version — so the same surface that drives experiments is also a real-time observability panel.
+
+Tenant rate/burst are loaded from `configs/tenants.yaml` at startup (overridable via `CLLM_TENANTS_FILE`) and are not currently editable through `/config`; updates require a restart or a programmatic call to `Handler.SetTenants`. Editing tenant rate/burst over the live API is on the roadmap (§14).
+
+Combined with per-request DSL directives (§12), the platform supports a wide spectrum of experiment styles without redeployment:
+
+* **Global policy sweeps** — ramp `max_tokens_in_flight` or `max_degradation` while a steady benchmark runs and read the response off the three observability layers (§8.4).
+* **A/B comparisons** — split traffic across DSL families (`tps`, `prefill`, `stall`, `no-cache`, `re-cache`) in a single run; metrics are partitioned by family automatically (§8.2).
+* **Cache-state transitions** — `:dsl no-cache` measures the real backend, `:dsl re-cache` refreshes a stale entry, `action=save`/`load` snapshots and restores a known-good cache between experiments.
+* **Backend swaps** — retarget `downstream_url`/`downstream_model` mid-flight to compare the same workload against vLLM, OpenAI, or another OpenAI-compatible upstream without redeploying the synthetic system.
+* **Real-time observation of policy changes** — because every knob has a corresponding metric or label dimension, the *moment* a value changes is visible on the dashboards.
+
+In short: every parameter that affects scheduling, admission, generation, or routing is a live knob, every change is observable on the same three-layer dashboard stack, and per-request DSL composition lets a single deployment run multiple experiments concurrently.
+
+### 9.1 Per-Request Reconfiguration via DSL
+
+`/config` changes are **global** — they affect every subsequent request. cLLM also supports **per-request** reconfiguration through the DSL directive system (§12): an in-prompt `:dsl …` line lets a single request override behavior without disturbing global state or other tenants in flight. This makes DSL the natural counterpart to `/config` for experiments that need surgical, traffic-mixed changes rather than a global flip.
+
+The two cache-routing directives matter most for live experimentation:
+
+* **`:dsl no-cache`** — bypasses the cache on both lookup *and* write. The request is forwarded to the configured upstream and its response is **not** cached. This is the calibration primitive (§6.6, §8.4): a single benchmark run with `:dsl no-cache` measures the real backend on the same hardware while leaving the cached library untouched. It also serves as a "force real" escape hatch when an operator wants to verify upstream behavior mid-experiment without flushing the cache.
+* **`:dsl re-cache`** — bypasses the cache on lookup but **does** write back. The upstream response replaces (or creates) the cache entry for that key. This is the refresh primitive: when a model upgrade, prompt change, or vLLM-version bump makes a cached response stale, sending the same prompt with `:dsl re-cache` updates that single entry in place — no cache wipe, no other entries disturbed, no other tenants impacted.
+
+Combined, they form a low-disruption maintenance loop alongside the cache `action=` endpoints: `re-cache` for targeted refresh, `no-cache` for one-off real-backend probes, `action=clear/save/load` for whole-cache lifecycle. Per-request DSL also composes with the global `dsl_profile` default — operators set the baseline globally and override per request when an experiment needs a different shape.
+
+---
+
+## 10. Reproducible Workloads
 
 cLLM treats cached prompts as **versioned workload artifacts**:
 
 * prompt sets can be recorded and replayed
 * token pacing derived from real BPE token counts
 * identical workloads can be replayed across configurations
+* the cache itself is snapshot-able (`POST /config?action=save`/`load`) so a known-good workload library is portable across deployments and CI runs
 
 This ensures:
 
 * deterministic benchmarking
 * reproducible experiments
 
+### 10.1 Pass-Through Reproduction (Real → Cache)
+
+Reproducibility is not just "replay the same synthetic run twice" — it is also **"replay a real vLLM run on the same hardware without paying for it again."** The pass-through path makes this loop trivial:
+
+1. Run `ask --bench --files prompts.yaml` against a cLLM instance pointed at vLLM with `:dsl no-cache` (or against vLLM directly). Every request goes to the real backend and `vllm-overview` + `gpu-overview` capture the ground truth.
+2. Drop the `:dsl no-cache` and run the same `prompts.yaml` again. The responses are now cached, so identical prompts are replayed synthetically at the calibrated envelope (§6.6) — no GPU cost, no upstream traffic, sub-second cache hits.
+3. The cached library is the artifact. Snapshot it with `POST /config?action=save`; share or commit the file; reload it on another machine with `action=load` to reproduce the *same* synthetic envelope on different hardware.
+
+This turns a one-time real-GPU benchmark into a permanently-replayable workload — the original measurement is preserved as data, not as transient telemetry, and every subsequent experiment runs against that captured ground truth at zero marginal GPU cost.
+
+### 10.2 Concurrent Multi-Target Benchmarking
+
+cLLM and vLLM run side-by-side in the same Kubernetes namespace, each on its own ingress, sharing the same prompt artifacts and the same observability stack (§8.4). Because `ask --bench` is keyed on `ASK_URL`, multiple benchmark drivers can run **concurrently against different targets in the same time window**:
+
+```bash
+# Terminal 1 — drive the real backend
+ASK_URL=https://vllm.example/v1   ask --bench 20 --loop --files prompts.yaml
+
+# Terminal 2 — drive the synthetic system on the same prompts
+ASK_URL=https://cllm.example/v1   ask --bench 20 --loop --files prompts.yaml
+
+# Terminal 3 — pass-through with no-cache to verify upstream behavior live
+ASK_URL=https://cllm.example/v1   ask --bench 20 --loop --files prompts.yaml \
+    --dsl no-cache
+```
+
+All three drivers light up dashboards in parallel — `vllm-overview` and `gpu-overview` for the real and pass-through streams, `cllm-overview` for the synthetic stream — with shared time axes and per-DSL-family partitioning (§8.2) for direct comparison. A cache run, a real-backend run, and a calibration probe can be executed in the same wall-clock window, on the same hardware, without colliding because each request flows through cLLM's per-tenant admission and per-request DSL routing.
+
+This is what moves cLLM from a *simulator* to a **GPU experimentation platform**:
+
+* **Same prompts, multiple targets, one time window.** Real vs synthetic vs calibration responses are captured concurrently, not in sequential runs that drift apart in load conditions.
+* **No additional GPU cost.** A single physical GPU serves the real-backend stream while the synthetic streams scale arbitrarily (`tps=96`, `tps=256`, …) on the same machine — every additional concurrent benchmark adds load only to the synthetic admission path.
+* **Direct cross-validation.** Side-by-side dashboards make it immediate when the synthetic envelope drifts from the real backend (signal to recalibrate via `:dsl re-cache` or rerun §6.6 calibration), and immediate when a policy change affects only one path.
+
+In short: reproducible workloads are not just stored prompts — they are stored *cached responses* layered on top of a multi-target driver model, and the combined surface lets a single GPU host as many parallel experiments as the synthetic admission gate will admit.
+
 ---
 
-## 10. Validation Against Real Systems
+## 11. Validation Against Real Systems
 
-cLLM is validated by running alongside vLLM in the same Kubernetes cluster:
+cLLM is validated by running alongside vLLM in the same Kubernetes cluster, sharing the same GPU host, the same prompt artifacts, and the same observability stack (§8.4). Validation is therefore not a one-shot benchmark — it is a continuous, side-by-side comparison built into the platform itself.
 
-* GPU telemetry via DCGM
-* shared dashboards
-* identical workloads
+### 11.1 Side-by-Side Deployment
 
-Observed alignment:
+* GPU telemetry via DCGM (`gpu-overview` dashboard)
+* upstream telemetry via vLLM `/metrics` (`vllm-overview` dashboard)
+* synthetic telemetry via cLLM (`cllm-overview` dashboard, including DSL-family partitioning)
+* identical prompt artifacts (`prompts.yaml`) drive both paths
+
+Observed alignment between the synthetic and real paths:
 
 * throughput saturation behavior
 * TTFT growth under load
 * queue dynamics
-* fairness effects
+* fairness effects under multi-tenant load
 
-While hardware-level details are abstracted, the simulator accurately reproduces the **system-level behaviors that drive control plane decisions**.
+### 11.2 Pass-Through as a Validation Primitive
+
+Validation in cLLM is not a separate test harness — it is the same `:dsl no-cache` pass-through path used for calibration (§6.6) and reproduction (§10.1). Pointing the cLLM instance at a real vLLM upstream and running `ask --bench --files prompts.yaml --dsl no-cache` produces the **ground-truth measurement** on `vllm-overview` and `gpu-overview`. Removing the directive and re-running the same `prompts.yaml` against the now-warm cache produces the **synthetic envelope** on `cllm-overview`. Side-by-side, those two runs are the validation: matching latency curves, matching throughput plateaus, matching queue dynamics — at the same load on the same hardware.
+
+The same loop also re-validates after change: a model upgrade, vLLM-version bump, or hardware swap is verified by a single `:dsl no-cache` run that updates the ground truth, optionally followed by `:dsl re-cache` to refresh stale entries (§9.1) so the synthetic library tracks the new real behavior. Validation is incremental and addressable, not a full re-benchmark.
+
+### 11.3 Concurrent Multi-Target Validation
+
+Because cLLM and vLLM are independent ingresses, validation can run **concurrently** rather than sequentially. Multiple `ask --bench` drivers, each pointed at a different `ASK_URL`, share the same time axis and the same Grafana stack (§10.2):
+
+* one driver against vLLM directly — establishes the real-backend baseline
+* one driver against cLLM with `:dsl no-cache` — exercises the pass-through path under identical conditions, isolating any cLLM-side overhead
+* one or more drivers against cLLM's synthetic path at varying `tps` — exercises the calibrated envelope at 1×, 2×, 4×, 16× simulated GPU counts
+* drivers may also be split across DSL families (`prefill`, `stall`, …) to validate that realism layers reproduce the contention shape, not just the raw throughput envelope
+
+Because every histogram and counter is partitioned by DSL family (§8.2), the comparison is **inside a single time window on a single dashboard**, not across time-stitched runs that drift apart in load conditions or background noise.
+
+### 11.4 What Validation Establishes
+
+* **System-level fidelity.** The synthetic path reproduces the throughput/latency/queue dynamics that drive control-plane decisions — admission, fairness, backpressure, capacity scaling — at the same shape as the real backend on the same hardware.
+* **Hardware-level abstraction is honest.** Micro-architectural effects (KV-cache pressure spikes, batch-scheduler interleaving, content-dependent decode-time variance) are intentionally not simulated; the synthetic path scales the *envelope*, not the underlying compute (§6.6 caveats).
+* **Validation is continuous, not a milestone.** The same `:dsl no-cache` mechanism that calibrated capacity (§6.6) and reproduced workloads (§10.1) is the validation primitive — there is no separate "validation pipeline" to maintain, and any operator can re-validate at any time at the cost of a single benchmark run.
+
+This is what moves cLLM from a *simulator* to a **GPU experimentation platform**: validation, calibration, and reproduction share one mechanism and one dashboard surface, and a single physical GPU concurrently hosts the ground-truth measurement, the calibrated synthetic baseline, and any number of scaled-up experiments — at no additional GPU cost.
 
 ---
 
-## 11. Replay DSL (Per-Request Execution Directives)
+## 12. Replay DSL (Per-Request Execution Directives)
 
 cLLM includes a **Replay DSL** that allows individual requests to carry execution directives which modify replay behavior without changing workload identity or global configuration. This turns the control plane into a **per-request experiment surface**, enabling mixed workloads, targeted fault injection, and reproducible scenario design.
 
+**What "DSL" means here.** DSL stands for **domain-specific language** — a small, purpose-built grammar embedded inside chat prompts. It is not a general programming language and not a query language; it is a tiny set of orthogonal directives (see §12.3) that describe *how* a request should be executed: routing (`no-cache`, `re-cache`), pacing (`tps=…`), prefill shape, jitter, stalls, and a few others. The directives are parsed before the request reaches the cache or the upstream and are surfaced as Prometheus labels and structured-log fields, so every per-request decision is observable and reproducible. The DSL composes with the global `/config` surface (§9): `/config` sets the *default* behavior, the DSL *overrides per request*, and the cache key is computed from the cleaned prompt only — so identical prompts always map to the same cached response regardless of which directives drove the original capture.
+
 ---
 
-### 11.1 Design Goals
+### 12.1 Design Goals
 
 * **Per-request control** without service restarts or global config changes
 * **Reproducibility**: identical prompts map to the same cache entry regardless of directives
@@ -468,14 +689,14 @@ cLLM includes a **Replay DSL** that allows individual requests to carry executio
 
 ---
 
-### 11.2 Syntax and Parsing
+### 12.2 Syntax and Parsing
 
-Directives are embedded in prompts using a `:dsl` marker (case-insensitive). The parser:
+Directives are embedded in prompts using a `:dsl` marker (case-insensitive). The DSL line ends at the first newline after the marker; anything past that newline is treated as the prompt body. The parser:
 
-* **Strips the marker and every trailing whitespace-separated token** from the message before forwarding to downstream models and before cache key generation
+* **Strips the marker and the directive line** from the message before forwarding to downstream models and before cache key generation. When the prompt body follows on a subsequent line, that body is preserved as the cleaned message content.
 * Applies **first-occurrence-of-each-class-wins** semantics across all messages (e.g., the first `tps=` directive in any message wins; later same-class directives are silently dropped)
 * Resolves ranges and randomness against a shared jitter source so a fixed seed produces a fixed schedule
-* Treats `no-cache` as having the highest precedence — it is honored regardless of position in the token stream
+* Treats cache directives (`no-cache`, `re-cache`) as having the highest precedence — they are honored regardless of position in the token stream and share a single `cache` directive class (first-wins)
 * Treats `no-delay` as a **macro** that expands to `no-prefill no-jitter no-variability no-stall`; it does **not** halt parsing and does **not** disable TPS pacing
 
 Numeric directives use a uniform `key=value` shape. The `=` is optional, so `segment 50` and `segment=50` are equivalent. Values are signed integers (`50`, `-30`) or signed ranges `lo:hi` (`30:50`, `-50:-30`, `-20:20`); inverted bounds are normalized by swapping. For ranges, the value is drawn uniformly from `[lo, hi]` once per request, except `segment=…` which redraws per stream segment.
@@ -495,13 +716,14 @@ After parsing:
 
 ---
 
-### 11.3 Supported Directive Classes
+### 12.3 Supported Directive Classes
 
 The DSL groups directives into orthogonal classes; each class can be claimed at most once per request (first-wins).
 
 * **Cache control**
 
-  * `no-cache` — bypass cache lookup; refresh-write the response (highest precedence)
+  * `no-cache` — bypass cache lookup AND skip the cache write (pure passthrough; cache contents unchanged)
+  * `re-cache` — bypass cache lookup but write the fresh response back, replacing any stale entry (cache refresh)
 * **Throughput**
 
   * `tps=N` / `tps=A:B` — pin per-request decode rate (1–2048)
@@ -523,13 +745,13 @@ The DSL groups directives into orthogonal classes; each class can be claimed at 
   * `max-tokens=N` / `max-tokens=A:B` — override `max_tokens` for this request (does not affect cache key)
 * **Composition**
 
-  * `profile=NAME` — expand a named directive bundle (see 11.5)
+  * `profile=NAME` — expand a named directive bundle (see 12.5)
 
 A bare keyword followed by a non-numeric next token is treated as a no-op; the next token is then parsed independently. Unknown or malformed tokens are silently ignored for forward compatibility.
 
 ---
 
-### 11.4 Execution Model Integration
+### 12.4 Execution Model Integration
 
 Parsed directives are carried as **replay overrides** through the execution pipeline:
 
@@ -548,7 +770,7 @@ Global degradation (`f(load)`) is still applied on top of per-request overrides,
 
 ---
 
-### 11.5 Profiles
+### 12.5 Profiles
 
 Profiles are **named directive bundles** loaded from `configs/profiles.yaml` at startup. They keep prompts terse for benchmark scenarios — the prompt names a profile and the server expands it.
 
@@ -571,7 +793,7 @@ The shipped catalog includes:
 
 ---
 
-### 11.5.1 Server-Wide Default Profile
+### 12.5.1 Server-Wide Default Profile
 
 A single profile may be designated as the **server-wide default**, applied to every request that omits the `:dsl` marker entirely. This lets operators shift the baseline replay behavior of an entire deployment without modifying client prompts.
 
@@ -596,13 +818,15 @@ A single profile may be designated as the **server-wide default**, applied to ev
 
 ---
 
-### 11.6 Cache and Workload Identity
+### 12.6 Cache and Workload Identity
 
 A key design principle is that **DSL directives do not affect cache identity**:
 
 * Cache keys are generated **after directive stripping**
 * Multiple DSL variants of the same prompt map to the **same cached response**
-* `no-cache` bypasses the lookup but still writes the downstream response back into the cache (refresh semantics)
+* `no-cache` bypasses the lookup and skips the write — useful for benchmarking the upstream model without polluting cached results
+* `re-cache` bypasses the lookup and writes the fresh response back — useful for refreshing a stale entry in place
+* `no-cache` and `re-cache` share a single directive class, so combining them in one prompt is harmless (first wins)
 
 This ensures:
 
@@ -612,7 +836,7 @@ This ensures:
 
 ---
 
-### 11.7 Observability
+### 12.7 Observability
 
 DSL usage is fully instrumented:
 
@@ -634,7 +858,7 @@ This enables:
 
 ---
 
-### 11.8 Use Cases
+### 12.8 Use Cases
 
 The Replay DSL enables several high-value scenarios:
 
@@ -651,7 +875,7 @@ The Replay DSL enables several high-value scenarios:
 
 ---
 
-### 11.9 Example Scenarios
+### 12.9 Example Scenarios
 
 #### Interactive vs Batch
 
@@ -703,7 +927,7 @@ Show me a streaming response that wobbles around real-time.
 
 ---
 
-### 11.10 Key Insight
+### 12.10 Key Insight
 
 The Replay DSL extends cLLM from a configurable system into a **programmable execution environment**:
 
@@ -716,25 +940,70 @@ Together, these allow **precise, reproducible, and composable experiments** on L
 
 ---
 
-## 12. Key Insights
+## 13. Cost and Operational Footprint
 
-1. **LLM serving is dominated by scheduling and queueing, not raw compute**
-2. **Tokens are the correct unit of resource modeling**
-3. **Latency is primarily driven by queueing under contention**
-4. **Small scheduling changes can significantly impact fairness and tail latency**
-5. **Deterministic simulation enables safer and faster iteration than GPU-only testing**
+cLLM is designed so that **the cost of experimentation is decoupled from the cost of the systems being experimented on**. Once the synthetic envelope is calibrated against a real GPU (§6.6, §8.4), every subsequent experiment — scheduling sweeps, fairness validation, capacity-scaling studies, CI regression runs — executes against the cached library at no additional GPU cost.
+
+### 13.1 GPU Multiplier
+
+A single physical GPU host calibrates one envelope; that envelope then scales to model 2×, 4×, 16×, or larger deployments via per-request `tps=N` (§6.6, §12.5). The economic consequence is direct:
+
+* **Scale testing without scale hardware.** Validating scheduling and fairness at thousands-of-GPU equivalents requires *one* calibrated GPU plus arbitrarily many synthetic streams — not a thousand-GPU cluster running for the duration of the test.
+* **Calibration is the only paid hour.** The real-GPU run that anchors the envelope is the only line item against the GPU budget; the experiments that *use* the envelope cost only the synthetic admission path's CPU and memory.
+* **Concurrent multi-target benchmarks share the same host.** Real-backend, pass-through, and synthetic streams run side-by-side on one GPU host (§10.2, §11.3) instead of in serial rented slots that drift apart in load conditions.
+
+At typical cloud GPU rates, a thousand-GPU-hour test campaign reduced to a single calibration hour plus synthetic replay is the difference between a budget-line capital request and a routine engineering activity.
+
+### 13.2 Operational Footprint
+
+The cost story is also an operations story — maybe more so. GPU instances carry overhead beyond their hourly rate:
+
+* **Provisioning latency and quota.** Cloud GPU SKUs are quota-limited, regionally scarce, and slow to spin up. A team that needs to test a scheduling change against a 16-GPU baseline waits on capacity, not on the test.
+* **Build-up and tear-down churn.** Infra teams write automation to start GPU pools before benchmarks and shut them down after, to avoid burning idle GPU-hours. cLLM removes the loop entirely for the synthetic path: the cache library is always-on and costs nothing to leave running.
+* **Reproducibility across rebuilds.** A cached workload library (`POST /config?action=save`/`load`) reproduces the same envelope on different hardware, so cluster rebuilds, region migrations, and CI environment refreshes do not invalidate prior experiments (§10.1).
+* **No GPU drivers in the experiment loop.** CI runners, developer laptops, and air-gapped environments do not need DCGM, NVIDIA drivers, or vLLM's GPU prerequisites to run synthetic experiments — only the calibration host does.
+
+### 13.3 Runs Almost Anywhere
+
+Because cLLM exposes an OpenAI-compatible API and the synthetic path requires no GPU at runtime, a calibrated cache library is portable to almost any host that can run a Go binary and a Kubernetes pod (or a plain container, or a local process):
+
+* **Engineering laptops** — macOS, Windows, Linux — reproduce the calibrated envelope for design and debugging without leaving the developer's machine.
+* **CPU-only servers and CI runners** host long-running benchmark and regression suites without competing for the GPU pool.
+* **Air-gapped or restricted environments** run the synthetic path against committed cache snapshots, so experimentation continues in places where pulling models or holding GPU quota is not an option.
+* **The calibration host stays small.** A single GPU is sufficient to anchor envelopes that downstream consumers replay anywhere; the GPU footprint of the *organization* drops to one calibration host plus zero per experimentation team.
+
+The combined effect: experimentation is no longer rate-limited by GPU availability, GPU budget, or GPU-host operability. The synthetic path is where most engineering time is spent; the real GPU is reserved for the work that genuinely requires it — calibration, validation after a model or vLLM upgrade, and ground-truth measurement.
 
 ---
 
-## 13. Future Work
+## 14. Future Work
 
-* Multi-node routing across heterogeneous GPU clusters
-* KV cache and memory pressure modeling
-* adaptive scheduling based on real-time metrics
-* failure injection (node degradation, network issues)
+1. **KV cache and memory pressure modeling** — close the most prominent §6.6 caveat by modeling KV-cache occupancy and pressure-driven contention, not just the throughput envelope.
+2. **Sublinear / pluggable `f(load)` shapes** — replace the fixed-shape, single-knob `max_degradation` curve (§6.4) with operator-pluggable curves so the linear `tps ≈ k × GPU_count` capacity-scaling assumption (§6.6) can be tuned against measured multi-GPU runs.
+3. **Adaptive scheduling driven by closed-loop metrics feedback** — adjust `max_tokens_in_flight` and `f(load)` automatically from observed `cllm_*` series instead of static configuration.
+4. **Live editing of tenant rate/burst via `/config`** — currently startup-only via `configs/tenants.yaml` or `Handler.SetTenants` (§9).
+5. **Weighted decode-time fairness** — tenant priority, request size, queue age layered on top of the FIFO active set (§7.2).
+6. **Multi-node routing across heterogeneous GPU clusters** — with per-class calibrated capacity envelopes, so a heterogeneous fleet can be simulated from baselines measured on each class (§6.6).
+7. **Failure injection** — upstream failures, partial connectivity, slow DNS, mid-stream upstream drops; complements the in-stream stall/jitter realism in §7.2.
+8. **Replay-time backend selection** — a `:dsl backend=NAME` directive against multiple configured upstreams, extending the multi-target story (§10.2, §11.3) to concurrent real backends.
+9. **Streaming admission preemption** — cooperative cancel-and-requeue under sustained tenant overage; today admitted requests run to completion.
+10. **Prompt-content-dependent decode variance** — stretch or compress streaming time as a function of cleaned-prompt features (length, topic) to close part of the micro-architectural gap noted in §6.6 without simulating a real GPU.
+11. **DSL-level cache-key control** — a `:dsl cache-key=tag` directive so one prompt can carry multiple cached variants (e.g., different model versions or sampling temperatures) without polluting the default cleaned-prompt identity rule (§12.6).
+12. **Cache library tooling and CI regression gates** — diff, prune-by-age, prune-by-tenant, export-by-DSL-family on top of `action=save`/`load` (§10); CI assertions of the synthetic envelope against committed cache snapshots, turning reproducibility into an automated regression gate.
 
 ---
 
-## 14. Conclusion
+## 15. Conclusion
 
-cLLM is not just a simulator—it is a **controllable, instrumented, and validated LLM inference system** that enables the design, testing, and validation of scheduling and scaling decisions before deploying to real GPU infrastructure.
+cLLM is not a simulator. It is a **controllable, instrumented, validated GPU experimentation platform** — built on a real OpenAI-compatible control plane, deployed alongside the same vLLM and observability stack you would run in production, and engineered so that scheduling, admission, fairness, and capacity-scaling decisions can be tested and validated *before* they touch real GPU infrastructure.
+
+The design choices reinforce each other:
+
+* **Tokens are the resource.** Cost-based admission and a soft-saturation `f(load)` curve reproduce the queueing-dominated behavior real serving systems exhibit — without pretending to model individual GPU kernels.
+* **One GPU is enough.** A single physical GPU calibrates the synthetic envelope; `tps=N` then scales that envelope to model 2×, 4×, or 16× GPU deployments on the same machine. Capacity-scaling experiments stop being a budget item.
+* **The DSL turns the control plane into an experiment surface.** Per-request directives compose with global `/config`, so mixed workloads, A/B comparisons, and targeted fault injection run inside a single deployment, in a single time window, against a single dashboard stack.
+* **Validation is not a milestone — it is a primitive.** The same `:dsl no-cache` mechanism that calibrates the system also validates and reproduces it. Real, pass-through, and synthetic streams run side-by-side on one GPU host with shared correlation IDs, shared time axes, and DSL-family-partitioned metrics.
+
+What this buys an engineering team: faster iteration on control-plane behavior, reproducible workloads that survive cluster rebuilds and CI runs, multi-target benchmarks without multi-target hardware, and an honest separation between *what is faithfully modeled* (system dynamics) and *what is intentionally abstracted* (micro-architectural GPU effects). The boundaries are documented, the calibration loop is closed, and every claim in this document is grounded in code that ships in the repository.
+
+cLLM moves LLM serving experimentation from "rent a fleet and hope" to "calibrate once, experiment forever" — without giving up the hardware grounding that makes the results worth trusting.

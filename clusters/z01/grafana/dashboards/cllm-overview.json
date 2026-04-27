@@ -141,7 +141,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(cllm_queue_active_requests)",
+          "expr": "sum(cllm_http_inflight_requests)",
           "refId": "A"
         }
       ],
@@ -891,13 +891,6 @@
           "legendFormat": "HTTP in-flight",
           "range": true,
           "refId": "A"
-        },
-        {
-          "editorMode": "code",
-          "expr": "sum(cllm_queue_active_requests)",
-          "legendFormat": "queue active",
-          "range": true,
-          "refId": "B"
         },
         {
           "editorMode": "code",
