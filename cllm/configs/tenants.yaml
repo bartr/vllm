@@ -1,0 +1,38 @@
+# cllm tenant configuration
+#
+# Each entry under `tenants` configures a token-bucket rate limit for
+# requests carrying a matching X-Tenant-Id header. The tenant name in
+# the header is matched case-insensitively and validated against
+# [a-z0-9_-]{1,64}; any unknown, missing, or invalid value routes to
+# the "default" tenant.
+#
+# Per-tenant limits are applied BEFORE the global cost budget. Each
+# admitted request decrements the tenant's bucket by its estimated
+# token cost (prompt_tokens + min(max_tokens, p95_completion_tokens)).
+# Tokens are refunded if the global budget subsequently rejects the
+# request, so a tenant's quota is only consumed when work actually
+# proceeds.
+#
+# rate  = sustainable token-cost per second (set 0 to disable limit)
+# burst = max token cost in a single burst (defaults to rate when 0)
+
+tenants:
+  default:
+    # Disabled: only the global cost budget gates requests with no
+    # X-Tenant-Id header (or with unknown values).
+    rate: 0
+    burst: 0
+
+  # Example: a small interactive tenant.
+  # Low sustained rate, high burst: snappy under intermittent load,
+  # tolerant of occasional bursts from chat sessions.
+  # interactive:
+  #   rate: 2000       # 2K tokens/sec sustained
+  #   burst: 100000    # absorb large one-shot prompts
+
+  # Example: a large batch tenant.
+  # High sustained rate, moderate burst: optimized for steady throughput
+  # rather than absorbing single-request spikes.
+  # batch:
+  #   rate: 50000
+  #   burst: 100000

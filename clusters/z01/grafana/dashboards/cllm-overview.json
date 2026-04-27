@@ -56,11 +56,11 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[15m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval])))",
           "refId": "A"
         }
       ],
-      "title": "Duration p95",
+      "title": "Latency p95",
       "type": "stat"
     },
     {
@@ -99,7 +99,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_queue_wait_duration_seconds_bucket{exported_endpoint=\"chat_completions\"}[15m]))) or on() vector(0)",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_queue_wait_duration_seconds_bucket{exported_endpoint=\"chat_completions\"}[$__rate_interval]))) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -230,7 +230,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(cllm_completion_tokens_total{exported_endpoint=\"chat_completions\"}[5m])) / 300",
+          "expr": "sum(rate(cllm_completion_tokens_total{exported_endpoint=\"chat_completions\"}[$__rate_interval]))",
           "refId": "A"
         }
       ],
@@ -273,7 +273,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(cllm_cache_lookups_total{exported_endpoint=\"chat_completions\",result=\"hit\"}[15m])) / clamp_min(sum(increase(cllm_cache_lookups_total{exported_endpoint=\"chat_completions\"}[15m])), 1)",
+          "expr": "sum(increase(cllm_cache_lookups_total{exported_endpoint=\"chat_completions\",result=\"hit\"}[$__rate_interval])) / clamp_min(sum(increase(cllm_cache_lookups_total{exported_endpoint=\"chat_completions\"}[$__rate_interval])), 1)",
           "refId": "A"
         }
       ],
@@ -322,7 +322,9 @@
               "mode": "off"
             }
           },
-          "unit": "short"
+          "decimals": 0,
+          "min": 0,
+          "unit": "none"
         },
         "overrides": []
       },
@@ -330,7 +332,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 24
       },
       "id": 5,
       "options": {
@@ -347,13 +349,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (result) (increase(cllm_jobs_total{exported_endpoint=\"chat_completions\",result=~\"completed|failed|rejected\"}[15m]))",
+          "expr": "sum by (result) (increase(cllm_jobs_total{exported_endpoint=\"chat_completions\",result=~\"completed|failed|rejected\"}[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Job Outcomes Last 15m",
+      "title": "Request Status",
       "type": "timeseries"
     },
     {
@@ -397,7 +399,10 @@
             "thresholdsStyle": {
               "mode": "off"
             }
-          }
+          },
+          "decimals": 0,
+          "min": 0,
+          "unit": "none"
         },
         "overrides": []
       },
@@ -405,7 +410,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 24
       },
       "id": 6,
       "options": {
@@ -422,13 +427,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(cllm_http_requests_total{route=\"POST /v1/chat/completions\"}[15m]))",
+          "expr": "sum(increase(cllm_http_requests_total{route=\"POST /v1/chat/completions\"}[$__rate_interval]))",
           "legendFormat": "requests",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "HTTP Requests Last 15m",
+      "title": "HTTP Requests",
       "type": "timeseries"
     },
     {
@@ -480,8 +485,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 24
+        "x": 0,
+        "y": 16
       },
       "id": 8,
       "options": {
@@ -498,14 +503,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(cllm_time_to_first_byte_seconds_bucket{exported_endpoint=\"chat_completions\",source=\"cache\"}[15m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(cllm_time_to_first_byte_seconds_bucket{exported_endpoint=\"chat_completions\",source=\"cache\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_time_to_first_byte_seconds_bucket{exported_endpoint=\"chat_completions\",source=\"cache\"}[15m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_time_to_first_byte_seconds_bucket{exported_endpoint=\"chat_completions\",source=\"cache\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
@@ -563,8 +568,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 24
+        "x": 12,
+        "y": 16
       },
       "id": 9,
       "options": {
@@ -581,20 +586,20 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\",source=\"cache\"}[15m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\",source=\"cache\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\",source=\"cache\"}[15m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\",source=\"cache\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Duration",
+      "title": "Latency",
       "type": "timeseries"
     },
     {
@@ -664,20 +669,20 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(cllm_downstream_request_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[15m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(cllm_downstream_request_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_downstream_request_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[15m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(cllm_downstream_request_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Downstream Duration",
+      "title": "Downstream Latency",
       "type": "timeseries"
     },
     {
@@ -722,7 +727,8 @@
               "mode": "off"
             }
           },
-          "unit": "short"
+          "decimals": 0,
+          "unit": "none"
         },
         "overrides": []
       },
@@ -747,13 +753,72 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (result) (increase(cllm_cache_lookups_total{exported_endpoint=\"chat_completions\"}[15m]))",
+          "expr": "sum by (result) (increase(cllm_cache_lookups_total{exported_endpoint=\"chat_completions\"}[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Cache Lookups Last 15m",
+      "title": "Cache Lookups",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "tokens/s",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "decimals": 0,
+          "min": 0,
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(cllm_completion_tokens_total{exported_endpoint=\"chat_completions\"}[30s]))",
+          "legendFormat": "tokens/s",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tokens/s",
       "type": "timeseries"
     },
     {
@@ -803,8 +868,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
-        "x": 0,
+        "w": 12,
+        "x": 12,
         "y": 8
       },
       "id": 12,
@@ -867,7 +932,9 @@
             "showPoints": "never",
             "stacking": {"group": "A", "mode": "none"}
           },
-          "unit": "short"
+          "decimals": 0,
+          "min": 0,
+          "unit": "none"
         },
         "overrides": []
       },
@@ -945,6 +1012,7 @@
             "stacking": {"group": "A", "mode": "none"}
           },
           "decimals": 3,
+          "min": 0,
           "unit": "s"
         },
         "overrides": []
@@ -983,6 +1051,7 @@
             "stacking": {"group": "A", "mode": "none"}
           },
           "decimals": 3,
+          "min": 0,
           "unit": "s"
         },
         "overrides": []

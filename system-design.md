@@ -73,26 +73,27 @@ The system is deployed alongside a real vLLM instance in Kubernetes, allowing **
 
 ### 5.1 Core Capacity Model
 
-cLLM models inference capacity as a combination of parallelism and load-dependent degradation rather than a fixed global throughput limit.
+cLLM models inference capacity along **two independent axes**: a *stock* of token-cost that may be in flight at any instant, and a *flow* of tokens generated per second. Each axis has its own knob and binds in different regimes; together with a load-dependent degradation function they reproduce the soft-saturation behavior of real GPU-backed inference.
 
-The effective system capacity is defined as:
+* **`max_tokens_in_flight`** — the admission stock. The total estimated token cost (prompt + projected completion) the system will admit concurrently. Bound by the cost-based admission gate; binds first when many requests overlap.
+* **`max_tokens_per_second`** — the replay flow. The ideal token *generation* rate of an isolated request on the synthetic execution path; binds during streaming.
+* **`f(load)`** — a configurable degradation function that scales the *effective* per-request flow downward as the in-flight stock approaches saturation.
+
+The effective per-request streaming rate is therefore:
 
 ```text
-Effective Capacity = (per-request token rate × max concurrent requests) × f(load)
+effective_tokens_per_second = max_tokens_per_second × f(load)
 ```
 
-Where:
+while the admission ceiling is independently bounded by `max_tokens_in_flight`. The two compose: a workload can be either admission-bound (lots of small requests filling the stock) or rate-bound (a few large requests serialized through the per-request flow), and `f(load)` couples them by slowing the flow as the stock fills.
 
-* **per-request token rate** represents the ideal token generation rate for an isolated request
-* **max concurrent requests** defines the level of parallelism the system can sustain efficiently
-* **f(load)** is a configurable degradation function that reduces effective throughput as concurrency increases beyond optimal levels
-
-This formulation captures two key properties of real GPU-backed inference systems:
+This formulation captures three key properties of real GPU-backed inference systems:
 
 1. **Parallel efficiency at low to moderate load**, where additional requests increase total throughput
-2. **Gradual performance degradation under contention**, where increased concurrency reduces per-request throughput and increases latency
+2. **Workload-aware admission**, where one large request can consume what would otherwise be many small ones — matching how KV-cache and prefill compute actually scale
+3. **Gradual performance degradation under contention**, where increased concurrency reduces per-request streaming throughput and increases latency
 
-Unlike a fixed global tokens-per-second model, this approach produces **soft saturation behavior**, where throughput plateaus and latency increases non-linearly as the system becomes queue-bound.
+Unlike a fixed concurrent-requests or fixed global tokens-per-second model, this approach produces **soft saturation behavior** that is sensitive to request size, where throughput plateaus and latency increases non-linearly as the token-cost budget becomes the binding constraint.
 
 ---
 
@@ -113,17 +114,20 @@ These regimes mirror real inference systems, where GPU utilization, memory press
 
 ```mermaid
 flowchart LR
-    A[Incoming requests] --> B{Admission control}
+    A[Incoming requests] --> T{Tenant bucket<br/>rate &amp; burst}
+    T -->|insufficient tokens| E1[429 tenant_rate]
+    T -->|tenant pays cost| B{Global cost budget<br/>max_tokens_in_flight}
 
-    B -->|capacity available| C[Active queue]
-    B -->|active full| D[Waiting queue]
-    B -->|waiting full| E[429 rejected]
+    B -->|capacity available| C[Active set]
+    B -->|budget full| D[Waiting FIFO]
+    B -->|waiting full or oversize| E2[429 over_capacity]
+    E2 -.refund tenant.-> T
 
-    C --> F[Weighted scheduler]
+    C --> F[Streaming scheduler]
     F --> G[Token allocation]
 
     H[Per-request token rate] --> I[Effective capacity model]
-    J[Max concurrent requests] --> I
+    J[Max tokens in flight] --> I
     K["f(load) degradation curve"] --> I
 
     I --> G
@@ -132,7 +136,8 @@ flowchart LR
     D -->|capacity opens| C
 
     L --> M[Metrics + logs]
-    E --> M
+    E1 --> M
+    E2 --> M
 
     M --> N[Grafana dashboards]
     M --> O[Request lifecycle trace]
@@ -140,15 +145,18 @@ flowchart LR
 
 #### Short verbal explanation
 
-cLLM treats inference capacity as a function of **parallelism plus contention**, not as a fixed global tokens/sec limit. Incoming requests first go through admission control. If capacity is available, they enter the active queue; otherwise they wait, and if the waiting queue is full, they receive a 429.
+cLLM treats inference capacity as a function of **parallelism plus contention**, not as a fixed global tokens/sec limit. Incoming requests pass through a **two-stage admission gate**:
 
-The active requests are handled by a weighted scheduler that allocates token throughput based on the effective capacity model:
+1. **Per-tenant token bucket.** Each request must first pay its estimated `cost` against its tenant's bucket. If the tenant is over its rate/burst, the request is rejected immediately with `429 tenant_rate`.
+2. **Global cost budget.** Surviving requests then compete for `max_tokens_in_flight`. If the budget has room, the request enters the active set; otherwise it joins a bounded FIFO waiting queue. If the waiting queue is full — or the request alone would exceed the entire budget — it is rejected with `429 over_capacity`, and its tenant tokens are refunded.
+
+Admitted requests are then handled along the two capacity axes from \u00a75.1: the admission stock (`max_tokens_in_flight`) bounds how much work runs concurrently, while the per-request flow
 
 ```text
-Effective Capacity = per-request token rate × max concurrent requests × f(load)
+effective_tokens_per_second = max_tokens_per_second \u00d7 f(load)
 ```
 
-As load increases, `f(load)` reduces effective throughput to simulate GPU contention. This creates realistic behavior: throughput rises at first, then plateaus, while TTFT and latency increase as the system becomes queue-bound.
+bounds how fast each one streams. As load increases, `f(load)` reduces the per-request flow to simulate GPU contention. This creates realistic behavior: throughput rises at first, then plateaus, while TTFT and latency increase as the system becomes queue-bound \u2014 with noisy tenants absorbed by their own buckets rather than degrading neighbors.
 
 ---
 
@@ -156,17 +164,28 @@ As load increases, `f(load)` reduces effective throughput to simulate GPU conten
 
 The scheduler maintains three request states:
 
-* **Active queue**: requests currently consuming token capacity
-* **Waiting queue**: buffered requests awaiting admission
-* **Rejected requests**: requests exceeding system limits and returned as HTTP 429
+* **Active set**: requests currently consuming token-cost capacity
+* **Waiting queue**: buffered requests awaiting admission, served strictly FIFO
+* **Rejected requests**: requests refused at the gate and returned as HTTP 429
 
-Admission decisions are based on:
+Admission is **cost-based** rather than count-based. Each incoming request is assigned an estimated token cost:
 
-* effective token capacity
-* maximum concurrency limits
-* queue size thresholds
+```text
+cost = prompt_tokens + min(max_tokens, p95_completion_tokens)
+```
 
-Backpressure is enforced via bounded queues and early rejection to prevent unbounded latency growth under overload.
+The `p95_completion_tokens` term is a rolling p95 maintained over recent successful downstream completions, with a warm-up minimum-sample threshold; until enough samples are observed the estimator falls back to the request's `max_tokens`. This makes the cost a realistic upper bound that adapts to the actual workload mix without requiring operator tuning.
+
+A two-stage gate decides admission:
+
+1. **Per-tenant rate limit (Stage 1).** A token-bucket per tenant, sized by `rate` (tokens/sec refill) and `burst` (max instantaneous balance). If the tenant cannot pay `cost`, the request is rejected immediately with `429 tenant rate exceeded`. This stage is non-blocking — tenants do not consume the global FIFO slot until they have paid their own bucket.
+2. **Global token-cost budget (Stage 2).** A single FIFO-ordered semaphore over `max_tokens_in_flight`. If `cost` does not currently fit, the request waits until enough capacity is released or until the bounded `max_waiting_requests` queue is full, in which case it is rejected with `429 over capacity`. Requests whose `cost` exceeds the entire budget are rejected immediately rather than blocking forever.
+
+If Stage 2 rejects a request, the tenant's Stage 1 tokens are **refunded** so a globally-rejected request does not permanently drain a tenant's quota.
+
+Releasing capacity is cancel-aware: a client that disconnects mid-flight returns its `cost` to the global budget so the next waiting request can proceed without delay. Successful downstream completions feed both the global p95 estimator and the per-tenant p95 estimator, so cost estimates self-correct over time. Cached replays and rejections do not pollute the estimators.
+
+Backpressure is therefore enforced on three independent dimensions — per-tenant rate, global token-cost-in-flight, and bounded waiting-queue depth — preventing unbounded latency growth under overload while keeping noisy tenants from starving the rest of the system.
 
 ---
 
@@ -189,23 +208,29 @@ This avoids unrealistic “hard cliff” capacity limits and better reflects rea
 
 ---
 
-### 5.5 Weighted Scheduling and Fairness
+### 5.5 Multi-Tenant Fairness
 
-To support multi-tenant workloads and heterogeneous request sizes, cLLM implements weighted scheduling.
+To support multi-tenant workloads and heterogeneous request sizes, cLLM enforces fairness at admission via a per-tenant token bucket. Each request is tagged with an `X-Tenant-Id` header (case-insensitive, validated against `[a-z0-9_-]{1,64}`); unknown, missing, or malformed values route to a built-in `default` tenant, which prevents Prometheus label cardinality attacks and keeps unauthenticated traffic on a single shared lane.
 
-Weights are computed based on:
+Each tenant has independent `rate` and `burst` parameters, configured via `configs/tenants.yaml` (overridable with `CLLM_TENANTS_FILE`) and applied at process start:
 
-* **tenant priority** (e.g., interactive vs batch)
-* **request size** (token length)
-* **queue wait time** (aging to prevent starvation)
+```yaml
+tenants:
+  default: { rate: 0,     burst: 0      }   # 0 disables the tenant gate
+  interactive: { rate: 2000,  burst: 100000 }
+  batch:       { rate: 50000, burst: 100000 }
+```
+
+Cost estimates are tenant-aware and use a fallback chain — **per-tenant p95 → global p95 → request `max_tokens`** — so a warm tenant gets workload-shape-specific admission decisions while cold tenants safely fall back to global behavior.
 
 This approach:
 
-* reduces head-of-line blocking
-* improves tail latency for short or high-priority requests
-* maintains overall system throughput
+* **Isolates noisy tenants.** A tenant that exceeds its `rate` is rejected at Stage 1 without consuming the global FIFO slot, so well-behaved tenants are not pushed deeper into the queue by another tenant's burst.
+* **Preserves work conservation.** A globally-rejected request refunds the tenant bucket, so legitimate traffic is not punished for transient global contention.
+* **Composes with the global gate.** Tenant limits are an *additional* constraint, not a replacement; the global cost budget still bounds total in-flight work and protects the simulated GPU.
+* **Supports interactive vs batch separation.** Interactive tenants are typically configured with low `rate` and high `burst` (snappy under intermittent load); batch tenants get high sustained `rate` with moderate `burst`. Both share the same global capacity ceiling.
 
-The result is a more realistic simulation of fairness and resource allocation in shared inference systems.
+The result is a realistic simulation of fairness in shared inference systems without needing a stateful weighted scheduler in the active set: ordering inside the global FIFO is preserved, but each tenant's *eligibility* to enter the FIFO is gated by its own bucket.
 
 ---
 
@@ -328,8 +353,10 @@ In short: TPS pacing and load-driven degradation are always on; everything else 
 Each request is assigned a **correlation ID** and tracked through:
 
 ```text
-admitted → queued → started → prefill → first_token → completed / rejected
+received → [queued] → admitted → started → [dsl_applied] → [prefill] → first_token → completed | rejected
 ```
+
+Bracketed events are conditional: `queued` fires only when the global gate forces a wait (so an immediately-admitted request emits only `admitted`); `dsl_applied` fires when one or more DSL directives are parsed; `prefill` fires only on cache hits with prefill simulation enabled. `rejected` is a terminal event that may replace any later event when admission, validation, or downstream processing fails.
 
 This enables root-cause analysis of latency:
 
@@ -350,6 +377,10 @@ Key metrics include:
 * queue depth and wait time
 * latency percentiles (P50/P95/P99)
 * stall and prefill histograms
+* **token-cost in flight** vs `max_tokens_in_flight` (admission saturation)
+* **per-tenant admissions and rejections** via `cllm_tenant_admissions_total{tenant}` and `cllm_tenant_rejections_total{tenant, reason}` where `reason ∈ {tenant_rate, over_capacity}`
+
+Lifecycle log events include `tenant` and `cost` fields for every request, so per-tenant attribution is available in both metrics and logs.
 
 ---
 
@@ -372,11 +403,12 @@ This decomposition enables precise reasoning about system bottlenecks.
 
 The system exposes a `/config` API allowing runtime changes to:
 
-* token capacity
-* concurrency limits
+* token capacity (`max_tokens_in_flight`, `max_tokens_per_second`, `max_waiting_requests`)
 * degradation curves
-* scheduling weights
+* DSL default profile
 * realism parameters (prefill, jitter, stalls)
+
+Tenant rate/burst are loaded from `configs/tenants.yaml` at startup and are not currently editable through `/config`; updates require a restart or a programmatic call to `Handler.SetTenants`.
 
 This enables:
 
@@ -589,10 +621,10 @@ DSL usage is fully instrumented:
 
   ```text
   cllm_dsl_directives_total{endpoint, directive}
-  cllm_requests_total{..., dsl_family}
+  cllm_dsl_requests_total{endpoint, family, result}
   ```
 
-  `directive` carries the literal token (`tps=128`, `segment=-20:20`, `profile=fastest`); `dsl_family` collapses numeric values to the keyword (`tps`, `segment`, `profile=fastest`) for low-cardinality dashboards.
+  `directive` carries the literal token (`tps=128`, `segment=-20:20`, `profile=fastest`); `family` collapses numeric values to the keyword (`tps`, `segment`, `profile=fastest`) for low-cardinality dashboards.
 
 This enables:
 

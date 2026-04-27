@@ -43,9 +43,9 @@ The server supports these runtime settings:
 - `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for chat completions
 - `CACHE_MAX_TOKENS` or `--max-tokens`: default max tokens for chat completions, `100` to `4000`, default `1024`
 - `CACHE_MAX_TOKENS_PER_SECOND` or `--max-tokens-per-second`: cached replay token rate per request, `0` to `1000`, default `32`; `0` disables cached replay delay
-- `CACHE_MAX_CONCURRENT_REQUESTS` or `--max-concurrent-requests`: max concurrent request slots, `1` to `512`, default `512`
-- `CACHE_MAX_WAITING_REQUESTS` or `--max-waiting-requests`: max queued waiting requests, `0` to `1024`, must be ≤ `2 * max-concurrent-requests`; default `1024`
-- `CACHE_MAX_DEGRADATION` or `--max-degradation`: percent reduction applied to cached replay throughput once concurrency rises above `10%`, `0` to `95`, default `10`; `0` disables degradation
+- `CACHE_MAX_TOKENS_IN_FLIGHT` or `--max-tokens-in-flight`: max admitted token cost in flight (cost-based admission), `1` to `2000000`, default `200000`. Each request is charged `prompt_tokens + min(max_tokens, p95_completion_tokens)` against this budget; oversized single requests are rejected immediately.
+- `CACHE_MAX_WAITING_REQUESTS` or `--max-waiting-requests`: max queued waiting requests when the budget is full, `0` to `1024`, default `1024`
+- `CACHE_MAX_DEGRADATION` or `--max-degradation`: percent reduction applied to cached replay throughput once the in-flight token budget rises above `10%`, `0` to `95`, default `10`; `0` disables degradation
 - `CACHE_TEMPERATURE` or `--temperature`: default temperature for chat completions
 - `CACHE_PREFILL_RATE_MULTIPLIER` or `--prefill-rate-multiplier`: simulated prefill rate as a multiple of `max-tokens-per-second`, `0` to `20`, default `0` (prefill simulation disabled; set non-zero to enable)
 - `CACHE_PREFILL_BASE_OVERHEAD_MS` or `--prefill-base-overhead-ms`: fixed simulated prefill startup overhead in ms, `0` to `60000`, default `0`
@@ -63,7 +63,7 @@ The server supports these runtime settings:
 Example:
 
 ```bash
-CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_DOWNSTREAM_URL=https://api.openai.com CACHE_DOWNSTREAM_TOKEN=your-token CACHE_DOWNSTREAM_MODEL=gpt-4.1 CACHE_MAX_TOKENS_PER_SECOND=48 CACHE_MAX_CONCURRENT_REQUESTS=256 CACHE_MAX_WAITING_REQUESTS=512 CACHE_MAX_DEGRADATION=15 go run ./cmd/cllm --cache-size 200
+CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_DOWNSTREAM_URL=https://api.openai.com CACHE_DOWNSTREAM_TOKEN=your-token CACHE_DOWNSTREAM_MODEL=gpt-4.1 CACHE_MAX_TOKENS_PER_SECOND=48 CACHE_MAX_TOKENS_IN_FLIGHT=128000 CACHE_MAX_WAITING_REQUESTS=512 CACHE_MAX_DEGRADATION=15 go run ./cmd/cllm --cache-size 200
 ```
 
 For a local vLLM source, omit the downstream token and model settings and keep the default downstream URL of `http://localhost:8000`.
@@ -71,18 +71,45 @@ For a local vLLM source, omit the downstream token and model settings and keep t
 You can inspect or update the live handler config at runtime:
 
 ```bash
-curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-concurrent-requests=256&max-waiting-requests=512&max-degradation=15&temperature=0.7'
+curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-tokens-in-flight=128000&max-waiting-requests=512&max-degradation=15&temperature=0.7'
 ```
 
-`/config` now returns `concurrent_requests`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_concurrent_requests`, `max_waiting_requests`, `max_degradation`, `computed_degradation_percentage`, `prefill_rate_multiplier`, `prefill_base_overhead_ms`, `prefill_jitter_percent`, `prefill_max_ms`, `stream_variability_percent`, `stream_jitter_percent`, `stream_stall_probability_percent`, `stream_stall_min_ms`, and `stream_stall_max_ms`. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `max-tokens-per-second`, `max-concurrent-requests`, `max-waiting-requests`, `max-degradation`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, `downstream-model`, `prefill-rate-multiplier`, `prefill-base-overhead-ms`, `prefill-jitter-percent`, `prefill-max-ms`, `stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, `stream-stall-min-ms`, and `stream-stall-max-ms`.
+`/config` now returns `tokens_in_flight`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_tokens_in_flight`, `max_waiting_requests`, `max_degradation`, `computed_degradation_percentage`, `prefill_rate_multiplier`, `prefill_base_overhead_ms`, `prefill_jitter_percent`, `prefill_max_ms`, `stream_variability_percent`, `stream_jitter_percent`, `stream_stall_probability_percent`, `stream_stall_min_ms`, and `stream_stall_max_ms`. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `max-tokens-per-second`, `max-tokens-in-flight`, `max-waiting-requests`, `max-degradation`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, `downstream-model`, `prefill-rate-multiplier`, `prefill-base-overhead-ms`, `prefill-jitter-percent`, `prefill-max-ms`, `stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, `stream-stall-min-ms`, and `stream-stall-max-ms`.
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
-Request admission is limited by concurrent slots and a waiting queue for `POST /v1/chat/completions`. When both are full, `cllm` returns `429` with `over capacity`.
+Request admission is cost-based: each request charges `prompt_tokens + min(max_tokens, p95_completion_tokens)` against `max-tokens-in-flight`. Requests that don't fit join a FIFO queue bounded by `max-waiting-requests`. When both the budget and queue are full, `cllm` returns `429` with `over capacity`. Single requests larger than the entire budget are rejected immediately rather than blocking forever.
 
-If you lower `max-concurrent-requests` or `max-waiting-requests` below the current in-flight or queued counts, existing work is preserved. New admissions stay blocked until the live counts fall back within the new limits.
+If you lower `max-tokens-in-flight` or `max-waiting-requests` below the current in-flight or queued counts, existing work is preserved. New admissions stay blocked until the live counts fall back within the new limits.
 
-Cached responses are replayed at the configured token rate. Once more than `10%` of concurrent slots are in use, cached replay throughput degrades gradually up to the configured maximum. The live computed degradation percentage and effective token rate are exposed through `/config`, logged whenever they change, and included in the periodic queue-depth logs. Live downstream responses still stream through once admitted.
+### Multi-tenant admission
+
+Requests can be tagged with an `X-Tenant-Id` header (e.g. `X-Tenant-Id: acme`). Tenant names are matched case-insensitively, validated against `[a-z0-9_-]{1,64}`, and any unknown, missing, or invalid value is routed to the `default` tenant.
+
+Each tenant has its own token-bucket rate limiter that gates admission *before* the global cost budget. The bucket is refilled at the tenant's `rate` (token cost per second) up to `burst` (max single burst). On admission:
+
+1. Cost is estimated using the tenant's own p95 completion-token history when warm, falling back to the global p95, then to the request's `max_tokens`.
+2. If the tenant bucket can't cover the cost, `cllm` returns `429` with `tenant rate exceeded` (no global queue used).
+3. Otherwise the global cost budget is checked. If the global gate later rejects, the tenant bucket is refunded so the quota isn't permanently drained by globally-rejected requests.
+
+Configure tenants via `configs/tenants.yaml` (override path with `CLLM_TENANTS_FILE`):
+
+```yaml
+tenants:
+  default:
+    rate: 0       # 0 disables the tenant limit; only the global budget gates
+    burst: 0
+  interactive:
+    rate: 5000
+    burst: 50000
+  batch:
+    rate: 50000
+    burst: 500000
+```
+
+Two Prometheus counters surface tenant decisions: `cllm_tenant_admissions_total{tenant}` and `cllm_tenant_rejections_total{tenant, reason}` where `reason` is `tenant_rate` or `over_capacity`. Lifecycle log events include `tenant` and `cost` fields.
+
+Cached responses are replayed at the configured token rate. Once the in-flight token budget rises above `10%` of capacity, cached replay throughput degrades gradually up to the configured maximum. The live computed degradation percentage and effective token rate are exposed through `/config`, logged whenever they change, and included in the periodic queue-depth logs. Live downstream responses still stream through once admitted.
 
 On a cache hit, `cllm` simulates **prefill latency** before emitting the first byte to mimic a CPU-based LLM. The delay is `prefill_base_overhead_ms + (prompt_tokens / prefill_rate) * 1000`, with `±prefill_jitter_percent` random jitter and a safety cap of `prefill_max_ms`. The prefill rate is `prefill_rate_multiplier * effective_tokens_per_second`, so adjusting `max-tokens-per-second` (or scheduler degradation) automatically scales prefill too. Setting `prefill-rate-multiplier=0` (or `max-tokens-per-second=0`) disables prefill simulation. The simulated delay is reported as a `prefill` lifecycle event (`prompt_tokens`, `prefill_ms`) and as the `cllm_prefill_duration_seconds{source}` histogram. Live downstream requests are unaffected.
 
@@ -261,7 +288,7 @@ For `POST /v1/chat/completions`, structured lifecycle events are emitted as logs
 make build
 ```
 
-This builds the local container image `cllm:0.6.0`.
+This builds the local container image `cllm:0.7.0`.
 
 To build and import that image into the local k3s container runtime:
 
@@ -272,8 +299,8 @@ make deploy
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.6.0 .
-docker save cllm:0.6.0 | sudo k3s ctr images import -
+docker build -t cllm:0.7.0 .
+docker save cllm:0.7.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -285,8 +312,8 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.6.0 .
-docker run --rm -p 8080:8080 cllm:0.6.0
+docker build -t cllm:0.7.0 .
+docker run --rm -p 8080:8080 cllm:0.7.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
@@ -299,7 +326,7 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.6.0`
+- deploy `cllm:0.7.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
 - mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path

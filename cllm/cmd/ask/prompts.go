@@ -53,31 +53,24 @@ type canonicalSource struct {
 
 func (c *canonicalSource) Next() (Prompt, bool) { return c.p, true }
 
-// orderedSource walks a prompt list in order, optionally repeating it
-// `loop` times. loop=0 means "exactly once".
+// orderedSource walks a prompt list in order. When forever is true,
+// Next never returns ok=false; otherwise it returns the list once and
+// then exhausts.
 type orderedSource struct {
 	mu      sync.Mutex
 	prompts []Prompt
-	loop    int // total full passes; 0 means once
-	cursor  int // global index, 0 .. len*loop
-	limit   int
+	cursor  int
+	forever bool
 }
 
-func newOrderedSource(prompts []Prompt, loop int) *orderedSource {
-	if loop < 1 {
-		loop = 1
-	}
-	return &orderedSource{
-		prompts: prompts,
-		loop:    loop,
-		limit:   len(prompts) * loop,
-	}
+func newOrderedSource(prompts []Prompt, forever bool) *orderedSource {
+	return &orderedSource{prompts: prompts, forever: forever}
 }
 
 func (o *orderedSource) Next() (Prompt, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.cursor >= o.limit {
+	if !o.forever && o.cursor >= len(o.prompts) {
 		return Prompt{}, false
 	}
 	p := o.prompts[o.cursor%len(o.prompts)]
@@ -85,9 +78,9 @@ func (o *orderedSource) Next() (Prompt, bool) {
 	return p, true
 }
 
-// randomSource returns a random prompt each call. It is unbounded; the
-// bench loop's stop conditions terminate it. With loop>0 it caps the
-// total number of pulls at len*loop.
+// randomSource returns a random prompt each call. When bounded is true
+// it serves exactly len(prompts) pulls; otherwise it is unbounded and
+// the bench loop's stop conditions terminate it.
 type randomSource struct {
 	mu      sync.Mutex
 	prompts []Prompt
@@ -96,10 +89,10 @@ type randomSource struct {
 	served  int
 }
 
-func newRandomSource(prompts []Prompt, loop int) *randomSource {
+func newRandomSource(prompts []Prompt, bounded bool) *randomSource {
 	limit := 0
-	if loop > 0 {
-		limit = len(prompts) * loop
+	if bounded {
+		limit = len(prompts)
 	}
 	return &randomSource{
 		prompts: prompts,
@@ -148,7 +141,12 @@ func loadPromptFiles(paths []string) ([]Prompt, error) {
 
 // buildPromptSource picks the right promptSource implementation for the
 // current options. canonical is the single-prompt fallback used when
-// --file is not supplied.
+// --files is not supplied.
+//
+// File-mode loop semantics:
+//   - --loop set, OR --count > 0, OR --duration > 0: cycle forever
+//     (the matching cap drives the stop).
+//   - none set: single pass through the concatenated list.
 func buildPromptSource(opts options, canonical Prompt) (promptSource, int, error) {
 	if len(opts.files) == 0 {
 		return &canonicalSource{p: canonical}, 0, nil
@@ -157,12 +155,9 @@ func buildPromptSource(opts options, canonical Prompt) (promptSource, int, error
 	if err != nil {
 		return nil, 0, err
 	}
+	forever := opts.loop || opts.count > 0 || opts.duration > 0
 	if opts.random {
-		return newRandomSource(prompts, opts.loop), len(prompts), nil
+		return newRandomSource(prompts, !forever), len(prompts), nil
 	}
-	loop := opts.loop
-	if loop < 1 {
-		loop = 1 // default: process each prompt once, then exit
-	}
-	return newOrderedSource(prompts, loop), len(prompts), nil
+	return newOrderedSource(prompts, forever), len(prompts), nil
 }

@@ -100,7 +100,7 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 	// Read-only fields go first.
 	readOnly := []configField{
 		{Key: "version", Label: "Version", Current: cfg.Version},
-		{Key: "concurrent_requests", Label: "Concurrent Requests", Current: strconv.Itoa(cfg.ConcurrentRequests)},
+		{Key: "tokens_in_flight", Label: "Tokens In Flight", Current: strconv.FormatInt(cfg.TokensInFlight, 10)},
 		{Key: "waiting_requests", Label: "Waiting Requests", Current: strconv.Itoa(cfg.WaitingRequests)},
 		{Key: "cache_entries", Label: "Cache Entries", Current: strconv.Itoa(cfg.CacheEntries)},
 		{Key: "effective_tokens_per_second", Label: "Effective Tokens/sec", Current: strconv.FormatFloat(cfg.EffectiveTokensPerSecond, 'f', 2, 64)},
@@ -180,12 +180,12 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 					Current: pickInt("max_tokens_per_second", "max-tokens-per-second", cfg.MaxTokensPerSecond),
 				},
 				{
-					Key: "max_concurrent_requests", Label: "max_concurrent_requests", Kind: fieldInt,
-					Help:    "Maximum concurrent request slots.",
-					Min:     strconv.Itoa(runtimeconfig.MinMaxConcurrentRequests),
-					Max:     strconv.Itoa(runtimeconfig.MaxMaxConcurrentRequests),
-					Default: strconv.Itoa(runtimeconfig.DefaultMaxConcurrentRequests),
-					Current: pickInt("max_concurrent_requests", "max-concurrent-requests", cfg.MaxConcurrentRequests),
+					Key: "max_tokens_in_flight", Label: "max_tokens_in_flight", Kind: fieldInt,
+					Help:    "Maximum admitted token cost in flight.",
+					Min:     strconv.Itoa(runtimeconfig.MinMaxTokensInFlight),
+					Max:     strconv.Itoa(runtimeconfig.MaxMaxTokensInFlight),
+					Default: strconv.Itoa(runtimeconfig.DefaultMaxTokensInFlight),
+					Current: pickInt("max_tokens_in_flight", "max-tokens-in-flight", int(cfg.MaxTokensInFlight)),
 				},
 				{
 					Key: "max_waiting_requests", Label: "max_waiting_requests", Kind: fieldInt,
@@ -197,7 +197,7 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 				},
 				{
 					Key: "max_degradation", Label: "max_degradation", Kind: fieldInt,
-					Help:    "Percent throughput reduction once concurrency rises above 10%. 0 disables.",
+					Help:    "Percent throughput reduction once token-budget rises above 10%. 0 disables.",
 					Min:     strconv.Itoa(runtimeconfig.MinMaxDegradation),
 					Max:     strconv.Itoa(runtimeconfig.MaxMaxDegradation),
 					Default: strconv.Itoa(runtimeconfig.DefaultMaxDegradation),

@@ -37,8 +37,8 @@ const (
 	maxMaxTokens                      = runtimeconfig.MaxMaxTokens
 	minMaxTokensPerSecond             = runtimeconfig.MinMaxTokensPerSecond
 	maxMaxTokensPerSecond             = runtimeconfig.MaxMaxTokensPerSecond
-	minMaxConcurrentRequests          = runtimeconfig.MinMaxConcurrentRequests
-	maxMaxConcurrentRequests          = runtimeconfig.MaxMaxConcurrentRequests
+	minMaxTokensInFlight              = runtimeconfig.MinMaxTokensInFlight
+	maxMaxTokensInFlight              = runtimeconfig.MaxMaxTokensInFlight
 	minMaxWaitingRequests             = runtimeconfig.MinMaxWaitingRequests
 	maxMaxWaitingRequests             = runtimeconfig.MaxMaxWaitingRequests
 	minMaxDegradation                 = runtimeconfig.MinMaxDegradation
@@ -47,7 +47,7 @@ const (
 	defaultTemperature                = runtimeconfig.DefaultTemperature
 	defaultVLLMHTTPTimeout            = 120 * time.Second
 	defaultMaxTokensPerSecond         = runtimeconfig.DefaultMaxTokensPerSecond
-	defaultMaxConcurrentRequests      = runtimeconfig.DefaultMaxConcurrentRequests
+	defaultMaxTokensInFlight          = runtimeconfig.DefaultMaxTokensInFlight
 	defaultMaxWaitingRequests         = runtimeconfig.DefaultMaxWaitingRequests
 	defaultMaxDegradation             = runtimeconfig.DefaultMaxDegradation
 	defaultPrefillRateMultiplier      = runtimeconfig.DefaultPrefillRateMultiplier
@@ -74,7 +74,6 @@ const (
 	minStreamStallMs                     = runtimeconfig.MinStreamStallMs
 	maxStreamStallMs                     = runtimeconfig.MaxStreamStallMs
 	degradationThreshold              = 0.10
-	replayTokensPerSecondCompensation = 1.025
 )
 
 type askOptions struct {
@@ -124,6 +123,7 @@ type Handler struct {
 	jitterSource                              func() float64
 	dslProfiles                               map[string][]string
 	dslDefaultProfile                         string
+	tenants                                   *tenantRegistry
 	lastLoggedComputedDegradationMilliPercent atomic.Int64
 }
 
@@ -146,24 +146,25 @@ func NewHandler() *Handler {
 	handler.streamStallProbabilityPercent = defaultStreamStallProbabilityPercent
 	handler.streamStallMin = time.Duration(defaultStreamStallMinMs) * time.Millisecond
 	handler.streamStallMax = time.Duration(defaultStreamStallMaxMs) * time.Millisecond
-	handler.scheduler = newRequestScheduler(defaultMaxConcurrentRequests, defaultMaxWaitingRequests)
+	handler.scheduler = newRequestScheduler(defaultMaxTokensInFlight, defaultMaxWaitingRequests)
 	handler.sleep = sleepWithContext
 	handler.jitterSource = defaultJitterSource
 	handler.dslProfiles = cloneDSLProfiles(DefaultDSLProfiles)
+	handler.tenants = newTenantRegistry(TenantConfig{}, 256, 50)
 	handler.lastLoggedComputedDegradationMilliPercent.Store(-1)
 	handler.metrics = newHandlerMetrics(handler)
 	handler.scheduler.metrics = handler.metrics
 	return handler
 }
 
-func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRequests, maxWaitingRequests, maxDegradation int) {
+func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxTokensInFlight, maxWaitingRequests, maxDegradation int) {
 	if maxTokensPerSecond < minMaxTokensPerSecond || maxTokensPerSecond > maxMaxTokensPerSecond {
 		maxTokensPerSecond = defaultMaxTokensPerSecond
 	}
-	if maxConcurrentRequests < minMaxConcurrentRequests || maxConcurrentRequests > maxMaxConcurrentRequests {
-		maxConcurrentRequests = defaultMaxConcurrentRequests
+	if maxTokensInFlight < minMaxTokensInFlight || maxTokensInFlight > maxMaxTokensInFlight {
+		maxTokensInFlight = defaultMaxTokensInFlight
 	}
-	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests || maxWaitingRequests > 2*maxConcurrentRequests {
+	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests {
 		maxWaitingRequests = defaultMaxWaitingRequests
 	}
 	if maxDegradation < minMaxDegradation {
@@ -177,10 +178,10 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRe
 	h.maxTokensPerSecond = maxTokensPerSecond
 	h.maxDegradation = maxDegradation
 	if h.scheduler == nil {
-		h.scheduler = newRequestScheduler(maxConcurrentRequests, maxWaitingRequests)
+		h.scheduler = newRequestScheduler(maxTokensInFlight, maxWaitingRequests)
 		h.scheduler.metrics = h.metrics
 	} else {
-		h.scheduler.Reconfigure(maxConcurrentRequests, maxWaitingRequests)
+		h.scheduler.Reconfigure(maxTokensInFlight, maxWaitingRequests)
 	}
 	h.configMu.Unlock()
 	h.logComputedDegradationIfChanged("limits_updated")
@@ -189,8 +190,8 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRe
 type ProcessingStats struct {
 	MaxTokensPerSecond            int
 	EffectiveTokensPerSecond      float64
-	MaxConcurrentRequests         int
-	ConcurrentRequests            int
+	MaxTokensInFlight             int64
+	TokensInFlight                int64
 	MaxWaitingRequests            int
 	WaitingRequests               int
 	MaxDegradation                int
@@ -216,9 +217,9 @@ func (h *Handler) RequestProcessingStats() ProcessingStats {
 		return stats
 	}
 
-	maxConcurrentRequests, concurrentRequests, maxWaitingRequests, waitingRequests, computedDegradationPercentage, effectiveTokensPerSecond := scheduler.processingStats(baseTokensPerSecond, maxDegradation)
-	stats.MaxConcurrentRequests = maxConcurrentRequests
-	stats.ConcurrentRequests = concurrentRequests
+	maxTokensInFlight, tokensInFlight, maxWaitingRequests, waitingRequests, computedDegradationPercentage, effectiveTokensPerSecond := scheduler.processingStats(baseTokensPerSecond, maxDegradation)
+	stats.MaxTokensInFlight = maxTokensInFlight
+	stats.TokensInFlight = tokensInFlight
 	stats.MaxWaitingRequests = maxWaitingRequests
 	stats.WaitingRequests = waitingRequests
 	stats.ComputedDegradationPercentage = roundMetric(computedDegradationPercentage)
@@ -226,9 +227,9 @@ func (h *Handler) RequestProcessingStats() ProcessingStats {
 	return stats
 }
 
-func (h *Handler) RequestQueueStats() (int, int, int, int) {
+func (h *Handler) RequestQueueStats() (int64, int64, int, int) {
 	stats := h.RequestProcessingStats()
-	return stats.MaxConcurrentRequests, stats.ConcurrentRequests, stats.MaxWaitingRequests, stats.WaitingRequests
+	return stats.MaxTokensInFlight, stats.TokensInFlight, stats.MaxWaitingRequests, stats.WaitingRequests
 }
 
 func (h *Handler) SetDownstreamToken(token string) {
@@ -381,7 +382,7 @@ func (h *Handler) Routes() http.Handler {
 }
 
 type runtimeConfig struct {
-	ConcurrentRequests            int     `json:"concurrent_requests"`
+	TokensInFlight                int64   `json:"tokens_in_flight"`
 	WaitingRequests               int     `json:"waiting_requests"`
 	Version                       string  `json:"version"`
 	CacheSize                     int     `json:"cache_size"`
@@ -392,7 +393,7 @@ type runtimeConfig struct {
 	MaxTokens                     int     `json:"max_tokens"`
 	MaxTokensPerSecond            int     `json:"max_tokens_per_second"`
 	EffectiveTokensPerSecond      float64 `json:"effective_tokens_per_second"`
-	MaxConcurrentRequests         int     `json:"max_concurrent_requests"`
+	MaxTokensInFlight             int64   `json:"max_tokens_in_flight"`
 	MaxWaitingRequests            int     `json:"max_waiting_requests"`
 	MaxDegradation                int     `json:"max_degradation"`
 	ComputedDegradationPercentage float64 `json:"computed_degradation_percentage"`
@@ -683,14 +684,45 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	mode := modeLabel(requestPayload.Stream)
 	requestedMaxTokens := requestPayload.MaxTokens
 
-	release, queueWait, ok := h.acquireRequestSlot(ctx, r.URL.RequestURI())
-	if !ok {
+	// Stage 0: resolve tenant. Unknown / missing tenant → "default".
+	tenant := h.resolveRequestTenant(r)
+
+	// Cost estimate uses tenant p95 first, then global, then max_tokens.
+	cost := estimateRequestCostForTenant(requestPayload, tenant, h.globalEstimator())
+
+	// Stage 1: tenant rate limit (token bucket; non-blocking).
+	if !tenant.bucket.tryReserve(float64(cost.totalCost)) {
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
+		h.metrics.observeAdmissionRejection(tenant.name, "tenant_rate")
+		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "tenant_rate", "request rejected",
+			"status", http.StatusTooManyRequests,
+			"mode", mode,
+			"max_tokens", requestedMaxTokens,
+			"tenant", tenant.name,
+			"cost", cost.totalCost,
+			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
+		)
+		markCacheHit(w, false)
+		writePlainText(w, http.StatusTooManyRequests, "tenant rate exceeded\n")
+		return
+	}
+
+	// Stage 2: global cost budget (FIFO queue).
+	release, queueWait, ok := h.acquireRequestSlot(ctx, cost, r.URL.RequestURI())
+	if !ok {
+		// Global gate refused; refund tenant tokens so a rejection here
+		// doesn't permanently drain rate quota.
+		tenant.bucket.refund(float64(cost.totalCost))
+		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
+		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
+		h.metrics.observeAdmissionRejection(tenant.name, "over_capacity")
 		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "over_capacity", "request rejected",
 			"status", http.StatusTooManyRequests,
 			"mode", mode,
 			"max_tokens", requestedMaxTokens,
+			"tenant", tenant.name,
+			"cost", cost.totalCost,
 			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
 		)
 		markCacheHit(w, false)
@@ -699,6 +731,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
+	h.metrics.observeAdmissionAccept(tenant.name, mode)
 	if queueWait > 0 {
 		h.metrics.observeQueueWait(endpoint, queueWait)
 	}
@@ -706,14 +739,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.emitLifecycleEvent(ctx, slog.LevelInfo, "started", "", "request started",
 		"mode", mode,
 		"max_tokens", requestedMaxTokens,
+		"tenant", tenant.name,
+		"cost", cost.totalCost,
 		"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
 	)
 
 	emitCompleted := func(level slog.Level, outcome, source string, status int, promptTokens, completionTokens int) {
+		// Feed the actual completion-token count back into the global p95
+		// estimator AND the tenant's per-tenant estimator, but only on
+		// successful, non-cached completions. Cached replays mirror
+		// upstream behavior and rejected/failed requests do not represent
+		// real workload.
+		if outcome == "completed" && source == "downstream" && status >= 200 && status < 300 {
+			h.observeCompletionTokens(completionTokens)
+			if tenant != nil && tenant.estimator != nil {
+				tenant.estimator.observe(completionTokens)
+			}
+		}
 		h.emitLifecycleEvent(ctx, level, "completed", outcome, "request completed",
 			"source", source,
 			"mode", mode,
 			"status", status,
+			"tenant", tenant.name,
 			"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
 			"duration_ms", float64(time.Since(processingStartedAt))/float64(time.Millisecond),
 			"prompt_tokens", promptTokens,
@@ -743,7 +790,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.cache != nil && !replayDSL.noCache {
+	// Cache lookup is skipped when either no-cache or re-cache is in
+	// effect; the latter still writes the fresh response back below.
+	if h.cache != nil && !replayDSL.noCache && !replayDSL.reCache {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			h.metrics.observeCacheLookup(endpoint, "hit")
 			markCacheHit(w, true)
@@ -839,7 +888,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if h.cache != nil {
+		if h.cache != nil && !replayDSL.noCache {
 			h.cache.Add(cacheKey, cachedResponse)
 		}
 		completionTokens := cachedResponseCompletionTokens(cachedResponse)
@@ -864,7 +913,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.cache != nil {
+	if h.cache != nil && !replayDSL.noCache {
 		h.cache.Add(cacheKey, cachedVLLMResponse{statusCode: statusCode, body: responseBody, contentType: contentType})
 	}
 
@@ -999,7 +1048,7 @@ func (h *Handler) currentConfig() runtimeConfig {
 	h.configMu.RUnlock()
 
 	return runtimeConfig{
-		ConcurrentRequests:            processingStats.ConcurrentRequests,
+		TokensInFlight:                processingStats.TokensInFlight,
 		WaitingRequests:               processingStats.WaitingRequests,
 		Version:                       buildinfo.Version,
 		CacheSize:                     cacheSize,
@@ -1010,7 +1059,7 @@ func (h *Handler) currentConfig() runtimeConfig {
 		MaxTokens:                     defaults.maxTokens,
 		MaxTokensPerSecond:            processingStats.MaxTokensPerSecond,
 		EffectiveTokensPerSecond:      processingStats.EffectiveTokensPerSecond,
-		MaxConcurrentRequests:         processingStats.MaxConcurrentRequests,
+		MaxTokensInFlight:             processingStats.MaxTokensInFlight,
 		MaxWaitingRequests:            processingStats.MaxWaitingRequests,
 		MaxDegradation:                processingStats.MaxDegradation,
 		ComputedDegradationPercentage: processingStats.ComputedDegradationPercentage,
@@ -1165,11 +1214,14 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	maxDegradation := h.maxDegradation
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
-	maxConcurrentRequests, _, maxWaitingRequests, _ := 0, 0, 0, 0
+	var maxTokensInFlight int64
+	var maxWaitingRequests int
 	if scheduler != nil {
-		maxConcurrentRequests, _, maxWaitingRequests, _ = scheduler.Stats()
+		cap, _, mw, _ := scheduler.Stats()
+		maxTokensInFlight = int64(cap)
+		maxWaitingRequests = mw
 	}
-	previousMaxConcurrentRequests := maxConcurrentRequests
+	previousMaxTokensInFlight := maxTokensInFlight
 	previousMaxWaitingRequests := maxWaitingRequests
 
 	if maxTokensPerSecondRaw := configQueryValue(queryValues, "max-tokens-per-second", "max_tokens_per_second"); maxTokensPerSecondRaw != "" {
@@ -1183,15 +1235,15 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 		maxTokensPerSecond = parsed
 	}
 
-	if maxConcurrentRequestsRaw := configQueryValue(queryValues, "max-concurrent-requests", "max_concurrent_requests"); maxConcurrentRequestsRaw != "" {
-		parsed, err := strconv.Atoi(maxConcurrentRequestsRaw)
+	if maxTokensInFlightRaw := configQueryValue(queryValues, "max-tokens-in-flight", "max_tokens_in_flight"); maxTokensInFlightRaw != "" {
+		parsed, err := strconv.ParseInt(maxTokensInFlightRaw, 10, 64)
 		if err != nil {
-			return false, fmt.Errorf("invalid max-concurrent-requests %q", maxConcurrentRequestsRaw)
+			return false, fmt.Errorf("invalid max-tokens-in-flight %q", maxTokensInFlightRaw)
 		}
-		if parsed < minMaxConcurrentRequests || parsed > maxMaxConcurrentRequests {
-			return false, fmt.Errorf("max-concurrent-requests must be between %d and %d", minMaxConcurrentRequests, maxMaxConcurrentRequests)
+		if parsed < int64(minMaxTokensInFlight) || parsed > int64(maxMaxTokensInFlight) {
+			return false, fmt.Errorf("max-tokens-in-flight must be between %d and %d", minMaxTokensInFlight, maxMaxTokensInFlight)
 		}
-		maxConcurrentRequests = parsed
+		maxTokensInFlight = parsed
 	}
 
 	if maxWaitingRequestsRaw := configQueryValue(queryValues, "max-waiting-requests", "max_waiting_requests"); maxWaitingRequestsRaw != "" {
@@ -1203,9 +1255,6 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 			return false, fmt.Errorf("max-waiting-requests must be between %d and %d", minMaxWaitingRequests, maxMaxWaitingRequests)
 		}
 		maxWaitingRequests = parsed
-	}
-	if maxWaitingRequests > 2*maxConcurrentRequests {
-		return false, fmt.Errorf("max-waiting-requests must be ≤ %d", 2*maxConcurrentRequests)
 	}
 
 	if maxDegradationRaw := configQueryValue(queryValues, "max-degradation", "max_degradation"); maxDegradationRaw != "" {
@@ -1397,7 +1446,7 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamToken(downstreamToken)
 	h.SetDownstreamModel(downstreamModel)
-	h.SetRequestProcessingLimits(maxTokensPerSecond, maxConcurrentRequests, maxWaitingRequests, maxDegradation)
+	h.SetRequestProcessingLimits(maxTokensPerSecond, int(maxTokensInFlight), maxWaitingRequests, maxDegradation)
 	if prefillChanged {
 		h.SetPrefillSimulation(prefillRateMultiplier, prefillBaseOverheadMs, prefillJitterPercent, prefillMaxMs)
 	}
@@ -1408,13 +1457,13 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 		// Validation already passed above; ignore the error path.
 		_ = h.SetDSLDefaultProfile(dslProfileNew)
 	}
-	updatedMaxConcurrentRequests, updatedConcurrentRequests, updatedMaxWaitingRequests, updatedWaitingRequests := h.RequestQueueStats()
-	if updatedMaxConcurrentRequests != previousMaxConcurrentRequests || updatedMaxWaitingRequests != previousMaxWaitingRequests {
+	updatedMaxTokensInFlight, updatedTokensInFlight, updatedMaxWaitingRequests, updatedWaitingRequests := h.RequestQueueStats()
+	if updatedMaxTokensInFlight != previousMaxTokensInFlight || updatedMaxWaitingRequests != previousMaxWaitingRequests {
 		slog.Info(
 			"request queue limits updated",
-			"max_concurrent_requests", updatedMaxConcurrentRequests,
-			"previous_max_concurrent_requests", previousMaxConcurrentRequests,
-			"concurrent_requests", updatedConcurrentRequests,
+			"max_tokens_in_flight", updatedMaxTokensInFlight,
+			"previous_max_tokens_in_flight", previousMaxTokensInFlight,
+			"tokens_in_flight", updatedTokensInFlight,
 			"max_waiting_requests", updatedMaxWaitingRequests,
 			"previous_max_waiting_requests", previousMaxWaitingRequests,
 			"waiting_requests", updatedWaitingRequests,
@@ -2171,14 +2220,14 @@ func convertSSEToChatCompletionJSON(body []byte) []byte {
 	return encoded
 }
 
-func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), time.Duration, bool) {
+func (h *Handler) acquireRequestSlot(ctx context.Context, cost requestCost, path string) (func(), time.Duration, bool) {
 	h.configMu.RLock()
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
 	if scheduler == nil {
 		return func() {}, 0, true
 	}
-	release, queueWait, ok := scheduler.AcquirePath(ctx, path)
+	release, queueWait, ok := scheduler.Acquire(ctx, cost, path)
 	if !ok {
 		return nil, 0, false
 	}
@@ -2187,6 +2236,93 @@ func (h *Handler) acquireRequestSlot(ctx context.Context, path string) (func(), 
 		release()
 		h.logComputedDegradationIfChanged("request_completed")
 	}, queueWait, true
+}
+
+// observeCompletionTokens feeds an actual completion-token count into the
+// global p95 estimator, improving cost estimates for subsequent requests.
+func (h *Handler) observeCompletionTokens(completionTokens int) {
+	if completionTokens <= 0 {
+		return
+	}
+	h.configMu.RLock()
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+	if scheduler == nil {
+		return
+	}
+	scheduler.Observe(completionTokens)
+}
+
+// globalEstimator returns the scheduler's completion-token p95 estimator,
+// used to compute cost before admission. Returns nil if the scheduler is
+// not yet initialized.
+func (h *Handler) globalEstimator() *completionEstimator {
+	h.configMu.RLock()
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+	if scheduler == nil {
+		return nil
+	}
+	return scheduler.Estimator()
+}
+
+// resolveRequestTenant returns the tenantState for a request's
+// X-Tenant-Id header, falling back to the default tenant for missing,
+// invalid, or unregistered values. Always returns non-nil.
+func (h *Handler) resolveRequestTenant(r *http.Request) *tenantState {
+	h.configMu.RLock()
+	tenants := h.tenants
+	h.configMu.RUnlock()
+	if tenants == nil {
+		// Should not happen in production (NewHandler initializes the
+		// registry) but guard for tests that build Handler{} directly.
+		return &tenantState{name: defaultTenantName, bucket: newTenantBucket(0, 0), estimator: newCompletionEstimator(256, 50)}
+	}
+	return tenants.resolve(r.Header.Get(tenantHeader))
+}
+
+// SetTenants installs a new tenant configuration set. The "default"
+// tenant is always preserved; existing tenants matching new names are
+// updated in place; missing tenants are removed. Pass nil/empty to
+// reset to default-only.
+func (h *Handler) SetTenants(tenants map[string]TenantConfig) {
+	h.configMu.RLock()
+	registry := h.tenants
+	h.configMu.RUnlock()
+	if registry == nil {
+		return
+	}
+	registry.configure(tenants)
+}
+
+// SetDefaultTenantConfig updates the configuration applied to the
+// always-present "default" tenant.
+func (h *Handler) SetDefaultTenantConfig(cfg TenantConfig) {
+	h.configMu.RLock()
+	registry := h.tenants
+	h.configMu.RUnlock()
+	if registry == nil {
+		return
+	}
+	registry.mu.Lock()
+	registry.defaultConfig = cfg
+	def, ok := registry.tenants[defaultTenantName]
+	registry.mu.Unlock()
+	if ok {
+		def.bucket.reconfigure(cfg.Rate, cfg.Burst)
+	}
+}
+
+// TenantNames returns a snapshot of registered tenant names. Order is
+// not guaranteed; callers needing deterministic order should sort.
+func (h *Handler) TenantNames() []string {
+	h.configMu.RLock()
+	registry := h.tenants
+	h.configMu.RUnlock()
+	if registry == nil {
+		return nil
+	}
+	return registry.names()
 }
 
 func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int, overrides replayOverrides) error {
@@ -2494,8 +2630,8 @@ func (h *Handler) logComputedDegradationIfChanged(source string) {
 		"computed_degradation_percentage", stats.ComputedDegradationPercentage,
 		"effective_tokens_per_second", stats.EffectiveTokensPerSecond,
 		"max_tokens_per_second", stats.MaxTokensPerSecond,
-		"concurrent_requests", stats.ConcurrentRequests,
-		"max_concurrent_requests", stats.MaxConcurrentRequests,
+		"tokens_in_flight", stats.TokensInFlight,
+		"max_tokens_in_flight", stats.MaxTokensInFlight,
 		"waiting_requests", stats.WaitingRequests,
 		"max_waiting_requests", stats.MaxWaitingRequests,
 	)
@@ -2523,178 +2659,160 @@ func calibratedTokensPerSecond(configuredTokensPerSecond int) float64 {
 	if configuredTokensPerSecond < 1 {
 		return 0
 	}
-	calibrated := float64(configuredTokensPerSecond) * replayTokensPerSecondCompensation
-	if calibrated < 1 {
-		return 1
-	}
-	return calibrated
+	return float64(configuredTokensPerSecond)
 }
 
+// requestScheduler is a cost-based admission gate. It charges each request
+// a token cost (prompt_tokens + min(max_tokens, p95_completion_tokens)) to a
+// token budget; when the budget is full, requests block FIFO until enough
+// cost is released. It composes a tokenBudget primitive with logging and
+// Prometheus metrics integration.
 type requestScheduler struct {
-	mu            sync.Mutex
-	queue         *list.List
-	maxConcurrent int
-	maxWaiting    int
-	inFlight      int
-	waiting       int
-	metrics       *handlerMetrics
+	mu                sync.Mutex
+	budget            *tokenBudget
+	estimator         *completionEstimator
+	metrics           *handlerMetrics
+	maxTokensInFlight int64
+	maxWaiting        int
 }
 
-type waitingRequest struct {
-	path       string
-	ready      chan struct{}
-	element    *list.Element
-	admitted   bool
-	enqueuedAt time.Time
-	queueWait  time.Duration
-	logger     *slog.Logger
-}
-
-func newRequestScheduler(maxConcurrentRequests, maxWaitingRequests int) *requestScheduler {
-	if maxConcurrentRequests < 1 {
-		maxConcurrentRequests = 1
+func newRequestScheduler(maxTokensInFlight, maxWaitingRequests int) *requestScheduler {
+	if maxTokensInFlight < 1 {
+		maxTokensInFlight = 1
 	}
 	if maxWaitingRequests < 0 {
 		maxWaitingRequests = 0
 	}
 	return &requestScheduler{
-		queue:         list.New(),
-		maxConcurrent: maxConcurrentRequests,
-		maxWaiting:    maxWaitingRequests,
+		budget:            newTokenBudget(int64(maxTokensInFlight), maxWaitingRequests),
+		estimator:         newCompletionEstimator(256, 50),
+		maxTokensInFlight: int64(maxTokensInFlight),
+		maxWaiting:        maxWaitingRequests,
 	}
 }
 
-func (s *requestScheduler) AcquirePath(ctx context.Context, path string) (func(), time.Duration, bool) {
+// Acquire charges cost.totalCost against the budget. It returns a release
+// closure (which refunds the same cost when called), the time spent waiting,
+// and ok=false when over capacity (queue full or oversized request).
+func (s *requestScheduler) Acquire(ctx context.Context, cost requestCost, path string) (func(), time.Duration, bool) {
 	logger := loggerFromContext(ctx)
-	s.mu.Lock()
-	if s.inFlight < s.maxConcurrent {
-		s.inFlight++
-		inFlight, maxConcurrent, waiting, maxWaiting := s.inFlight, s.maxConcurrent, s.waiting, s.maxWaiting
-		s.mu.Unlock()
-		logger.Info("admitted", "path", path, "source", "direct", "queue_wait_ms", 0.0, "concurrent_requests", inFlight, "max_concurrent_requests", maxConcurrent, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
-		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "admitted", "")
-		return s.releaseFunc(path), 0, true
-	}
-	if s.waiting >= s.maxWaiting {
-		s.mu.Unlock()
-		return nil, 0, false
+	chargedCost := int64(cost.totalCost)
+	if chargedCost < 1 {
+		chargedCost = 1
 	}
 
-	request := &waitingRequest{path: path, ready: make(chan struct{}), enqueuedAt: time.Now(), logger: logger}
-	request.element = s.queue.PushBack(request)
-	s.waiting++
-	inFlight, maxConcurrent, waiting, maxWaiting := s.inFlight, s.maxConcurrent, s.waiting, s.maxWaiting
-	s.mu.Unlock()
-	logger.Info("queued", "path", path, "concurrent_requests", inFlight, "max_concurrent_requests", maxConcurrent, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
-	s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "queued", "")
+	// Peek to determine whether we will be queued. The result is advisory
+	// (used only for logging) and races with concurrent acquirers are
+	// acceptable.
+	capacity, inFlight, _, _ := s.budget.stats()
+	willQueue := inFlight+chargedCost > capacity
 
-	select {
-	case <-request.ready:
-		return s.releaseFunc(path), request.queueWait, true
-	case <-ctx.Done():
-		s.mu.Lock()
-		if request.admitted {
-			s.mu.Unlock()
-			return s.releaseFunc(path), request.queueWait, true
-		}
-		if request.element != nil {
-			s.queue.Remove(request.element)
-			request.element = nil
-			s.waiting--
-		}
-		s.mu.Unlock()
-		return nil, 0, false
+	if willQueue {
+		// Pre-log the queue event before blocking on acquire. We log here
+		// because once acquire returns, we cannot distinguish "blocked
+		// briefly" from "rejected after blocking" in the queued log.
+		_, _, waiting, maxWaiting := s.budget.stats()
+		logger.Info("queued", "path", path, "cost", chargedCost, "tokens_in_flight", inFlight, "max_tokens_in_flight", capacity, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
+		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "queued", "")
 	}
+
+	queueWait, ok := s.budget.acquire(ctx, chargedCost)
+	if !ok {
+		return nil, queueWait, false
+	}
+
+	source := "direct"
+	if willQueue {
+		source = "waiting_to_concurrent"
+	}
+	_, postInFlight, waiting, maxWaiting := s.budget.stats()
+	logger.Info("admitted", "path", path, "source", source, "cost", chargedCost, "queue_wait_ms", float64(queueWait)/float64(time.Millisecond), "tokens_in_flight", postInFlight, "max_tokens_in_flight", capacity, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
+	s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "admitted", "")
+	return s.releaseFunc(chargedCost), queueWait, true
 }
 
-func (s *requestScheduler) Reconfigure(maxConcurrentRequests, maxWaitingRequests int) {
-	if maxConcurrentRequests < 1 {
-		maxConcurrentRequests = 1
+func (s *requestScheduler) Reconfigure(maxTokensInFlight, maxWaitingRequests int) {
+	if maxTokensInFlight < 1 {
+		maxTokensInFlight = 1
 	}
 	if maxWaitingRequests < 0 {
 		maxWaitingRequests = 0
 	}
-
 	s.mu.Lock()
-	s.maxConcurrent = maxConcurrentRequests
+	s.maxTokensInFlight = int64(maxTokensInFlight)
 	s.maxWaiting = maxWaitingRequests
-	s.promoteWaitingLocked()
 	s.mu.Unlock()
+	s.budget.reconfigure(int64(maxTokensInFlight), maxWaitingRequests)
 }
 
-func (s *requestScheduler) Stats() (int, int, int, int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.maxConcurrent, s.inFlight, s.maxWaiting, s.waiting
-}
-
-func (s *requestScheduler) releaseFunc(path string) func() {
-	return func() {
-		s.mu.Lock()
-		if s.inFlight > 0 {
-			s.inFlight--
-		}
-		s.promoteWaitingLocked()
-		s.mu.Unlock()
+// Observe records actual completion tokens for the global p95 estimator,
+// which improves cost estimates for subsequent requests.
+func (s *requestScheduler) Observe(completionTokens int) {
+	if s == nil || s.estimator == nil {
+		return
 	}
+	s.estimator.observe(completionTokens)
 }
 
-func (s *requestScheduler) promoteWaitingLocked() {
-	for s.inFlight < s.maxConcurrent && s.queue.Len() > 0 {
-		front := s.queue.Front()
-		request := front.Value.(*waitingRequest)
-		s.queue.Remove(front)
-		request.element = nil
-		request.admitted = true
-		request.queueWait = time.Since(request.enqueuedAt)
-		s.waiting--
-		s.inFlight++
-		logger := request.logger
-		if logger == nil {
-			logger = slog.Default()
-		}
-		logger.Info("admitted", "path", request.path, "source", "waiting_to_concurrent", "queue_wait_ms", float64(request.queueWait)/float64(time.Millisecond), "concurrent_requests", s.inFlight, "max_concurrent_requests", s.maxConcurrent, "waiting_requests", s.waiting, "max_waiting_requests", s.maxWaiting)
-		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "admitted", "")
-		close(request.ready)
+// Estimator returns the global completion-token p95 estimator.
+func (s *requestScheduler) Estimator() *completionEstimator {
+	if s == nil {
+		return nil
+	}
+	return s.estimator
+}
+
+func (s *requestScheduler) Stats() (int, int64, int, int) {
+	capacity, inFlight, waiting, maxWaiting := s.budget.stats()
+	return int(capacity), inFlight, maxWaiting, waiting
+}
+
+func (s *requestScheduler) releaseFunc(cost int64) func() {
+	return func() {
+		s.budget.release(cost)
 	}
 }
 
 func (s *requestScheduler) effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation int) float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, effectiveTokensPerSecond := s.degradationMetricsLocked(baseTokensPerSecond, maxDegradation)
+	_, effectiveTokensPerSecond := s.degradationMetrics(baseTokensPerSecond, maxDegradation)
 	return effectiveTokensPerSecond
 }
 
-func (s *requestScheduler) processingStats(baseTokensPerSecond, maxDegradation int) (int, int, int, int, float64, float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	computedDegradationPercentage, effectiveTokensPerSecond := s.degradationMetricsLocked(baseTokensPerSecond, maxDegradation)
-	return s.maxConcurrent, s.inFlight, s.maxWaiting, s.waiting, computedDegradationPercentage, effectiveTokensPerSecond
+// processingStats returns the snapshot used for metrics and the /config
+// endpoint: (maxTokensInFlight, tokensInFlight, maxWaiting, waiting,
+// computedDegradationPercentage, effectiveTokensPerSecond).
+func (s *requestScheduler) processingStats(baseTokensPerSecond, maxDegradation int) (int64, int64, int, int, float64, float64) {
+	capacity, inFlight, waiting, maxWaiting := s.budget.stats()
+	computedDegradationPercentage, effectiveTokensPerSecond := s.degradationMetricsFor(capacity, inFlight, baseTokensPerSecond, maxDegradation)
+	return capacity, inFlight, maxWaiting, waiting, computedDegradationPercentage, effectiveTokensPerSecond
 }
 
-func (s *requestScheduler) degradationMetricsLocked(baseTokensPerSecond, maxDegradation int) (float64, float64) {
+func (s *requestScheduler) degradationMetrics(baseTokensPerSecond, maxDegradation int) (float64, float64) {
+	capacity, inFlight, _, _ := s.budget.stats()
+	return s.degradationMetricsFor(capacity, inFlight, baseTokensPerSecond, maxDegradation)
+}
+
+// degradationMetricsFor computes (computedDegradationPercentage,
+// effectiveTokensPerSecond) using the cost-based fill ratio
+// inFlight/capacity. Below the 10% threshold there is no degradation; above
+// it, degradation scales linearly to maxDegradation at full capacity.
+func (s *requestScheduler) degradationMetricsFor(capacity, inFlight int64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
 	if baseTokensPerSecond < 1 {
 		return 0, 0
 	}
 	calibratedBaseTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
-	if maxDegradation == 0 {
+	if maxDegradation == 0 || capacity <= 0 {
 		return 0, calibratedBaseTokensPerSecond
 	}
-	capacity := s.maxConcurrent
-	inFlight := s.inFlight
-	if capacity == 0 {
+	thresholdCost := int64(math.Floor(float64(capacity) * degradationThreshold))
+	if inFlight <= thresholdCost {
 		return 0, calibratedBaseTokensPerSecond
 	}
-	thresholdRequests := int(math.Floor(float64(capacity) * degradationThreshold))
-	if inFlight <= thresholdRequests {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	degradationWindow := capacity - thresholdRequests
+	degradationWindow := capacity - thresholdCost
 	if degradationWindow <= 0 {
 		return 0, calibratedBaseTokensPerSecond
 	}
-	progress := float64(inFlight-thresholdRequests) / float64(degradationWindow)
+	progress := float64(inFlight-thresholdCost) / float64(degradationWindow)
 	if progress < 0 {
 		progress = 0
 	}

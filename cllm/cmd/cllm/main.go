@@ -57,7 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
-	handler.SetRequestProcessingLimits(cfg.MaxTokensPerSecond, cfg.MaxConcurrentRequests, cfg.MaxWaitingRequests, cfg.MaxDegradation)
+	handler.SetRequestProcessingLimits(cfg.MaxTokensPerSecond, cfg.MaxTokensInFlight, cfg.MaxWaitingRequests, cfg.MaxDegradation)
 	handler.SetPrefillSimulation(cfg.PrefillRateMultiplier, cfg.PrefillBaseOverheadMs, cfg.PrefillJitterPercent, cfg.PrefillMaxMs)
 	handler.SetStreamRealism(cfg.StreamVariabilityPercent, cfg.StreamJitterPercent, cfg.StreamStallProbabilityPercent, cfg.StreamStallMinMs, cfg.StreamStallMaxMs)
 	if cfg.DSLProfiles != nil {
@@ -72,6 +72,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		logger.Info("default DSL profile installed", "dsl_profile", handler.DSLDefaultProfile())
+	}
+	if len(cfg.Tenants) > 0 {
+		converted := make(map[string]httpapi.TenantConfig, len(cfg.Tenants))
+		for name, spec := range cfg.Tenants {
+			converted[name] = httpapi.TenantConfig{Rate: spec.Rate, Burst: spec.Burst}
+		}
+		handler.SetTenants(converted)
+		logger.Info("loaded tenants", "count", len(converted), "names", handler.TenantNames())
 	}
 	if err := loadStartupCache(logger, handler, cfg.CacheFilePath); err != nil {
 		logger.Error("load startup cache", "err", err, "cache_file_path", cfg.CacheFilePath)
@@ -95,8 +103,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"max_tokens", cfg.MaxTokens,
 			"max_tokens_per_second", cfg.MaxTokensPerSecond,
 			"effective_tokens_per_second", processingStats.EffectiveTokensPerSecond,
-			"max_concurrent_requests", processingStats.MaxConcurrentRequests,
-			"concurrent_requests", processingStats.ConcurrentRequests,
+			"max_tokens_in_flight", processingStats.MaxTokensInFlight,
+			"tokens_in_flight", processingStats.TokensInFlight,
 			"max_waiting_requests", processingStats.MaxWaitingRequests,
 			"waiting_requests", processingStats.WaitingRequests,
 			"max_degradation", cfg.MaxDegradation,
@@ -179,8 +187,8 @@ func startQueueDepthLogger(ctx context.Context, logger *slog.Logger, handler *ht
 			processingStats := handler.RequestProcessingStats()
 			logger.Info(
 				"queue depth",
-				"concurrent_requests", processingStats.ConcurrentRequests,
-				"max_concurrent_requests", processingStats.MaxConcurrentRequests,
+				"tokens_in_flight", processingStats.TokensInFlight,
+				"max_tokens_in_flight", processingStats.MaxTokensInFlight,
 				"waiting_requests", processingStats.WaitingRequests,
 				"max_waiting_requests", processingStats.MaxWaitingRequests,
 				"effective_tokens_per_second", processingStats.EffectiveTokensPerSecond,

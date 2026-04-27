@@ -7,15 +7,13 @@
 #   temperature  Override --temperature for this prompt only.
 
 - prompt: "Explain Azure"
-#  dsl: "profile=fast"
-#  max_tokens: 256
-#  temperature: 0.2
+  max_tokens: 512
+  temperature: 0.2
 
 - prompt: "What is the capital of Texas?"
-#  max_tokens: 32
-#  temperature: 0.0
+  max_tokens: 32
+  temperature: 0.0
 
 - prompt: "Explain Kubernetes"
-#  dsl: "tps=20 ttft_ms=500"
-#  max_tokens: 512
-#  temperature: 0.7
+  max_tokens: 512
+  temperature: 0.2

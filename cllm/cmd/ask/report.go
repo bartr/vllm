@@ -43,7 +43,11 @@ func runAggregator(opts options, results <-chan Result, stdout io.Writer) {
 		if r.OK {
 			window.add(r.StartedAt, r.EndedAt, r.CompletionTokens)
 		}
-		totalTPS := window.tps(r.EndedAt)
+		totalTPS, totalReady := window.tps(r.EndedAt)
+		totalCol := ""
+		if totalReady {
+			totalCol = fmt.Sprintf("%.2f", totalTPS)
+		}
 
 		cache := ""
 		if r.OK {
@@ -53,8 +57,8 @@ func runAggregator(opts options, results <-chan Result, stdout io.Writer) {
 			}
 		}
 
-		fmt.Fprintf(stdout, "%-7d %-7d %-9s %-12s %-11.2f %-12.2f %-6s",
-			r.Worker, r.CompletionTokens, ttft, duration, reqTPS, totalTPS, cache)
+		fmt.Fprintf(stdout, "%-7d %-7d %-9s %-12s %-11.2f %-12s %-6s",
+			r.Worker, r.CompletionTokens, ttft, duration, reqTPS, totalCol, cache)
 		if !r.OK {
 			fmt.Fprintf(stdout, "  ERR: %s", trimErr(r.Err, 80))
 		}
@@ -66,51 +70,145 @@ func runAggregator(opts options, results <-chan Result, stdout io.Writer) {
 	}
 }
 
-// windowDeque tracks (started_at, ended_at, completion_tokens) tuples
-// within a rolling time window for sliding tokens/sec. A request is
-// kept while any part of it overlaps the window, so a single long
-// request never collapses the rate to 0. The reported coverage is
-// clamped to the window so a long-running request's tps reflects its
-// actual decode rate rather than the elapsed wall clock.
+// windowDeque tracks tokens/sec over a rolling window by distributing
+// each completed request's token count linearly across its [start, end]
+// lifetime into per-second buckets. A request that ran 8 seconds and
+// produced 256 tokens contributes 32 tokens to each of the 8 seconds it
+// was alive, regardless of when the aggregator actually observed its
+// completion. This collapses the arrival-noise variance of clustered
+// retirements: a flock of completions arriving in the same second adds
+// their tokens to the seconds they were *generated*, not to the second
+// they happened to be observed.
+//
+// Because the aggregator only observes requests at completion, the most
+// recent ~one-request-lifetime of buckets is always partial (in-flight
+// requests haven't back-filled them yet). To remove the resulting
+// steady-state bias, the read is **lagged** by a decaying maximum of
+// observed request lifetimes (a bucket is only fully filled once the
+// longest possibly-overlapping request has retired). The lag is
+// clamped to maxAge - 1 so coverage never collapses to zero.
 type windowDeque struct {
-	maxAge time.Duration
-	items  []windowItem
-}
-
-type windowItem struct {
-	start  time.Time
-	end    time.Time
-	tokens int
+	maxAge  time.Duration
+	buckets map[int64]float64 // unix-second -> tokens generated in that second
+	first   time.Time         // start of the first observed request (warm-up anchor)
+	maxLife float64           // decaying max of observed request lifetimes, in seconds
 }
 
 func (w *windowDeque) add(start, end time.Time, tokens int) {
-	w.items = append(w.items, windowItem{start: start, end: end, tokens: tokens})
+	if tokens <= 0 {
+		return
+	}
+	if w.first.IsZero() || start.Before(w.first) {
+		w.first = start
+	}
+	if w.buckets == nil {
+		w.buckets = make(map[int64]float64)
+	}
+	if !end.After(start) {
+		// Degenerate (zero-duration) request: credit the end second.
+		w.buckets[end.Unix()] += float64(tokens)
+		return
+	}
+	// Track a decaying max lifetime. Decay slowly (~0.97 per add) so a
+	// transient long request keeps the lag elevated for ~30 subsequent
+	// completions, preventing oscillation between under-counted and
+	// fully-filled regimes.
+	life := end.Sub(start).Seconds()
+	w.maxLife *= 0.97
+	if life > w.maxLife {
+		w.maxLife = life
+	}
+	perSec := float64(tokens) / life
+	cur := start
+	for cur.Before(end) {
+		secStart := time.Unix(cur.Unix(), 0)
+		secEnd := secStart.Add(time.Second)
+		if secEnd.After(end) {
+			secEnd = end
+		}
+		overlap := secEnd.Sub(cur).Seconds()
+		w.buckets[cur.Unix()] += perSec * overlap
+		cur = secEnd
+	}
 }
 
-func (w *windowDeque) tps(now time.Time) float64 {
-	cutoff := now.Add(-w.maxAge)
-	// Evict only requests that ended before the window started.
-	for len(w.items) > 0 && w.items[0].end.Before(cutoff) {
-		w.items = w.items[1:]
+func (w *windowDeque) tps(now time.Time) (float64, bool) {
+	if w.first.IsZero() {
+		return 0, false
 	}
-	if len(w.items) == 0 {
-		return 0
+	// Lag the read by the decaying max of observed request lifetimes
+	// so every bucket inside the read window has been fully filled by
+	// every request that overlapped it. Mean lag is too short: a
+	// bucket at second t is only complete once every request that was
+	// alive during t has ended, i.e. t + maxLife.
+	lagSec := w.maxLife
+	if maxLag := w.maxAge.Seconds() - 1; lagSec > maxLag {
+		lagSec = maxLag
 	}
-	var sum int
-	for _, it := range w.items {
-		sum += it.tokens
+	if lagSec < 0 {
+		lagSec = 0
 	}
-	// Coverage is from the earliest in-window start to now, clamped to maxAge.
-	earliest := w.items[0].start
-	if earliest.Before(cutoff) {
-		earliest = cutoff
+
+	// Use sub-second resolution for the read window so adjacent
+	// samples don't return identical sums. The 1-second bucket grid
+	// is unchanged; we just weight the trailing edges of the read
+	// window by their fractional overlap with each bucket. Tokens
+	// inside a bucket are assumed to have been generated uniformly
+	// within that second (consistent with how add() distributes them).
+	nowF := float64(now.UnixNano()) / 1e9
+	readEnd := nowF - lagSec
+	readStart := readEnd - w.maxAge.Seconds()
+
+	// Evict buckets older than the absolute retention horizon (well
+	// before the cutoff) so the map can't grow unbounded.
+	absoluteCutoff := int64(nowF - w.maxAge.Seconds() - maxLagSeconds)
+	for sec := range w.buckets {
+		if sec < absoluteCutoff {
+			delete(w.buckets, sec)
+		}
 	}
-	covered := now.Sub(earliest)
+
+	var sum float64
+	startSec := int64(math.Floor(readStart))
+	endSec := int64(math.Floor(readEnd))
+	for sec, v := range w.buckets {
+		if sec < startSec || sec > endSec {
+			continue
+		}
+		l := float64(sec)
+		r := l + 1
+		if l < readStart {
+			l = readStart
+		}
+		if r > readEnd {
+			r = readEnd
+		}
+		overlap := r - l
+		if overlap <= 0 {
+			continue
+		}
+		sum += v * overlap
+	}
+
+	covered := w.maxAge.Seconds()
+	firstF := float64(w.first.UnixNano()) / 1e9
+	if elapsed := readEnd - firstF; elapsed < covered {
+		covered = elapsed
+	}
 	if covered <= 0 {
-		return 0
+		return 0, false
 	}
-	return float64(sum) / covered.Seconds()
+
+	// Ready once the wall-clock has accumulated a full window plus
+	// the current lag — at that point every bucket in the read
+	// window has been fully filled by every overlapping request.
+	ready := (nowF - firstF) >= w.maxAge.Seconds()+lagSec
+	return sum / covered, ready
 }
+
+// maxLagSeconds bounds how much extra bucket history we retain beyond
+// the maxAge window so that the lagged-read can still see them.
+const maxLagSeconds = 60.0
 
 func trimErr(s string, n int) string {
 	if len(s) <= n {

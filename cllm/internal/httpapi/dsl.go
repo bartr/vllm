@@ -19,8 +19,16 @@ const dslMarker = ":dsl"
 
 // replayOverrides is the resolved set of per-request adjustments derived
 // from DSL directives. nil/zero fields mean "no override".
+//
+// Cache semantics are controlled by two booleans that share a single
+// directive class ("cache") for first-wins precedence:
+//
+//	noCache  skip cache lookup AND skip cache write (pure passthrough).
+//	reCache  skip cache lookup but DO write the fresh response back to
+//	         the cache, replacing any stale entry.
 type replayOverrides struct {
 	noCache              bool
+	reCache              bool
 	noTPS                bool
 	noPrefill            bool
 	tpsOverride          int     // <=0 means use handler value
@@ -113,9 +121,10 @@ func parseDSLWithDefaultProfile(messages []chatCompletionMessage, draw func() fl
 	seen := map[string]bool{}
 	var profileName string
 
-	// Pre-scan: no-cache has the highest precedence. Profile selection is
-	// also collected here so the chosen bundle can be expanded after the
-	// main loop.
+	// Pre-scan: cache directives have the highest precedence. Profile
+	// selection is also collected here so the chosen bundle can be
+	// expanded after the main loop. The "cache" class is shared by
+	// no-cache and re-cache; first-wins.
 	for _, m := range messages {
 		_, dslPart, hadMarker := splitAtDSLMarker(m.Content)
 		if !hadMarker {
@@ -127,6 +136,12 @@ func parseDSLWithDefaultProfile(messages []chatCompletionMessage, draw func() fl
 				seen["cache"] = true
 				overrides.noCache = true
 				overrides.directives = append(overrides.directives, "no-cache")
+				continue
+			}
+			if tok == "re-cache" && !seen["cache"] {
+				seen["cache"] = true
+				overrides.reCache = true
+				overrides.directives = append(overrides.directives, "re-cache")
 				continue
 			}
 			if name, ok := strings.CutPrefix(tok, "profile="); ok && !seen["profile"] {
@@ -207,6 +222,14 @@ func applyDSLTokenList(o *replayOverrides, fields []string, seen map[string]bool
 			}
 			continue
 		}
+		if raw == "re-cache" {
+			if !inPrompt && !seen["cache"] {
+				seen["cache"] = true
+				o.reCache = true
+				o.directives = append(o.directives, "re-cache")
+			}
+			continue
+		}
 		if strings.HasPrefix(raw, "profile=") {
 			// Profiles are pre-scanned in the prompt, never nested in bundles.
 			continue
@@ -249,15 +272,30 @@ func applyDSLTokenList(o *replayOverrides, fields []string, seen map[string]bool
 
 // splitAtDSLMarker returns (before, after, hadMarker). before has the
 // marker and any trailing whitespace removed. The marker match is
-// case-insensitive.
+// case-insensitive. The DSL line is bounded at the first newline after
+// the marker: anything past that newline is prompt body and is
+// concatenated onto `before` so it is not consumed as DSL tokens.
 func splitAtDSLMarker(content string) (string, string, bool) {
 	idx := strings.Index(strings.ToLower(content), dslMarker)
 	if idx < 0 {
 		return content, "", false
 	}
 	before := strings.TrimRight(content[:idx], " \t\r\n")
-	after := content[idx+len(dslMarker):]
-	return before, after, true
+	rest := content[idx+len(dslMarker):]
+	dslPart := rest
+	var afterBody string
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		dslPart = rest[:nl]
+		afterBody = rest[nl+1:]
+	}
+	if afterBody != "" {
+		if before == "" {
+			before = strings.TrimRight(afterBody, " \t\r\n")
+		} else {
+			before = before + "\n" + strings.TrimRight(afterBody, " \t\r\n")
+		}
+	}
+	return before, dslPart, true
 }
 
 // applyDSLBareToken applies a no-argument directive. Returns true when at
@@ -475,7 +513,7 @@ func dslDirectiveFamily(tok string) string {
 		return tok
 	}
 	switch tok {
-	case "no-cache", "no-delay", "no-tps", "no-prefill", "no-jitter", "no-variability", "no-stall":
+	case "no-cache", "re-cache", "no-delay", "no-tps", "no-prefill", "no-jitter", "no-variability", "no-stall":
 		return tok
 	}
 	if eq := strings.IndexByte(tok, '='); eq > 0 {

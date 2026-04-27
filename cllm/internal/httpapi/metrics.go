@@ -32,6 +32,8 @@ type handlerMetrics struct {
 	jobDuration               *prometheus.HistogramVec
 	downstreamRequestDuration *prometheus.HistogramVec
 	requestLifecycleEvents    *prometheus.CounterVec
+	tenantAdmissionTotal      *prometheus.CounterVec
+	tenantRejectionsTotal     *prometheus.CounterVec
 }
 
 const chatCompletionsRouteLabel = "POST /v1/chat/completions"
@@ -126,6 +128,14 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			Name: "cllm_request_lifecycle_events_total",
 			Help: "Total per-request lifecycle events (admitted, queued, started, completed, rejected). The outcome label is empty for events that do not carry a result or reason.",
 		}, []string{"endpoint", "event", "outcome"}),
+		tenantAdmissionTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_tenant_admissions_total",
+			Help: "Total chat completion requests admitted past both tenant rate limit and global cost budget, by tenant.",
+		}, []string{"tenant"}),
+		tenantRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_tenant_rejections_total",
+			Help: "Total chat completion requests rejected at admission, by tenant and reason (tenant_rate, over_capacity).",
+		}, []string{"tenant", "reason"}),
 	}
 
 	registry.MustRegister(
@@ -150,12 +160,14 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		metrics.jobDuration,
 		metrics.downstreamRequestDuration,
 		metrics.requestLifecycleEvents,
+		metrics.tenantAdmissionTotal,
+		metrics.tenantRejectionsTotal,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "cllm_queue_active_requests",
-			Help: "Current number of active admitted requests.",
+			Name: "cllm_tokens_in_flight",
+			Help: "Current admitted token cost in flight.",
 		}, func() float64 {
 			stats := handler.RequestProcessingStats()
-			return float64(stats.ConcurrentRequests)
+			return float64(stats.TokensInFlight)
 		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cllm_queue_waiting_requests",
@@ -165,11 +177,11 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			return float64(stats.WaitingRequests)
 		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "cllm_queue_max_active_requests",
-			Help: "Configured maximum number of active concurrent requests.",
+			Name: "cllm_max_tokens_in_flight",
+			Help: "Configured maximum admitted token cost in flight.",
 		}, func() float64 {
 			stats := handler.RequestProcessingStats()
-			return float64(stats.MaxConcurrentRequests)
+			return float64(stats.MaxTokensInFlight)
 		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cllm_queue_max_waiting_requests",
@@ -322,6 +334,20 @@ func (m *handlerMetrics) observeLifecycleEvent(endpoint, event, outcome string) 
 		return
 	}
 	m.requestLifecycleEvents.WithLabelValues(endpoint, event, outcome).Inc()
+}
+
+func (m *handlerMetrics) observeAdmissionAccept(tenant, _ string) {
+	if m == nil || m.tenantAdmissionTotal == nil {
+		return
+	}
+	m.tenantAdmissionTotal.WithLabelValues(tenant).Inc()
+}
+
+func (m *handlerMetrics) observeAdmissionRejection(tenant, reason string) {
+	if m == nil || m.tenantRejectionsTotal == nil {
+		return
+	}
+	m.tenantRejectionsTotal.WithLabelValues(tenant, reason).Inc()
 }
 
 func (m *handlerMetrics) observeJob(endpoint, result, source, _ string, duration time.Duration) {

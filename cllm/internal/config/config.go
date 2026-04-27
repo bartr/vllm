@@ -23,7 +23,7 @@ const (
 	defaultTemperature           = runtimeconfig.DefaultTemperature
 	defaultSystemPrompt          = runtimeconfig.DefaultSystemPrompt
 	defaultMaxTokensPerSecond    = runtimeconfig.DefaultMaxTokensPerSecond
-	defaultMaxConcurrentRequests = runtimeconfig.DefaultMaxConcurrentRequests
+	defaultMaxTokensInFlight     = runtimeconfig.DefaultMaxTokensInFlight
 	defaultMaxWaitingRequests    = runtimeconfig.DefaultMaxWaitingRequests
 	defaultMaxDegradation        = runtimeconfig.DefaultMaxDegradation
 	defaultPrefillRateMultiplier = runtimeconfig.DefaultPrefillRateMultiplier
@@ -39,8 +39,8 @@ const (
 	maxMaxTokens                 = runtimeconfig.MaxMaxTokens
 	minMaxTokensPerSecond        = runtimeconfig.MinMaxTokensPerSecond
 	maxMaxTokensPerSecond        = runtimeconfig.MaxMaxTokensPerSecond
-	minMaxConcurrentRequests     = runtimeconfig.MinMaxConcurrentRequests
-	maxMaxConcurrentRequests     = runtimeconfig.MaxMaxConcurrentRequests
+	minMaxTokensInFlight         = runtimeconfig.MinMaxTokensInFlight
+	maxMaxTokensInFlight         = runtimeconfig.MaxMaxTokensInFlight
 	minMaxWaitingRequests        = runtimeconfig.MinMaxWaitingRequests
 	maxMaxWaitingRequests        = runtimeconfig.MaxMaxWaitingRequests
 	minMaxDegradation            = runtimeconfig.MinMaxDegradation
@@ -72,7 +72,7 @@ type Config struct {
 	MaxTokens             int
 	Temperature           float64
 	MaxTokensPerSecond    int
-	MaxConcurrentRequests int
+	MaxTokensInFlight     int
 	MaxWaitingRequests    int
 	MaxDegradation        int
 	PrefillRateMultiplier float64
@@ -86,6 +86,7 @@ type Config struct {
 	StreamStallMaxMs              int
 	DSLProfiles           map[string][]string
 	DSLProfile            string
+	Tenants               map[string]TenantSpec
 	ShutdownTimeout       time.Duration
 }
 
@@ -116,6 +117,11 @@ func LoadFromArgs(args []string) (Config, error) {
 		return Config{}, err
 	}
 
+	tenants, err := loadTenants()
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		Addr:                  net.JoinHostPort("", strconv.Itoa(portNumber)),
 		CacheSize:             runtimeOptions.cacheSize,
@@ -127,7 +133,7 @@ func LoadFromArgs(args []string) (Config, error) {
 		MaxTokens:             runtimeOptions.maxTokens,
 		Temperature:           runtimeOptions.temperature,
 		MaxTokensPerSecond:    runtimeOptions.maxTokensPerSecond,
-		MaxConcurrentRequests: runtimeOptions.maxConcurrentRequests,
+		MaxTokensInFlight:     runtimeOptions.maxTokensInFlight,
 		MaxWaitingRequests:    runtimeOptions.maxWaitingRequests,
 		MaxDegradation:        runtimeOptions.maxDegradation,
 		PrefillRateMultiplier: runtimeOptions.prefillRateMultiplier,
@@ -141,6 +147,7 @@ func LoadFromArgs(args []string) (Config, error) {
 		StreamStallMaxMs:              runtimeOptions.streamStallMaxMs,
 		DSLProfiles:           dslProfiles,
 		DSLProfile:            runtimeOptions.dslProfile,
+		Tenants:               tenants,
 		ShutdownTimeout:       shutdownTimeout,
 	}, nil
 }
@@ -159,7 +166,7 @@ func Usage() string {
 	builder.WriteString(fmt.Sprintf("      --system-prompt string  Default system prompt for chat completions (default %q)\n", defaultSystemPrompt))
 	builder.WriteString(fmt.Sprintf("      --max-tokens int        Default max tokens for chat completions (default %d)\n", defaultMaxTokens))
 	builder.WriteString(fmt.Sprintf("      --max-tokens-per-second int   Max cached replay tokens per request per second (default %d)\n", defaultMaxTokensPerSecond))
-	builder.WriteString(fmt.Sprintf("      --max-concurrent-requests int Max number of concurrent request slots (default %d)\n", defaultMaxConcurrentRequests))
+	builder.WriteString(fmt.Sprintf("      --max-tokens-in-flight int    Max admitted token cost in flight (default %d)\n", defaultMaxTokensInFlight))
 	builder.WriteString(fmt.Sprintf("      --max-waiting-requests int    Max number of queued waiting requests (default %d)\n", defaultMaxWaitingRequests))
 	builder.WriteString(fmt.Sprintf("      --max-degradation int         Percent degradation applied after 10%% concurrency usage (default %d)\n", defaultMaxDegradation))
 	builder.WriteString(fmt.Sprintf("      --temperature float     Default temperature for chat completions (default %.1f)\n", defaultTemperature))
@@ -185,7 +192,7 @@ func Usage() string {
 	builder.WriteString("  CACHE_DSL_PROFILE\n")
 	builder.WriteString("  CACHE_MAX_TOKENS\n")
 	builder.WriteString("  CACHE_MAX_TOKENS_PER_SECOND\n")
-	builder.WriteString("  CACHE_MAX_CONCURRENT_REQUESTS\n")
+	builder.WriteString("  CACHE_MAX_TOKENS_IN_FLIGHT\n")
 	builder.WriteString("  CACHE_MAX_WAITING_REQUESTS\n")
 	builder.WriteString("  CACHE_MAX_DEGRADATION\n")
 	builder.WriteString("  CACHE_TEMPERATURE\n")
@@ -211,7 +218,7 @@ type runtimeOptions struct {
 	maxTokens             int
 	temperature           float64
 	maxTokensPerSecond    int
-	maxConcurrentRequests int
+	maxTokensInFlight     int
 	maxWaitingRequests    int
 	maxDegradation        int
 	prefillRateMultiplier float64
@@ -235,7 +242,7 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 		maxTokens:             defaultMaxTokens,
 		temperature:           defaultTemperature,
 		maxTokensPerSecond:    defaultMaxTokensPerSecond,
-		maxConcurrentRequests: defaultMaxConcurrentRequests,
+		maxTokensInFlight:     defaultMaxTokensInFlight,
 		maxWaitingRequests:    defaultMaxWaitingRequests,
 		maxDegradation:        defaultMaxDegradation,
 		prefillRateMultiplier: defaultPrefillRateMultiplier,
@@ -300,12 +307,12 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 		options.maxTokensPerSecond = parsedValue
 	}
 
-	if envValue := os.Getenv("CACHE_MAX_CONCURRENT_REQUESTS"); envValue != "" {
+	if envValue := os.Getenv("CACHE_MAX_TOKENS_IN_FLIGHT"); envValue != "" {
 		parsedValue, err := strconv.Atoi(envValue)
 		if err != nil {
-			return runtimeOptions{}, fmt.Errorf("invalid CACHE_MAX_CONCURRENT_REQUESTS %q", envValue)
+			return runtimeOptions{}, fmt.Errorf("invalid CACHE_MAX_TOKENS_IN_FLIGHT %q", envValue)
 		}
-		options.maxConcurrentRequests = parsedValue
+		options.maxTokensInFlight = parsedValue
 	}
 
 	if envValue := os.Getenv("CACHE_MAX_WAITING_REQUESTS"); envValue != "" {
@@ -408,9 +415,9 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	flagSet.StringVar(&options.systemPrompt, "system-prompt", options.systemPrompt, "default system prompt for requests")
 	flagSet.IntVar(&options.maxTokens, "max-tokens", options.maxTokens, "default max tokens for requests")
 	flagSet.IntVar(&options.maxTokensPerSecond, "max-tokens-per-second", options.maxTokensPerSecond, "maximum cached replay tokens per request per second")
-	flagSet.IntVar(&options.maxConcurrentRequests, "max-concurrent-requests", options.maxConcurrentRequests, "maximum number of concurrent request slots")
+	flagSet.IntVar(&options.maxTokensInFlight, "max-tokens-in-flight", options.maxTokensInFlight, "maximum admitted token cost in flight")
 	flagSet.IntVar(&options.maxWaitingRequests, "max-waiting-requests", options.maxWaitingRequests, "maximum number of waiting requests")
-	flagSet.IntVar(&options.maxDegradation, "max-degradation", options.maxDegradation, "degradation percent applied after 10 percent concurrency usage")
+	flagSet.IntVar(&options.maxDegradation, "max-degradation", options.maxDegradation, "degradation percent applied after 10 percent token-budget usage")
 	flagSet.Float64Var(&options.temperature, "temperature", options.temperature, "default temperature for requests")
 	flagSet.Float64Var(&options.prefillRateMultiplier, "prefill-rate-multiplier", options.prefillRateMultiplier, "simulated prefill rate as multiple of max-tokens-per-second; 0 disables prefill simulation")
 	flagSet.IntVar(&options.prefillBaseOverheadMs, "prefill-base-overhead-ms", options.prefillBaseOverheadMs, "fixed simulated prefill startup overhead in ms")
@@ -437,15 +444,15 @@ func loadRuntimeOptions(args []string) (runtimeOptions, error) {
 	if options.maxTokensPerSecond < minMaxTokensPerSecond || options.maxTokensPerSecond > maxMaxTokensPerSecond {
 		return runtimeOptions{}, fmt.Errorf("max-tokens-per-second must be between %d and %d", minMaxTokensPerSecond, maxMaxTokensPerSecond)
 	}
-	if options.maxConcurrentRequests < minMaxConcurrentRequests || options.maxConcurrentRequests > maxMaxConcurrentRequests {
-		return runtimeOptions{}, fmt.Errorf("max-concurrent-requests must be between %d and %d", minMaxConcurrentRequests, maxMaxConcurrentRequests)
+	if options.maxTokensInFlight < minMaxTokensInFlight || options.maxTokensInFlight > maxMaxTokensInFlight {
+		return runtimeOptions{}, fmt.Errorf("max-tokens-in-flight must be between %d and %d", minMaxTokensInFlight, maxMaxTokensInFlight)
 	}
 	if options.maxWaitingRequests < minMaxWaitingRequests || options.maxWaitingRequests > maxMaxWaitingRequests {
 		return runtimeOptions{}, fmt.Errorf("max-waiting-requests must be between %d and %d", minMaxWaitingRequests, maxMaxWaitingRequests)
 	}
-	if options.maxWaitingRequests > 2*options.maxConcurrentRequests {
-		return runtimeOptions{}, fmt.Errorf("max-waiting-requests must be ≤ %d", 2*options.maxConcurrentRequests)
-	}
+	// max-waiting-requests is independent of token capacity; the only
+	// invariant is its own bounds (checked above).
+
 	if options.maxDegradation < minMaxDegradation || options.maxDegradation > maxMaxDegradation {
 		return runtimeOptions{}, fmt.Errorf("max-degradation must be between %d and %d", minMaxDegradation, maxMaxDegradation)
 	}

@@ -157,8 +157,8 @@ func startBanner(w io.Writer, opts options, maxWorkers int) {
 	if opts.count > 0 {
 		fmt.Fprintf(w, "count: %d\n", opts.count)
 	}
-	if opts.loop > 0 {
-		fmt.Fprintf(w, "loop: %d\n", opts.loop)
+	if opts.loop {
+		fmt.Fprintln(w, "loop: forever")
 	}
 	if len(opts.files) > 0 {
 		fmt.Fprintf(w, "files: %v (random=%t)\n", opts.files, opts.random)

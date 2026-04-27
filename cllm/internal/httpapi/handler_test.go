@@ -33,7 +33,7 @@ func TestRoutes(t *testing.T) {
 		{name: "health", method: http.MethodGet, path: "/health", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "ready", method: http.MethodGet, path: "/ready", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"concurrent_requests":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32.8`, `"max_concurrent_requests":512`, `"max_waiting_requests":1024`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"dsl_default_profile":""`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"tokens_in_flight":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32`, `"max_tokens_in_flight":200000`, `"max_waiting_requests":1024`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"dsl_default_profile":""`}},
 		{name: "cache", method: http.MethodGet, path: "/cache", statusCode: http.StatusOK, bodyContains: []string{`"enabled":true`, `"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`}},
 		{name: "metrics", method: http.MethodGet, path: "/metrics", statusCode: http.StatusOK, bodyContains: []string{"# HELP cllm_http_requests_total", "cllm_http_inflight_requests", "cllm_queue_waiting_requests"}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
@@ -508,7 +508,9 @@ func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 	defer vllmServer.Close()
 
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.SetRequestProcessingLimits(2, 10, 10, 0)
+	// Cost-based admission: each request charges prompt_tokens + max_tokens
+	// (~705 here). Use a 2000-token budget so two requests fit.
+	handler.SetRequestProcessingLimits(2, 2000, 10, 0)
 	handler.SetPrefillSimulation(0, 0, 0, 1)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	var sleeps []time.Duration
@@ -547,7 +549,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(20, 10, 10, 50)
 
-	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), "/one")
+	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first request slot")
 	}
@@ -558,7 +560,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 		t.Fatalf("delay below threshold = %s, want %s", got, expected)
 	}
 
-	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), "/two")
+	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second request slot")
 	}
@@ -577,7 +579,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 
 	releases := make([]func(), 0, 52)
 	for i := 0; i < 51; i++ {
-		release, _, ok := handler.acquireRequestSlot(context.Background(), "/threshold")
+		release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/threshold")
 		if !ok {
 			t.Fatalf("failed to acquire slot %d", i+1)
 		}
@@ -594,7 +596,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 		t.Fatalf("delay at threshold = %s, want %s", got, expected)
 	}
 
-	release, _, ok := handler.acquireRequestSlot(context.Background(), "/threshold-plus-one")
+	release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/threshold-plus-one")
 	if !ok {
 		t.Fatal("failed to acquire threshold+1 slot")
 	}
@@ -637,7 +639,7 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_per_second=48&max_concurrent_requests=64&max_waiting_requests=96&max_degradation=25&downstream_token=secret-token", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_per_second=48&max_tokens_in_flight=64&max_waiting_requests=96&max_degradation=25&downstream_token=secret-token", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -668,8 +670,8 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	if got.MaxTokensPerSecond != 48 {
 		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
 	}
-	if got.MaxConcurrentRequests != 64 {
-		t.Fatalf("max concurrent requests = %d, want %d", got.MaxConcurrentRequests, 64)
+	if got.MaxTokensInFlight != 64 {
+		t.Fatalf("max tokens in flight = %d, want %d", got.MaxTokensInFlight, 64)
 	}
 	if got.MaxWaitingRequests != 96 {
 		t.Fatalf("max waiting requests = %d, want %d", got.MaxWaitingRequests, 96)
@@ -755,13 +757,12 @@ func TestConfigEndpointRejectsInvalidQueueValues(t *testing.T) {
 		path string
 		want string
 	}{
-		{name: "concurrent below min", path: "/config?max-concurrent-requests=0", want: `max-concurrent-requests must be between 1 and 512`},
-		{name: "concurrent above max", path: "/config?max-concurrent-requests=513", want: `max-concurrent-requests must be between 1 and 512`},
+		{name: "tokens-in-flight below min", path: "/config?max-tokens-in-flight=0", want: `max-tokens-in-flight must be between 1 and 2000000`},
+		{name: "tokens-in-flight above max", path: "/config?max-tokens-in-flight=2000001", want: `max-tokens-in-flight must be between 1 and 2000000`},
 		{name: "waiting below min", path: "/config?max-waiting-requests=-1", want: `max-waiting-requests must be between 0 and 1024`},
 		{name: "waiting above max", path: "/config?max-waiting-requests=1025", want: `max-waiting-requests must be between 0 and 1024`},
-		{name: "waiting too large for concurrent", path: "/config?max-concurrent-requests=64&max-waiting-requests=129", want: `max-waiting-requests must be ≤ 128`},
 		{name: "tokens per second above max", path: "/config?max-tokens-per-second=1001", want: `max-tokens-per-second must be between 0 and 1000`},
-		{name: "degradation above max", path: "/config?max-concurrent-requests=64&max-waiting-requests=96&max-degradation=96", want: `max-degradation must be between 0 and 95`},
+		{name: "degradation above max", path: "/config?max-tokens-in-flight=64&max-waiting-requests=96&max-degradation=96", want: `max-degradation must be between 0 and 95`},
 		{name: "unknown dsl-profile", path: "/config?dsl-profile=does-not-exist", want: `unknown dsl-profile "does-not-exist"`},
 	}
 
@@ -786,11 +787,11 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	releaseOne, _, ok := scheduler.AcquirePath(ctx, "/one")
+	releaseOne, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first direct slot")
 	}
-	releaseTwo, _, ok := scheduler.AcquirePath(ctx, "/two")
+	releaseTwo, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second direct slot")
 	}
@@ -801,13 +802,13 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	}
 	acquired := make(chan acquiredRelease, 2)
 	go func() {
-		release, _, ok := scheduler.AcquirePath(ctx, "/three")
+		release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/three")
 		if ok {
 			acquired <- acquiredRelease{path: "/three", release: release}
 		}
 	}()
 	go func() {
-		release, _, ok := scheduler.AcquirePath(ctx, "/four")
+		release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/four")
 		if ok {
 			acquired <- acquiredRelease{path: "/four", release: release}
 		}
@@ -826,7 +827,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 		t.Fatalf("stats after reconfigure = (%d,%d,%d,%d), want (1,2,1,2)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
 
-	if _, _, ok := scheduler.AcquirePath(ctx, "/five"); ok {
+	if _, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/five"); ok {
 		t.Fatal("expected new admission to be rejected while queue remains above max waiting")
 	}
 
@@ -843,7 +844,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 1 || maxWaiting != 1 || waiting != 1 {
 		t.Fatalf("stats after first promotion = (%d,%d,%d,%d), want (1,1,1,1)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
-	if _, _, ok := scheduler.AcquirePath(ctx, "/six"); ok {
+	if _, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/six"); ok {
 		t.Fatal("expected new admission to be rejected while waiting queue is still full")
 	}
 
@@ -856,7 +857,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 0 || maxWaiting != 1 || waiting != 0 {
 		t.Fatalf("final stats = (%d,%d,%d,%d), want (1,0,1,0)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
-	if release, _, ok := scheduler.AcquirePath(ctx, "/seven"); !ok {
+	if release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/seven"); !ok {
 		t.Fatal("expected direct admission once both queues had space again")
 	} else {
 		release()
@@ -872,14 +873,14 @@ func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 	scheduler := newRequestScheduler(1, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	releaseOne, _, ok := scheduler.AcquirePath(ctx, "/one")
+	releaseOne, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire direct slot")
 	}
 
 	queuedAcquired := make(chan func(), 1)
 	go func() {
-		release, _, ok := scheduler.AcquirePath(ctx, "/two")
+		release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/two")
 		if ok {
 			queuedAcquired <- release
 		}
@@ -917,7 +918,7 @@ func TestConfigEndpointLogsQueueLimitChanges(t *testing.T) {
 
 	handler := NewHandler().Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?max-concurrent-requests=64&max-waiting-requests=96", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?max-tokens-in-flight=64&max-waiting-requests=96", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -925,11 +926,11 @@ func TestConfigEndpointLogsQueueLimitChanges(t *testing.T) {
 	logOutput := logBuffer.String()
 	for _, want := range []string{
 		`msg="request queue limits updated"`,
-		`previous_max_concurrent_requests=512`,
-		`max_concurrent_requests=64`,
+		`previous_max_tokens_in_flight=200000`,
+		`max_tokens_in_flight=64`,
 		`previous_max_waiting_requests=1024`,
 		`max_waiting_requests=96`,
-		`concurrent_requests=0`,
+		`tokens_in_flight=0`,
 		`waiting_requests=0`,
 	} {
 		if !strings.Contains(logOutput, want) {
@@ -947,11 +948,11 @@ func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(20, 10, 10, 50)
 
-	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), "/one")
+	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first request slot")
 	}
-	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), "/two")
+	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second request slot")
 	}
@@ -962,7 +963,7 @@ func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
 	for _, want := range []string{
 		`msg="computed degradation updated" source=limits_updated computed_degradation_percentage=0`,
 		`msg="computed degradation updated" source=request_admitted computed_degradation_percentage=5.556`,
-		`effective_tokens_per_second=19.361`,
+		`effective_tokens_per_second=18.889`,
 		`msg="computed degradation updated" source=request_completed computed_degradation_percentage=0`,
 	} {
 		if !strings.Contains(logOutput, want) {
@@ -977,7 +978,7 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 
 	releases := make([]func(), 0, 52)
 	for i := 0; i < 52; i++ {
-		release, _, ok := handler.acquireRequestSlot(context.Background(), "/load")
+		release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/load")
 		if !ok {
 			t.Fatalf("failed to acquire slot %d", i+1)
 		}
@@ -993,8 +994,8 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 	if got.ComputedDegradationPercentage != 0.022 {
 		t.Fatalf("computed degradation percentage = %v, want 0.022", got.ComputedDegradationPercentage)
 	}
-	if got.EffectiveTokensPerSecond != 102.478 {
-		t.Fatalf("effective tokens per second = %v, want 102.478", got.EffectiveTokensPerSecond)
+	if got.EffectiveTokensPerSecond != 99.978 {
+		t.Fatalf("effective tokens per second = %v, want 99.978", got.EffectiveTokensPerSecond)
 	}
 }
 
@@ -1125,7 +1126,7 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
 	t.Setenv("CACHE_MAX_TOKENS_PER_SECOND", "0")
-	t.Setenv("CACHE_MAX_CONCURRENT_REQUESTS", "64")
+	t.Setenv("CACHE_MAX_TOKENS_IN_FLIGHT", "64")
 	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
 	t.Setenv("CACHE_MAX_DEGRADATION", "25")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
@@ -1146,8 +1147,8 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	if cfg.MaxTokensPerSecond != 0 {
 		t.Fatalf("MaxTokensPerSecond = %d, want 0", cfg.MaxTokensPerSecond)
 	}
-	if cfg.MaxConcurrentRequests != 64 {
-		t.Fatalf("MaxConcurrentRequests = %d, want 64", cfg.MaxConcurrentRequests)
+	if cfg.MaxTokensInFlight != 64 {
+		t.Fatalf("MaxTokensInFlight = %d, want 64", cfg.MaxTokensInFlight)
 	}
 	if cfg.MaxWaitingRequests != 95 {
 		t.Fatalf("MaxWaitingRequests = %d, want 95", cfg.MaxWaitingRequests)
@@ -1172,14 +1173,14 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--max-tokens-per-second", "64", "--max-concurrent-requests", "16", "--max-waiting-requests", "31", "--max-degradation", "15", "--temperature", "0.9"}
+	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--max-tokens-per-second", "64", "--max-tokens-in-flight", "16", "--max-waiting-requests", "31", "--max-degradation", "15", "--temperature", "0.9"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
 	t.Setenv("CACHE_MAX_TOKENS_PER_SECOND", "0")
-	t.Setenv("CACHE_MAX_CONCURRENT_REQUESTS", "64")
+	t.Setenv("CACHE_MAX_TOKENS_IN_FLIGHT", "64")
 	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
 	t.Setenv("CACHE_MAX_DEGRADATION", "25")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
@@ -1200,8 +1201,8 @@ func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	if cfg.MaxTokensPerSecond != 64 {
 		t.Fatalf("MaxTokensPerSecond = %d, want 64", cfg.MaxTokensPerSecond)
 	}
-	if cfg.MaxConcurrentRequests != 16 {
-		t.Fatalf("MaxConcurrentRequests = %d, want 16", cfg.MaxConcurrentRequests)
+	if cfg.MaxTokensInFlight != 16 {
+		t.Fatalf("MaxTokensInFlight = %d, want 16", cfg.MaxTokensInFlight)
 	}
 	if cfg.MaxWaitingRequests != 31 {
 		t.Fatalf("MaxWaitingRequests = %d, want 31", cfg.MaxWaitingRequests)
@@ -1235,11 +1236,10 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 		{name: "env max tokens out of range", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
 		{name: "invalid env max tokens per second", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS_PER_SECOND", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS_PER_SECOND "nope"`},
 		{name: "flag max tokens per second above max", args: []string{"cllm", "--max-tokens-per-second", "1001"}, wantErr: "max-tokens-per-second must be between 0 and 1000"},
-		{name: "flag max concurrent requests too low", args: []string{"cllm", "--max-concurrent-requests", "0"}, wantErr: "max-concurrent-requests must be between 1 and 512"},
-		{name: "flag max concurrent requests too high", args: []string{"cllm", "--max-concurrent-requests", "513"}, wantErr: "max-concurrent-requests must be between 1 and 512"},
+		{name: "flag max tokens in flight too low", args: []string{"cllm", "--max-tokens-in-flight", "0"}, wantErr: "max-tokens-in-flight must be between 1 and 2000000"},
+		{name: "flag max tokens in flight too high", args: []string{"cllm", "--max-tokens-in-flight", "2000001"}, wantErr: "max-tokens-in-flight must be between 1 and 2000000"},
 		{name: "flag max waiting requests negative", args: []string{"cllm", "--max-waiting-requests", "-1"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
 		{name: "flag max waiting requests too high", args: []string{"cllm", "--max-waiting-requests", "1025"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
-		{name: "flag max waiting requests too large for concurrent", args: []string{"cllm", "--max-concurrent-requests", "64", "--max-waiting-requests", "129"}, wantErr: "max-waiting-requests must be ≤ 128"},
 		{name: "flag max degradation too high", args: []string{"cllm", "--max-degradation", "96"}, wantErr: "max-degradation must be between 0 and 95"},
 		{name: "invalid env temperature", args: []string{"cllm"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
 		{name: "flag max tokens out of range", args: []string{"cllm", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
@@ -1573,7 +1573,7 @@ func TestChatCompletionsRejectedOverCapacityEmitsLifecycleEvent(t *testing.T) {
 
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(32, 1, 0, 0)
-	release, _, ok := handler.acquireRequestSlot(context.Background(), "/v1/chat/completions")
+	release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/v1/chat/completions")
 	if !ok {
 		t.Fatal("failed to acquire baseline slot")
 	}

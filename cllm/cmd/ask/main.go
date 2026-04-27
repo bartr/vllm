@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"cllm/internal/buildinfo"
 )
 
 // options collects every flag and resolved environment value that drives a
@@ -31,7 +33,7 @@ type options struct {
 	rampDuration time.Duration
 	duration     time.Duration // 0 = no time limit
 	count        int           // 0 = no count limit
-	loop         int           // 0 = no loop limit (file mode only)
+	loop         bool          // cycle prompt list forever (file mode)
 	random       bool
 
 	// Endpoint.
@@ -73,6 +75,11 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if hasVersionFlag(args) {
+		_, _ = fmt.Fprintf(stdout, "ask %s\n", buildinfo.Version)
+		return nil
+	}
+
 	opts, err := parseFlags(args, stderr)
 	if err != nil {
 		return err
@@ -110,6 +117,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 func parseFlags(args []string, stderr io.Writer) (options, error) {
 	opts := defaultOptions()
 
+	// Pre-scan: --files takes one-or-more non-flag tokens until the next
+	// `-`-prefixed argument or end of args. Splice them out before
+	// handing the remainder to the standard flag package, which only
+	// supports single-value flags.
+	args, files := extractFilesArg(args)
+	opts.files = files
+
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -123,8 +137,8 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	var durationSpec string
 	fs.StringVar(&durationSpec, "duration", "", "stop bench after duration (e.g. 30s, 5m, 1h)")
 	fs.IntVar(&opts.count, "count", 0, "stop bench after N completed requests")
-	fs.IntVar(&opts.loop, "loop", 0, "loop the prompt list N times (requires --file)")
-	fs.BoolVar(&opts.random, "random", false, "pick a random prompt per request (requires --file)")
+	fs.BoolVar(&opts.loop, "loop", false, "cycle the prompt list forever (requires --files; use --count/--duration to bound)")
+	fs.BoolVar(&opts.random, "random", false, "pick a random prompt per request (requires --files)")
 
 	// Endpoint.
 	fs.StringVar(&opts.url, "url", opts.url, "base URL of the chat endpoint")
@@ -144,10 +158,6 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	// Prompt sourcing.
 	fs.StringVar(&opts.promptText, "prompt", opts.promptText, "user prompt text (alternative to positional args)")
 	fs.StringVar(&opts.promptFile, "prompt-file", opts.promptFile, "read user prompt from a text file")
-	fs.Func("file", "YAML file of prompts (bench mode only; repeatable)", func(v string) error {
-		opts.files = append(opts.files, v)
-		return nil
-	})
 
 	// Output.
 	fs.BoolVar(&opts.quiet, "quiet", false, "suppress streamed content (single mode shows only the trailer)")
@@ -196,6 +206,15 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		return options{}, err
 	}
 	return opts, nil
+}
+
+func hasVersionFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--version" {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultOptions() options {
@@ -272,7 +291,7 @@ func validateOptions(opts options) error {
 	}
 	if opts.bench == 0 {
 		// Single-shot: bench-only flags should not be set.
-		if opts.duration > 0 || opts.count > 0 || opts.loop > 0 ||
+		if opts.duration > 0 || opts.count > 0 || opts.loop ||
 			opts.random || opts.warmup || len(opts.files) > 0 ||
 			opts.rampEnd > 0 {
 			return errors.New("bench-only flags require --bench N")
@@ -284,11 +303,11 @@ func validateOptions(opts options) error {
 			return fmt.Errorf("--ramp end (%d) cannot exceed --bench (%d)", opts.rampEnd, opts.bench)
 		}
 	}
-	if opts.loop > 0 && len(opts.files) == 0 {
-		return errors.New("--loop requires --file")
+	if opts.loop && len(opts.files) == 0 {
+		return errors.New("--loop requires --files")
 	}
 	if opts.random && len(opts.files) == 0 {
-		return errors.New("--random requires --file")
+		return errors.New("--random requires --files")
 	}
 	if opts.maxTokens < 1 {
 		return errors.New("--max-tokens must be >= 1")
@@ -311,9 +330,10 @@ Single-shot:
 Bench:
   ask --bench 20 --duration 30s --prompt 'explain azure'
   ask --bench 50 --ramp 1:50 --ramp-duration 30s --duration 2m --prompt 'hi'
-  ask --bench 8 --file prompts.yaml          # process each prompt once, then exit
-  ask --bench 8 --file prompts.yaml --loop 5 # process the list 5 times
-  ask --bench 8 --file prompts.yaml --random --duration 1m
+  ask --bench 8 --files prompts.yaml             # process each prompt once, then exit
+  ask --bench 8 --files prompts.yaml --loop      # cycle forever (Ctrl-C to stop)
+  ask --bench 8 --files prompts.yaml --count 1000           # 1000 reqs cycling list
+  ask --bench 8 --files a.yaml b.yaml c.yaml --random --duration 1m
 
 YAML prompt file format:
   - prompt: "Explain Azure"
@@ -326,7 +346,9 @@ Mode:
 Stop conditions (bench, first-to-fire wins; Ctrl-C always works):
   --duration DUR           Stop after wall-clock duration (e.g. 30s, 5m, 1h)
   --count N                Stop after N completed requests
-  --loop N                 Iterate --file prompt list N times (requires --file)
+  --loop                   Cycle the --files prompt list forever (use --count
+                           or --duration to bound). Without --loop, --count or
+                           --duration also cycle the list automatically.
 
 Concurrency shape (bench):
   --ramp START:END         Linear ramp from START to END concurrent workers
@@ -337,8 +359,11 @@ Prompt sourcing:
   PROMPT...                Positional args become the user prompt
   --prompt TEXT            Alternative to positional args
   --prompt-file PATH       Read prompt from text file
-  --file PATH              YAML file of prompts (bench-only; repeatable)
-  --random                 Pick a random prompt per request (requires --file)
+  --files PATH...          One or more YAML prompt files (bench-only).
+                           Files are concatenated in order; --files may be
+                           repeated, and each occurrence accepts multiple
+                           paths until the next flag.
+  --random                 Pick a random prompt per request (requires --files)
 
 Request shape:
   --url URL                Endpoint base URL (default $CLLM_URL or http://localhost:8088)
@@ -357,8 +382,69 @@ Output:
   --debug                  Print SSE lines to stderr while streaming
   --report / --no-report   Final summary in bench mode (default on)
   -h, --help               Show this help
+  --version                Print version and exit
 
 Environment (lower precedence than flags):
   CLLM_URL, CLLM_TOKEN, CLLM_MODEL, CLLM_SYSTEM_PROMPT,
   CLLM_MAX_TOKENS, CLLM_TEMPERATURE, CLLM_DSL
 `
+
+// extractFilesArg pulls a `--files`/`-files`/`--files=...` flag out of
+// args, gathering one-or-more values that follow it (until the next
+// `-`-prefixed token or end of args). Returns the remaining args plus
+// the collected file list. Multiple `--files` occurrences accumulate.
+//
+// Recognized forms:
+//
+//	--files a.yaml b.yaml c.yaml
+//	-files a.yaml
+//	--files=a.yaml
+//	--files=a.yaml b.yaml          (the =value plus following bare args)
+func extractFilesArg(args []string) ([]string, []string) {
+	var rest []string
+	var files []string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		// Stop scanning past `--`: pass it and everything after through.
+		if a == "--" {
+			rest = append(rest, args[i:]...)
+			break
+		}
+		name, value, hasValue := splitFlagToken(a)
+		if name != "files" {
+			rest = append(rest, a)
+			i++
+			continue
+		}
+		i++
+		if hasValue {
+			if value != "" {
+				files = append(files, value)
+			}
+		}
+		// Greedily absorb following non-flag tokens.
+		for i < len(args) {
+			next := args[i]
+			if next == "--" || strings.HasPrefix(next, "-") {
+				break
+			}
+			files = append(files, next)
+			i++
+		}
+	}
+	return rest, files
+}
+
+// splitFlagToken parses "-name", "--name", "--name=value" forms.
+// Returns name="" when the token isn't a recognized flag form.
+func splitFlagToken(s string) (name, value string, hasValue bool) {
+	if !strings.HasPrefix(s, "-") || s == "-" || s == "--" {
+		return "", "", false
+	}
+	t := strings.TrimLeft(s, "-")
+	if eq := strings.IndexByte(t, '='); eq >= 0 {
+		return t[:eq], t[eq+1:], true
+	}
+	return t, "", false
+}

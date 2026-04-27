@@ -349,6 +349,66 @@ func TestParseDSLNoCacheStripsFromPrompt(t *testing.T) {
 	}
 }
 
+// TestParseDSLReCacheSetsFlag verifies re-cache produces a distinct
+// override from no-cache: it does NOT set noCache, but DOES set reCache.
+func TestParseDSLReCacheSetsFlag(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: "hello :dsl re-cache"}}
+	out, ov := parseDSL(in, func() float64 { return 0 })
+	if out[0].Content != "hello" {
+		t.Fatalf("content = %q, want %q", out[0].Content, "hello")
+	}
+	if ov.noCache {
+		t.Fatalf("noCache should be false for re-cache")
+	}
+	if !ov.reCache {
+		t.Fatalf("reCache should be true")
+	}
+	if !contains(ov.directives, "re-cache") {
+		t.Fatalf("directives missing re-cache: %v", ov.directives)
+	}
+}
+
+// TestParseDSLCacheClassFirstWins verifies no-cache and re-cache share a
+// class so a second cache directive is ignored.
+func TestParseDSLCacheClassFirstWins(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: ":dsl no-cache re-cache"}}
+	_, ov := parseDSL(in, func() float64 { return 0 })
+	if !ov.noCache || ov.reCache {
+		t.Fatalf("expected noCache only; got noCache=%v reCache=%v", ov.noCache, ov.reCache)
+	}
+}
+
+// TestParseDSLPrefixedTerminatesAtNewline reproduces a regression: when
+// the ask CLI prepended `:dsl ...\n<prompt>` (the bench --dsl path), the
+// splitter consumed the prompt body as DSL tokens, leaving an empty
+// user message that vLLM responded to with ~54 generic tokens.
+func TestParseDSLPrefixedTerminatesAtNewline(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: ":dsl no-cache max-tokens=512\nExplain Azure"}}
+	out, ov := parseDSL(in, func() float64 { return 0 })
+	if out[0].Content != "Explain Azure" {
+		t.Fatalf("content = %q, want %q", out[0].Content, "Explain Azure")
+	}
+	if !ov.noCache {
+		t.Fatalf("noCache = false, want true")
+	}
+	if ov.maxTokensOverride != 512 {
+		t.Fatalf("maxTokensOverride = %d, want 512", ov.maxTokensOverride)
+	}
+}
+
+// TestParseDSLPrefixedNoBody covers the degenerate case of a `:dsl …`
+// line with no following prompt text.
+func TestParseDSLPrefixedNoBody(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: ":dsl no-cache"}}
+	out, ov := parseDSL(in, func() float64 { return 0 })
+	if out[0].Content != "" {
+		t.Fatalf("content = %q, want empty", out[0].Content)
+	}
+	if !ov.noCache {
+		t.Fatalf("noCache = false, want true")
+	}
+}
+
 func TestParseDSLProfileExpandsBundle(t *testing.T) {
 	profiles := map[string][]string{"interactive": {"no-stall", "no-jitter"}}
 	in := []chatCompletionMessage{{Role: "user", Content: "hi :dsl profile=interactive"}}

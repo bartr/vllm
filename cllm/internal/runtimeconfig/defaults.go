@@ -12,7 +12,7 @@ const (
 	DefaultMaxTokens             = 1024
 	DefaultTemperature           = 0.2
 	DefaultMaxTokensPerSecond    = 32
-	DefaultMaxConcurrentRequests = 512
+	DefaultMaxTokensInFlight     = 200000
 	DefaultMaxWaitingRequests    = 1024
 	DefaultMaxDegradation        = 10
 	DefaultPrefillRateMultiplier = 0.0
@@ -30,8 +30,8 @@ const (
 	MaxMaxTokens                 = 4000
 	MinMaxTokensPerSecond        = 0
 	MaxMaxTokensPerSecond        = 1000
-	MinMaxConcurrentRequests     = 1
-	MaxMaxConcurrentRequests     = 512
+	MinMaxTokensInFlight         = 1
+	MaxMaxTokensInFlight         = 2000000
 	MinMaxWaitingRequests        = 0
 	MaxMaxWaitingRequests        = 1024
 	MinMaxDegradation            = 0
