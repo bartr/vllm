@@ -183,3 +183,65 @@ nodes:
 		t.Fatalf("expected fallback capacity, got %+v", nodes[0].Capacity)
 	}
 }
+
+// TestBuildKVCompletionFactorInheritance confirms that
+// kv_completion_factor inherits from class when the node leaves it
+// unset, the per-node override wins when both are present, and that
+// nodes with KV modeling enabled get a non-nil KVEstimator.
+func TestBuildKVCompletionFactorInheritance(t *testing.T) {
+	yaml := `
+nodes:
+  inherits-class:
+    class: H100
+    max_tokens_in_flight: 1024
+  overrides-class:
+    class: H100
+    max_tokens_in_flight: 1024
+    kv_completion_factor: 0.25
+  no-kv:
+    class: A10
+    max_tokens_in_flight: 1024
+
+classes:
+  H100:
+    max_kv_tokens: 4096
+    kv_completion_factor: 0.5
+  A10:
+    max_kv_tokens: 0
+`
+	path := writeTempYAML(t, yaml)
+	t.Setenv("CLLM_NODES_FILE", path)
+	spec, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	fallback := Capacity{MaxTokensInFlight: 4096, MaxTokensPerSecond: 50, MaxWaitingRequests: 50}
+	nodes := spec.Build(fallback)
+	if len(nodes) != 3 {
+		t.Fatalf("got %d nodes, want 3", len(nodes))
+	}
+
+	byID := map[string]*Node{}
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+
+	if got := byID["inherits-class"].Capacity.KVCompletionFactor; got != 0.5 {
+		t.Errorf("inherits-class factor = %v, want 0.5 (class default)", got)
+	}
+	if byID["inherits-class"].KVEstimator == nil {
+		t.Errorf("inherits-class missing KVEstimator (KV is enabled)")
+	}
+	if got := byID["overrides-class"].Capacity.KVCompletionFactor; got != 0.25 {
+		t.Errorf("overrides-class factor = %v, want 0.25 (node override)", got)
+	}
+	if byID["overrides-class"].KVEstimator == nil {
+		t.Errorf("overrides-class missing KVEstimator")
+	}
+	if got := byID["no-kv"].Capacity.KVCompletionFactor; got != 0 {
+		t.Errorf("no-kv factor = %v, want 0 (KV disabled, no inheritance)", got)
+	}
+	if byID["no-kv"].KVEstimator != nil {
+		t.Errorf("no-kv has KVEstimator but KV modeling is disabled")
+	}
+}

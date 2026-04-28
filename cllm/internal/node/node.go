@@ -15,6 +15,15 @@ type Capacity struct {
 	// into f(load). 0 falls back to 1.0 (KV pressure dominates equally
 	// with compute pressure once both pass the 10% deadband).
 	KVWeight float64
+
+	// KVCompletionFactor scales the KV estimator's p95 completion
+	// prediction when computing per-request KVCost (Phase 4 of
+	// docs/design-memory-pressure.md). A factor < 1.0 models
+	// amortization (prefix cache, mid-stream KV release) on hardware
+	// where peak KV residency is below prompt+completion. 0 falls
+	// back to 1.0; values are clamped to (0, 4.0]. Only consulted
+	// when the node has KV modeling enabled and KVEstimator is warm.
+	KVCompletionFactor float64
 }
 
 // Degradation holds the per-node f(load) curve parameters.
@@ -67,6 +76,16 @@ type Node struct {
 
 	Budget    *TokenBudget
 	Estimator *CompletionEstimator
+
+	// KVEstimator is the per-node KV-residency p95 estimator (Phase 4
+	// of docs/design-memory-pressure.md). nil when MaxKVTokens == 0.
+	// Observes actual completion-token counts on a separate sample
+	// stream from Estimator so KV cost can decouple from compute cost
+	// (e.g., when the operator sets KVCompletionFactor < 1 to model
+	// prefix-cache amortization, or when future per-node calibration
+	// data lands). When nil OR cold, KVCost falls back to
+	// PromptTokens + EstimatedTokens — byte-for-byte today's behavior.
+	KVEstimator *CompletionEstimator
 
 	// KV is the per-node KV-cache occupancy budget. nil when the node
 	// has Capacity.MaxKVTokens == 0 (KV modeling disabled). Admission

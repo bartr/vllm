@@ -1,7 +1,7 @@
 # Smoke-test prompt list for cllm.
 #
 # Run sequentially against a deployed cllm with `ask --files smoke-test.yaml`,
-# or one-by-one with `ASK_URL=http://... ./ask.sh` style calls. Each prompt
+# or one-by-one with `ASK_URL=http://... ask "<prompt>"` calls. Each prompt
 # exercises a distinct admission, DSL, or routing path. Comments describe
 # the expected outcome on a 2-node fleet where `kv-node` has
 # `max_kv_tokens: 1024` and `default` has KV disabled (see
@@ -147,3 +147,17 @@
 # scheduler intervention.
 - prompt: "priority=low via DSL"
   dsl: "node=default priority=low no-cache"
+
+# ---- 20. KV estimator decoupling (Phase 4) -----------------------------
+# Expect: 200 on kv-node. Long prompt + small max_tokens drives the
+# per-node KV estimator on a *separate* sample stream from the cost
+# estimator. After warm-up (50 such requests), the
+# `cllm_node_kv_estimator_p95{node="kv-node"}` gauge appears and tracks
+# the observed completion-token p95; KVCost on subsequent requests is
+# refined from this value rather than mirroring TotalCost. Useful for
+# the calibration loop: aim a long-prompt benchmark at vLLM, watch
+# `gpu_cache_usage_perc` and `cllm_node_kv_estimator_p95` converge, then
+# tune `kv_completion_factor` in classes.yaml until the synthetic node
+# tracks the real one.
+- prompt: "Summarize the following short paragraph in one sentence: cLLM is a lightweight admission and routing layer in front of an OpenAI-compatible LLM endpoint."
+  dsl: "node=kv-node max-tokens=16 no-cache"

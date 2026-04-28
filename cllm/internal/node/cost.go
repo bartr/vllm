@@ -16,11 +16,12 @@ type RequestCost struct {
 	EstimatedTokens int // the min(max_tokens, p95) component
 	TotalCost       int // PromptTokens + EstimatedTokens
 
-	// KVCost is the KV-cache token charge for this request. In v1 it
-	// mirrors TotalCost (§4.1 of docs/design-memory-pressure.md); a
-	// future per-node KV estimator or a :dsl kv-cost= directive can
-	// override it without changing the call sites that construct
-	// RequestCost via EstimateCost.
+	// KVCost is the KV-cache token charge for this request. Defaults
+	// to TotalCost; the Phase 4 path (EstimateCostWithKV) replaces
+	// this with a per-node KV-estimator-driven prediction when the
+	// routed node has KV modeling enabled and its KV estimator is
+	// warm. Override paths: `:dsl kv-cost=N` sets it directly,
+	// `:dsl no-kv` sets it to -1 (sentinel: skip the KV gate).
 	KVCost int
 
 	// Priority is the admission-queue priority for this request
@@ -39,6 +40,20 @@ type RequestCost struct {
 // maxTokens must already be normalised to a positive value by the caller;
 // promptTokens must already include any system-prompt accounting.
 func EstimateCost(promptTokens, maxTokens int, estimator *CompletionEstimator) RequestCost {
+	return EstimateCostWithKV(promptTokens, maxTokens, estimator, nil, 0)
+}
+
+// EstimateCostWithKV is the Phase 4 form of EstimateCost: it accepts an
+// optional per-node KV estimator and a completion-factor multiplier so
+// KVCost can decouple from TotalCost. When kvEstimator is nil OR cold,
+// KVCost falls back to PromptTokens + EstimatedTokens — byte-for-byte
+// today's behavior.
+//
+// kvFactor scales the KV estimator's p95 completion prediction; 0 falls
+// back to 1.0 and values are clamped to (0, 4.0]. The factor models
+// amortization (e.g., prefix-cache hits) on hardware where peak KV
+// residency is below prompt+completion.
+func EstimateCostWithKV(promptTokens, maxTokens int, estimator, kvEstimator *CompletionEstimator, kvFactor float64) RequestCost {
 	if maxTokens < 1 {
 		maxTokens = 1
 	}
@@ -48,10 +63,36 @@ func EstimateCost(promptTokens, maxTokens int, estimator *CompletionEstimator) R
 			estimate = p95
 		}
 	}
+	totalCost := promptTokens + estimate
+
+	kvCost := totalCost
+	if kvEstimator != nil {
+		if kvP95, ok := kvEstimator.P95(); ok {
+			factor := kvFactor
+			if factor <= 0 {
+				factor = 1.0
+			}
+			if factor > 4.0 {
+				factor = 4.0
+			}
+			scaled := int(float64(kvP95) * factor)
+			if scaled < 0 {
+				scaled = 0
+			}
+			if scaled > maxTokens {
+				scaled = maxTokens
+			}
+			kvCost = promptTokens + scaled
+			if kvCost < promptTokens {
+				kvCost = promptTokens
+			}
+		}
+	}
+
 	return RequestCost{
 		PromptTokens:    promptTokens,
 		EstimatedTokens: estimate,
-		TotalCost:       promptTokens + estimate,
-		KVCost:          promptTokens + estimate,
+		TotalCost:       totalCost,
+		KVCost:          kvCost,
 	}
 }

@@ -1,7 +1,6 @@
 // Command ask is a single CLI for talking to an OpenAI-compatible chat
 // completions endpoint, either as a one-shot interactive request or as a
-// concurrent benchmark. It replaces the previous bash scripts ask.sh and
-// benchmark.sh.
+// concurrent benchmark.
 //
 // Usage:
 //
@@ -272,9 +271,8 @@ func parseRampSpec(s string) (int, int, error) {
 	return start, end, nil
 }
 
-// parseDurationSpec accepts both Go-native durations (10s, 1m30s) and the
-// shorthand the old benchmark.sh used (10s, 5m, 1h, or a bare integer
-// number of seconds).
+// parseDurationSpec accepts both Go-native durations (10s, 1m30s) and a
+// simple shorthand (10s, 5m, 1h, or a bare integer number of seconds).
 func parseDurationSpec(s string) (time.Duration, error) {
 	if d, err := time.ParseDuration(s); err == nil {
 		return d, nil

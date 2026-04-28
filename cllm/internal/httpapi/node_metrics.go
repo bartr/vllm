@@ -47,6 +47,11 @@ var (
 		"Per-node combined load max(cost_load, kv_load * kv_weight) feeding f(load). Emitted only when the node has KV modeling enabled.",
 		[]string{"node", "class"}, nil,
 	)
+	nodeKVEstimatorP95Desc = prometheus.NewDesc(
+		"cllm_node_kv_estimator_p95",
+		"Per-node KV estimator p95 of recent completion tokens (Phase 4 of design-memory-pressure.md). Emitted only when the node has KV modeling enabled and the estimator has reached its warm-up sample count; otherwise the series is omitted.",
+		[]string{"node", "class"}, nil,
+	)
 )
 
 func (c nodeFleetCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -56,6 +61,7 @@ func (c nodeFleetCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- nodeKVTokensInFlightDesc
 	ch <- nodeMaxKVTokensDesc
 	ch <- nodeCombinedLoadDesc
+	ch <- nodeKVEstimatorP95Desc
 }
 
 func (c nodeFleetCollector) Collect(ch chan<- prometheus.Metric) {
@@ -88,6 +94,15 @@ func (c nodeFleetCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(nodeKVTokensInFlightDesc, prometheus.GaugeValue, float64(kvInFlight), n.ID, n.Class)
 			ch <- prometheus.MustNewConstMetric(nodeMaxKVTokensDesc, prometheus.GaugeValue, float64(kvCap), n.ID, n.Class)
 			ch <- prometheus.MustNewConstMetric(nodeCombinedLoadDesc, prometheus.GaugeValue, combinedLoadOf(n), n.ID, n.Class)
+			// Phase 4: emit kv_estimator_p95 only when the
+			// estimator has crossed its warm-up threshold so cold
+			// nodes don't stamp 0 into a gauge that scrapers
+			// would otherwise plot as a real reading.
+			if n.KVEstimator != nil {
+				if p95, ok := n.KVEstimator.P95(); ok {
+					ch <- prometheus.MustNewConstMetric(nodeKVEstimatorP95Desc, prometheus.GaugeValue, float64(p95), n.ID, n.Class)
+				}
+			}
 		}
 	}
 }

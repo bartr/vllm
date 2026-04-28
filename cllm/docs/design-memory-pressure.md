@@ -1,6 +1,6 @@
 # KV cache and memory pressure modeling
 
-Status: **draft for review**
+Status: **Phases 1+2+3+4 shipped (cllm 0.10.x); Phase 5 owned by §14 item 9**
 Owners: bartr
 Future Work item: §14, item 1 in [system-design.md](../../system-design.md)
 Companion docs: [design-cost-admission.md](design-cost-admission.md), [design-multi-node.md](design-multi-node.md)
@@ -106,6 +106,26 @@ workloads they track each other almost perfectly. Splitting them adds
 configuration surface without a measurable benefit until KV-aware decoding
 (speculative, prefix-cache hits) is modeled — both are explicit non-goals
 above.
+
+### 4.1bis KV-aware estimator (Phase 4, cllm 0.10.x)
+
+Phase 4 separates the two estimator streams without changing the v1
+contract. Each KV-modeled node gains a `KVEstimator` that observes
+completion-token counts on the same successful-downstream signal as the
+compute estimator but feeds an independent p95. The handler refines
+`cost.KVCost` *after* routing — the router still uses the legacy compute
+cost — using
+
+```text
+KVCost = PromptTokens + clamp(int(kv_p95 * kv_completion_factor), 0, max_tokens)
+```
+
+`kv_completion_factor` is a per-class / per-node knob (default 1.0; clamped
+to (0, 4.0]) and the operator's calibration lever for hardware where peak
+KV residency runs below prompt+completion. A factor < 1.0 amortizes the
+KV charge for prefix-cache or short-residency decode without changing
+the cost gate. Cold or absent estimators fall back to `KVCost = TotalCost`,
+so the backward-compat contract from §10 is preserved byte-for-byte.
 
 ### 4.2 KV pressure curve
 
@@ -433,6 +453,44 @@ Three phases, each shippable on its own.
 - Document calibration loop in §11.2 of `system-design.md` and update
   `talking-points.md` honest-limits.
 - **Deliverable:** mixed-context benchmarks land in one prompt set.
+
+### Phase 4 — KV-aware completion estimator (cllm 0.10.x, shipped)
+Closes the §4.1 / §12 Q2 honest-gap that `KVCost = TotalCost` ignores
+prefix-cache amortization, mid-stream KV release, and any future per-node
+KV calibration.
+
+- Each KV-modeled node carries an independent `KVEstimator
+  *CompletionEstimator` (constructed by the loader iff `MaxKVTokens > 0`).
+  Same window/warm-up shape as the compute estimator so the two converge
+  in lock-step when no factor is supplied.
+- New `EstimateCostWithKV(prompt, max, costEst, kvEst, kvFactor)` derives
+  `KVCost = PromptTokens + clamp(int(kvP95 × factor), 0, maxTokens)` once
+  the KV estimator is warm; cold or nil estimator falls back to
+  `TotalCost` byte-for-byte.
+- New per-class / per-node config field `kv_completion_factor` (default
+  1.0; clamped to (0, 4.0]) is the operator's calibration knob.
+  Setting `< 1.0` models hardware where peak KV residency runs below
+  prompt+completion (prefix cache, short-residency decode).
+- The handler refines `cost.KVCost` *after* routing using the routed
+  node's `KVEstimator`, but only when neither `:dsl kv-cost=` nor
+  `:dsl no-kv` already pinned it. Pre-routing cost estimation is
+  unchanged so the router still uses the legacy compute cost as input.
+- The KV estimator is fed on the same successful-downstream signal as
+  the compute estimator (`emitCompleted` in `handler.go`).
+- New gauge `cllm_node_kv_estimator_p95{node, class}` is emitted only
+  when the estimator is warm; cold nodes stay quiet so dashboards do
+  not plot 0 as a real reading.
+- **Deliverable:** the calibration loop becomes "aim a long-prompt
+  benchmark at vLLM, watch `gpu_cache_usage_perc` and
+  `cllm_node_kv_estimator_p95` converge, then tune `kv_completion_factor`
+  until the synthetic node tracks the real one."
+
+### Phase 5 — Preemption-on-pressure (out of scope for item 1)
+Cooperatively cancel-and-requeue an in-flight long-context request when
+KV pressure exceeds a hard ceiling. **Owned by §14 item 9 (streaming
+admission preemption), not item 1.** Merging the two stories blurs the
+design boundary; item 9 is the canonical home and Phase 4 of this doc
+is the close-out for item 1.
 
 ---
 

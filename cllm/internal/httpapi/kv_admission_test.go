@@ -24,6 +24,10 @@ func makeKVTestNode(id, class string, computeCap, kvCap int64) *node.Node {
 		},
 	}
 	n.KV = node.NewKVBudget(kvCap)
+	// Phase 4: KV-modeled nodes carry an independent KV estimator
+	// stream; matching the loader so handler-level tests see the
+	// same shape.
+	n.KVEstimator = node.NewCompletionEstimator(256, 50)
 	return n
 }
 

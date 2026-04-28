@@ -318,7 +318,7 @@ For `POST /v1/chat/completions`, structured lifecycle events are emitted as logs
 make build
 ```
 
-This builds the local container image `cllm:0.9.0`.
+This builds the local container image `cllm:0.10.0`.
 
 To build and import that image into the local k3s container runtime:
 
@@ -329,8 +329,8 @@ make deploy
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.9.0 .
-docker save cllm:0.9.0 | sudo k3s ctr images import -
+docker build -t cllm:0.10.0 .
+docker save cllm:0.10.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -342,8 +342,8 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.9.0 .
-docker run --rm -p 8080:8080 cllm:0.9.0
+docker build -t cllm:0.10.0 .
+docker run --rm -p 8080:8080 cllm:0.10.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
@@ -356,7 +356,7 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.9.0`
+- deploy `cllm:0.10.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
 - mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path

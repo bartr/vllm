@@ -1567,6 +1567,45 @@
       "title": "Phase · Reclaimed Token-Seconds By Class",
       "description": "Headline efficiency metric for phase-aware allocation: (initial_tps - sustained_tps) × tokens_in_phase_b accumulated across completed streams. Positive area means interactive traffic gave throughput back to the fleet.",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "tokens",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 104},
+      "id": 48,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "cllm_node_kv_estimator_p95",
+          "legendFormat": "{{node}} · kv_p95",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KV · Estimator p95 By Node",
+      "description": "Per-node KV estimator's rolling p95 of recent completion tokens (Phase 4 of design-memory-pressure.md). Decoupled from the cost estimator so KVCost can amortize via kv_completion_factor while TotalCost stays unchanged. The series is omitted on cold nodes (fewer than the warm-up sample count) and on nodes with KV modeling disabled.",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",
@@ -1588,6 +1627,6 @@
   "timezone": "browser",
   "title": "cLLM Overview",
   "uid": "cllm-overview",
-  "version": 5,
+  "version": 6,
   "weekStart": ""
 }

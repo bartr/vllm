@@ -117,8 +117,8 @@ func runSingle(opts options, prompt string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// printTrailer renders the human-readable summary line block that the old
-// ask.sh emitted, augmented with ttft and decode tok/s.
+// printTrailer renders the human-readable summary line block,
+// including ttft and decode tok/s.
 func printTrailer(w io.Writer, r Result) {
 	fmt.Fprintln(w, "------------------")
 	fmt.Fprintf(w, "elapsed_ms: %d\n", r.Duration().Milliseconds())

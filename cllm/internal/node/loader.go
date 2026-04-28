@@ -55,6 +55,13 @@ type NodeSpec struct {
 	MaxKVTokens int64    `yaml:"max_kv_tokens,omitempty"`
 	KVWeight    *float64 `yaml:"kv_weight,omitempty"`
 
+	// KVCompletionFactor scales the per-node KV estimator's p95
+	// completion prediction (Phase 4 of
+	// docs/design-memory-pressure.md). nil inherits from class;
+	// 0 falls back to 1.0. Only consulted on nodes with KV modeling
+	// enabled.
+	KVCompletionFactor *float64 `yaml:"kv_completion_factor,omitempty"`
+
 	// Per-node overrides for class realism knobs. A zero value means
 	// "inherit from class".
 	PrefillRateMultiplier *float64 `yaml:"prefill_rate_multiplier,omitempty"`
@@ -89,7 +96,11 @@ type ClassSpec struct {
 	// leave it unset. (\u00a74.4 of docs/design-memory-pressure.md.)
 	MaxKVTokens int64   `yaml:"max_kv_tokens"`
 	KVWeight    float64 `yaml:"kv_weight"`
-}
+	// KVCompletionFactor is the class-level default for the per-node
+	// KV estimator multiplier (Phase 4 of
+	// docs/design-memory-pressure.md). 0 falls back to 1.0 at use
+	// time; only consulted on nodes with KV modeling enabled.
+	KVCompletionFactor float64 `yaml:"kv_completion_factor"`}
 
 // RouterSpec is the routing policy section of nodes.yaml. Phase 2.2 will
 // consume this; Phase 2.1 only persists it.
@@ -208,6 +219,7 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 			MaxWaitingRequests: pickInt(spec.MaxWaitingRequests, fallback.MaxWaitingRequests),
 			MaxKVTokens:        pickInt64(spec.MaxKVTokens, class.MaxKVTokens),
 			KVWeight:           derefFloat64(spec.KVWeight, class.KVWeight),
+			KVCompletionFactor: derefFloat64(spec.KVCompletionFactor, class.KVCompletionFactor),
 		}
 		// Only normalize KVWeight when KV modeling is enabled; leave
 		// it zero otherwise so a node with KV disabled has a Capacity
@@ -258,6 +270,13 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 		n.Budget.SetAgingStepMs(DefaultPriorityAgingStepMs)
 		if cap.MaxKVTokens > 0 {
 			n.KV = NewKVBudget(cap.MaxKVTokens)
+			// Phase 4: each KV-modeled node carries an independent
+			// p95 estimator stream so KVCost can decouple from
+			// TotalCost (per-node KVCompletionFactor amortization,
+			// future prefix-cache modeling). Same window/warm-up as
+			// the cost estimator so the two converge in lock-step
+			// when the operator hasn't supplied a factor.
+			n.KVEstimator = NewCompletionEstimator(256, 50)
 		}
 		out = append(out, n)
 	}

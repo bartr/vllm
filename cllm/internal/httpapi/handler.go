@@ -749,6 +749,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.logRouterDecisionIfMultiNode(ctx, routedNode, routedReason, replayDSL)
 	}
 
+	// Phase 4 (docs/design-memory-pressure.md §4.1bis): refine KVCost
+	// using the routed node's KV estimator, but only when the DSL did
+	// not already pin the value. The routed node's KVEstimator is nil
+	// when KV modeling is disabled on that node — in which case
+	// cost.KVCost stays at its TotalCost default and the rest of the
+	// admission path behaves byte-for-byte as today.
+	if !replayDSL.noKV && replayDSL.kvCostOverride == 0 && routedNode != nil && routedNode.KVEstimator != nil {
+		refineMax := requestPayload.MaxTokens
+		if refineMax < 1 {
+			refineMax = defaultMaxTokens
+		}
+		refined := node.EstimateCostWithKV(
+			cost.PromptTokens,
+			refineMax,
+			h.globalEstimator(),
+			routedNode.KVEstimator,
+			routedNode.Capacity.KVCompletionFactor,
+		)
+		cost.KVCost = refined.KVCost
+	}
+
 	// Stage 1: tenant rate limit (token bucket; non-blocking).
 	if !tenant.bucket.tryReserve(float64(cost.TotalCost)) {
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
@@ -859,6 +880,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.observeCompletionTokens(completionTokens)
 			if routedNode != nil && routedNode.Estimator != nil && routedNode != h.scheduler.node {
 				routedNode.Estimator.Observe(completionTokens)
+			}
+			// Phase 4: feed the per-node KV estimator on the same
+			// successful-downstream signal. Only nodes with KV
+			// modeling enabled have a non-nil KVEstimator, so this
+			// is a no-op on the legacy single-node default fleet.
+			if routedNode != nil && routedNode.KVEstimator != nil {
+				routedNode.KVEstimator.Observe(completionTokens)
 			}
 			if tenant != nil && tenant.estimator != nil {
 				tenant.estimator.Observe(completionTokens)
