@@ -932,7 +932,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cache != nil && !replayDSL.noCache && !replayDSL.reCache {
 		if cachedResponse, ok := h.cache.Get(cacheKey); ok {
 			h.metrics.observeCacheLookup(endpoint, "hit")
-			markCacheHit(w, true)
 			completionTokens := cachedResponseCompletionTokens(cachedResponse)
 			promptTokens := cachedResponsePromptTokens(cachedResponse)
 			if promptTokens <= 0 {
@@ -940,6 +939,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			cachedSource := "cache"
 			cachedMode := mode
+
+			// TTFT-budget gate (system-design §14, item 13 follow-on,
+			// 0.11.x). Predicted TTFT = simulated prefill (without
+			// jitter) + 1/first-token-tps. Cached-replay path only;
+			// no-cache / re-cache / cache-miss bypass. DSL override
+			// (`:dsl max-ttft-ms=N`) wins over class config; 0 disables.
+			effectiveMaxTTFTMs := class.config.MaxTTFTMs
+			if replayDSL.maxTTFTMsSet {
+				effectiveMaxTTFTMs = replayDSL.maxTTFTMsOverride
+			}
+			if effectiveMaxTTFTMs > 0 {
+				predictedMs := h.predictTTFTms(promptTokens, replayDSL)
+				if predictedMs > effectiveMaxTTFTMs {
+					tenant.bucket.refund(float64(cost.TotalCost))
+					h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
+					h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
+					h.metrics.observeAdmissionRejection(tenant.name, class.name, "class_ttft_budget")
+					h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "class_ttft_budget", "request rejected",
+						"status", http.StatusTooManyRequests,
+						"mode", mode,
+						"max_tokens", requestedMaxTokens,
+						"tenant", tenant.name,
+						"class", class.name,
+						"cost", cost.TotalCost,
+						"max_ttft_ms", effectiveMaxTTFTMs,
+						"predicted_ttft_ms", predictedMs,
+						"prompt_tokens", promptTokens,
+						"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
+					)
+					markCacheHit(w, false)
+					writePlainText(w, http.StatusTooManyRequests, "class ttft budget\n")
+					return
+				}
+			}
+			markCacheHit(w, true)
 
 			prefillDelay, prefillErr := h.simulatePrefillDelay(ctx, promptTokens, replayDSL)
 			if prefillDelay > 0 {
@@ -2792,6 +2826,113 @@ func (h *Handler) simulatePrefillDelay(ctx context.Context, promptTokens int, ov
 		return delay, err
 	}
 	return delay, nil
+}
+
+// predictTTFTms returns a stable, jitter-free admission-time estimate
+// of the time-to-first-token a cached-replay request would experience.
+// Used by the per-class `max_ttft_ms` admission gate (system-design
+// §14, item 13 follow-on, 0.11.x). Two components:
+//
+//	prefill_ms     — same shape as computePrefillDelay but without the
+//	                 random ±jitterPercent term, so successive calls
+//	                 with identical inputs return the same number.
+//	first_token_ms — ceil(1000 / first_token_tps), where first_token_tps
+//	                 is the rate the request will start at:
+//	                   * `:dsl tps=N` if set,
+//	                   * phase.InitialTPS if the resolved phase is
+//	                     active and InitialTokens > 0,
+//	                   * else h.maxTokensPerSecond.
+//	                 Degradation is applied via the same scheduler hook
+//	                 used by computePrefillDelay so the prediction
+//	                 tracks current node load.
+//
+// Queue-wait is intentionally NOT included; that axis is owned by
+// `class_queue_timeout` (Phase 14B). Returns total milliseconds.
+func (h *Handler) predictTTFTms(promptTokens int, overrides replayOverrides) int {
+	prefillMs := h.computePrefillDelayDeterministic(promptTokens, overrides)
+
+	h.configMu.RLock()
+	baseTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+
+	switch {
+	case overrides.noTPS:
+		// No pacing — first token emits as fast as the writer can
+		// flush. Use 0 ms for the first-token component.
+		return int(prefillMs / time.Millisecond)
+	case overrides.tpsOverride > 0:
+		baseTokensPerSecond = overrides.tpsOverride
+	case overrides.phase.active() && overrides.phase.InitialTPS > 0:
+		baseTokensPerSecond = overrides.phase.InitialTPS
+	}
+
+	if baseTokensPerSecond <= 0 {
+		// Pacing disabled at the handler level; same as no-tps.
+		return int(prefillMs / time.Millisecond)
+	}
+
+	effective := calibratedTokensPerSecond(baseTokensPerSecond)
+	if scheduler != nil {
+		effective = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
+	}
+	if effective <= 0 {
+		effective = 1
+	}
+	firstTokenMs := int(1000.0/effective + 0.999) // ceil
+	return int(prefillMs/time.Millisecond) + firstTokenMs
+}
+
+// computePrefillDelayDeterministic mirrors computePrefillDelay but
+// omits the random jitter draw, so repeated calls with the same inputs
+// return the same value. Used by predictTTFTms; the actual streaming
+// path continues to call computePrefillDelay (with jitter) so observed
+// TTFT still varies as configured.
+func (h *Handler) computePrefillDelayDeterministic(promptTokens int, overrides replayOverrides) time.Duration {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if overrides.noPrefill {
+		return 0
+	}
+
+	h.configMu.RLock()
+	rateMultiplier := h.prefillRateMultiplier
+	base := h.prefillBaseOverhead
+	maxDuration := h.prefillMaxDuration
+	baseTokensPerSecond := h.maxTokensPerSecond
+	maxDegradation := h.maxDegradation
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+
+	if overrides.tpsOverride > 0 {
+		baseTokensPerSecond = overrides.tpsOverride
+	}
+	if rateMultiplier <= 0 || baseTokensPerSecond <= 0 {
+		return 0
+	}
+
+	effectiveDecodeRate := calibratedTokensPerSecond(baseTokensPerSecond)
+	if scheduler != nil {
+		effectiveDecodeRate = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
+	}
+	prefillRate := effectiveDecodeRate * rateMultiplier
+	if prefillRate <= 0 {
+		return 0
+	}
+
+	delay := base + time.Duration(float64(promptTokens)/prefillRate*float64(time.Second))
+	if overrides.prefillDurationScale > 0 && overrides.prefillDurationScale != 1 {
+		delay = time.Duration(float64(delay) * overrides.prefillDurationScale)
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	if maxDuration > 0 && delay > maxDuration {
+		delay = maxDuration
+	}
+	return delay
 }
 
 // SetStreamRealism configures variability, jitter, and partial-stall behavior

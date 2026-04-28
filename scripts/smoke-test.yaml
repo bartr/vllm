@@ -161,3 +161,20 @@
 # tracks the real one.
 - prompt: "Summarize the following short paragraph in one sentence: cLLM is a lightweight admission and routing layer in front of an OpenAI-compatible LLM endpoint."
   dsl: "node=kv-node max-tokens=16 no-cache"
+
+# ---- 21. Class TTFT budget passes (Phase 13 follow-on, 0.11.x) --------
+# Expect: 200. Pinned to the default node (no kv estimator). DSL sets a
+# generous TTFT budget that the cached-replay path will not exceed, so
+# the prompt completes normally. Used to exercise the admission-time
+# `predictTTFTms` helper without tripping the gate.
+- prompt: "Explain Azure briefly."
+  dsl: "node=default max-ttft-ms=5000"
+
+# ---- 22. Class TTFT budget rejects ------------------------------------
+# Expect: 429 with reason=class_ttft_budget once a cache entry exists.
+# DSL forces a 1 ms cap and a `prefill=500` (50% prefill scale-up) so
+# the deterministic prediction blows past the budget. Tenant bucket is
+# refunded; the rejection-reason panel of `cllm-overview` should pick
+# up the new label value.
+- prompt: "Explain Azure briefly."
+  dsl: "node=default max-ttft-ms=1 prefill=500"

@@ -41,6 +41,14 @@
 #                0 inherits the handler base TPS for that phase.
 # sustained_tps  rate (tokens/sec) during the sustained phase.
 #                0 inherits the handler base TPS for that phase.
+# max_ttft_ms    per-class cap on simulated time-to-first-token, in
+#                milliseconds (system-design §14, item 13 follow-on,
+#                0.11.x). Enforced on the cached-replay path only:
+#                predicted TTFT = simulated prefill (jitter-free) +
+#                ceil(1000/first_token_tps); requests over the cap are
+#                rejected with reason `class_ttft_budget` and the
+#                tenant bucket is refunded. 0 disables. Per-request
+#                override: `:dsl max-ttft-ms=N` (0 disables, also).
 #
 # Validation: `initial_tokens > 0` requires at least one of
 # `initial_tps` / `sustained_tps` to be set explicitly; otherwise the
@@ -54,9 +62,13 @@ classes:
 
   # Example: snappy chat traffic. Short queue tolerance, high priority.
   # Two-phase pacing: 100 tokens at 32 tps, then 16 tps for the tail.
+  # Tight TTFT cap so cached replays that would simulate a slow first
+  # byte (heavy prefill, low TPS) reject at admission with
+  # `class_ttft_budget`.
   # interactive:
   #   priority: high
   #   max_queue_ms: 500
+  #   max_ttft_ms: 500
   #   initial_tokens: 100
   #   initial_tps: 32
   #   sustained_tps: 16
@@ -66,9 +78,11 @@ classes:
   # batch:
   #   priority: low
   #   max_queue_ms: 10000
+  #   max_ttft_ms: 10000
   #   sustained_tps: 32
 
   # Example: medium-priority offline evaluation runs.
   # eval:
   #   priority: medium
   #   max_queue_ms: 2000
+  #   max_ttft_ms: 2000

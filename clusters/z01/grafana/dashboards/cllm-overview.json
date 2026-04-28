@@ -1340,7 +1340,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (reason) (rate(cllm_tenant_rejections_total{reason=~\"kv_pressure|kv_oversize|over_capacity|class_queue_timeout\"}[5m]))",
+          "expr": "sum by (reason) (rate(cllm_tenant_rejections_total{reason=~\"kv_pressure|kv_oversize|over_capacity|class_queue_timeout|class_ttft_budget\"}[5m]))",
           "legendFormat": "{{reason}}",
           "range": true,
           "refId": "A"

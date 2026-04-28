@@ -36,6 +36,8 @@ type replayOverrides struct {
 	maxTokensOverride    int     // <=0 means use request value
 	kvCostOverride       int     // <=0 means use estimator value
 	maxQueueMsOverride   int     // <=0 means use class.MaxQueueMs (Phase 14B)
+	maxTTFTMsSet         bool    // true when `:dsl max-ttft-ms=N` was set (0 is meaningful: disable)
+	maxTTFTMsOverride    int     // active only when maxTTFTMsSet; 0 disables for this request
 	prefillDurationScale float64 // 1.0 means no change
 
 	// delayScaleFn returns a fresh per-segment multiplicative scale applied
@@ -131,6 +133,7 @@ var dslDirectiveKeys = map[string]string{
 	"max-tokens":     "max-tokens",
 	"kv-cost":        "kv-cost",
 	"max-queue-ms":   "max-queue-ms",
+	"max-ttft-ms":   "max-ttft-ms",
 	"initial-tokens": "phase-boundary",
 	"initial-tps":    "initial-tps",
 	"sustained-tps":  "sustained-tps",
@@ -597,6 +600,14 @@ func applyKeyedDirective(o *replayOverrides, key, val string, seen map[string]bo
 		}
 		seen[class] = true
 		o.maxQueueMsOverride = n
+	case "max-ttft-ms":
+		n := resolveDelta(lo, hi, draw)
+		if n < 0 {
+			return "", false
+		}
+		seen[class] = true
+		o.maxTTFTMsSet = true
+		o.maxTTFTMsOverride = n
 	case "initial-tokens":
 		n := resolveDelta(lo, hi, draw)
 		if n < 0 {

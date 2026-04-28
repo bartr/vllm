@@ -55,6 +55,14 @@ type ClassConfig struct {
 	// (phase B) portion of the stream. 0 inherits the handler base
 	// TPS for that phase.
 	SustainedTPS int
+	// MaxTTFTMs is the per-class cap on simulated time-to-first-token,
+	// in milliseconds (system-design §14, item 13 follow-on, 0.11.x).
+	// Enforced on the cached-replay path after routing and after the
+	// cache hit is confirmed; 0 disables. Predicted TTFT =
+	// computePrefillDelayDeterministic(prompt) + 1000/first_token_tps.
+	// Per-request override: `:dsl max-ttft-ms=N`. Rejection reason:
+	// `class_ttft_budget`.
+	MaxTTFTMs int
 }
 
 // classState bundles a resolved class with its configuration. The name

@@ -169,7 +169,7 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		}, []string{"tenant", "class"}),
 		tenantRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_tenant_rejections_total",
-			Help: "Total chat completion requests rejected at admission, by tenant, workload class, and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize, class_queue_timeout).",
+			Help: "Total chat completion requests rejected at admission, by tenant, workload class, and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize, class_queue_timeout, class_ttft_budget).",
 		}, []string{"tenant", "class", "reason"}),
 		nodeAdmissionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_node_admissions_total",

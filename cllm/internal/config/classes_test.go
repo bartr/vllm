@@ -46,11 +46,41 @@ classes:
 	}
 }
 
+// TestReadClassesFileAcceptsMaxTTFTMs ensures the per-class TTFT
+// budget field (system-design §14, item 13 follow-on) loads through
+// to the returned ClassSpec.
+func TestReadClassesFileAcceptsMaxTTFTMs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "classes.yaml")
+	body := `
+classes:
+  interactive:
+    priority: high
+    max_ttft_ms: 500
+  default:
+    priority: medium
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	out, err := readClassesFile(path, true)
+	if err != nil {
+		t.Fatalf("readClassesFile: %v", err)
+	}
+	if out["interactive"].MaxTTFTMs != 500 {
+		t.Fatalf("interactive MaxTTFTMs = %d; want 500", out["interactive"].MaxTTFTMs)
+	}
+	if out["default"].MaxTTFTMs != 0 {
+		t.Fatalf("default MaxTTFTMs = %d; want 0 (unset)", out["default"].MaxTTFTMs)
+	}
+}
+
 func TestReadClassesFileRejectsNegativePhaseFields(t *testing.T) {
 	cases := map[string]string{
 		"initial_tokens": "initial_tokens: -1",
 		"initial_tps":    "initial_tps: -1",
 		"sustained_tps":  "sustained_tps: -1",
+		"max_ttft_ms":    "max_ttft_ms: -1",
 	}
 	for label, line := range cases {
 		t.Run(label, func(t *testing.T) {

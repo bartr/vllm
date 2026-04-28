@@ -68,11 +68,18 @@ priority — a coarse all-or-nothing knob.
 
 ## 3.1 Non-goals (this iteration)
 
-- **No `max_ttft_ms` enforcement.** The system-design sketch lists
-  `max_ttft_ms` as a class field. The current code already enforces a TTFT
-  budget via `prefill_max_ms` and the simulated-prefill cap; reusing that
-  budget per-class is a small follow-on, but mixing it into Phase 13 conflates
-  prefill budgeting with stream pacing. Defer.
+- **`max_ttft_ms` enforcement — shipped in 0.11.x.** Originally
+  deferred from Phase 13 to keep prefill budgeting separate from
+  stream pacing. Now lives next to the existing per-class
+  `max_queue_ms` gate: each class may declare an optional
+  `max_ttft_ms`, the cached-replay path predicts TTFT at admission
+  (jitter-free `simulatePrefillDelay` + `ceil(1000 /
+  first_token_tps)`), and a request whose prediction exceeds the cap
+  is rejected with new reason `class_ttft_budget`. The tenant bucket
+  is refunded; per-request override is `:dsl max-ttft-ms=N` (0
+  disables for that request); `no-cache` / `re-cache` / cache-miss
+  bypass the gate by construction. Single-axis byte-for-byte
+  compatibility holds when `max_ttft_ms = 0` (the default).
 - **No global "reclaimed capacity" pool.** The reclaim is implicit:
   `sustained_tps < initial_tps` means the request consumes less effective TPS
   during phase B, leaving headroom under the global cost budget for other
@@ -385,10 +392,10 @@ mergeable and shippable as a 0.9.x increment; the natural cut points are
   draining cheap (interactive finishes phase A in tens of ms, then the queue
   head moves to the next request even though phase B continues in the
   background).
-* **`max_ttft_ms` enforcement** (deferred non-goal) lays naturally on top:
-  if first-byte simulated prefill plus `1 / initial_tps` would blow past the
-  class budget, reject at admission with new reason `class_ttft_budget`.
-  Reuses the prefill-cap machinery already in `simulatePrefillDelay`.
+* **`max_ttft_ms` enforcement — shipped in cllm 0.11.x** (see §3.1).
+  Sits alongside `max_queue_ms` and the existing rejection-reason
+  panel; predicted TTFT is admission-time only and reuses the
+  prefill-cap machinery already in `simulatePrefillDelay`.
 * **Class-aware capacity scaling** (extension of §6.6 capacity-scaling
   story): the same calibrated `tps=N` knob can declare per-class envelopes,
   giving multi-target benchmarks a way to model "this hardware delivers

@@ -91,6 +91,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 				InitialTokens: spec.InitialTokens,
 				InitialTPS:    spec.InitialTPS,
 				SustainedTPS:  spec.SustainedTPS,
+				MaxTTFTMs:     spec.MaxTTFTMs,
 			}
 		}
 		handler.SetClasses(converted)

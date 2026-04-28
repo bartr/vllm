@@ -35,6 +35,14 @@ type ClassSpec struct {
 	// (phase B) portion of the stream, after InitialTokens have been
 	// emitted. 0 inherits the handler base TPS for that phase.
 	SustainedTPS int `yaml:"sustained_tps" json:"sustained_tps"`
+	// MaxTTFTMs is the per-class cap on simulated time-to-first-token,
+	// in milliseconds, enforced on the cached-replay path only. 0
+	// disables the cap (legacy single-axis behavior). When the
+	// admission-time prediction (simulated prefill + 1/first-token-TPS)
+	// exceeds the cap, the request is rejected with reason
+	// `class_ttft_budget` and the tenant bucket is refunded.
+	// Per-request override: `:dsl max-ttft-ms=N` (0 disables).
+	MaxTTFTMs int `yaml:"max_ttft_ms" json:"max_ttft_ms"`
 }
 
 // loadClasses reads workload-class configurations from a YAML or JSON
@@ -115,6 +123,9 @@ func readClassesFile(path string, required bool) (map[string]ClassSpec, error) {
 		}
 		if spec.SustainedTPS < 0 {
 			return nil, fmt.Errorf("class %q in %s: sustained_tps must be >= 0", name, path)
+		}
+		if spec.MaxTTFTMs < 0 {
+			return nil, fmt.Errorf("class %q in %s: max_ttft_ms must be >= 0", name, path)
 		}
 		// Reject misconfigured envelopes: a non-zero phase boundary
 		// with both rates inheriting the handler base would emit
