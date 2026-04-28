@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cllm-nodes
+  namespace: cllm
+data:
+  nodes.yaml: |
+    # Two-node fleet for KV-pressure smoke testing.
+    # `kv-node` has a tiny KV ceiling so kv-cost= directives can
+    # provoke kv_pressure / kv_oversize rejections on demand.
+    # `default` keeps KV disabled so the same fleet exercises the
+    # backward-compat fall-through path.
+    nodes:
+      kv-node:
+        class: kv-test
+        max_tokens_per_second: 32
+        max_tokens_in_flight: 16384
+        max_waiting_requests: 100
+        max_kv_tokens: 1024
+        kv_weight: 1.0
+      default:
+        class: default
+        max_tokens_per_second: 32
+        max_tokens_in_flight: 16384
+        max_waiting_requests: 100
+    classes:
+      kv-test:
+        f_load_shape: piecewise_linear
+        max_degradation: 10
+        prefill_rate_multiplier: 4
+      default:
+        f_load_shape: piecewise_linear
+        max_degradation: 10
+        prefill_rate_multiplier: 4
+    router:
+      policy: least-loaded
+      fallback: any

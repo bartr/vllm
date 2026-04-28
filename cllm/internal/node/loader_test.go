@@ -1,0 +1,185 @@
+package node
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+const sampleNodesYAML = `
+nodes:
+  rtx-2000-0:
+    class: rtx-2000
+    upstream: http://vllm:8000/v1
+    max_tokens_per_second: 30
+    max_tokens_in_flight: 8192
+    max_waiting_requests: 100
+  h100-0:
+    class: H100
+    max_tokens_per_second: 96
+    max_tokens_in_flight: 65536
+    max_waiting_requests: 200
+    prefill_rate_multiplier: 14.0
+
+classes:
+  rtx-2000:
+    f_load_shape: piecewise_linear
+    max_degradation: 10
+    prefill_rate_multiplier: 4
+  H100:
+    f_load_shape: piecewise_linear
+    max_degradation: 15
+    prefill_rate_multiplier: 12
+
+router:
+  policy: least-loaded
+  fallback: any
+`
+
+func writeTempYAML(t *testing.T, contents string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nodes.yaml")
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write temp yaml: %v", err)
+	}
+	return path
+}
+
+func TestLoadFromCLLMNodesFile(t *testing.T) {
+	path := writeTempYAML(t, sampleNodesYAML)
+	t.Setenv("CLLM_NODES_FILE", path)
+
+	spec, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if spec == nil {
+		t.Fatal("Load returned nil spec")
+	}
+	if len(spec.Nodes) != 2 {
+		t.Fatalf("nodes: got %d, want 2", len(spec.Nodes))
+	}
+	if len(spec.Classes) != 2 {
+		t.Fatalf("classes: got %d, want 2", len(spec.Classes))
+	}
+	if spec.Router.Policy != "least-loaded" {
+		t.Fatalf("router.policy: got %q, want least-loaded", spec.Router.Policy)
+	}
+}
+
+func TestLoadMissingFileNoOverride(t *testing.T) {
+	t.Setenv("CLLM_NODES_FILE", "")
+	// Run from a temp dir so configs/nodes.yaml relative-to-CWD isn't found.
+	dir := t.TempDir()
+	prev, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+
+	spec, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if spec != nil {
+		t.Fatalf("expected nil spec when no file present, got %+v", spec)
+	}
+}
+
+func TestLoadMissingFileWithOverrideErrors(t *testing.T) {
+	t.Setenv("CLLM_NODES_FILE", "/no/such/path/nodes.yaml")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for missing override file, got nil")
+	}
+}
+
+func TestValidateRejectsUnknownClass(t *testing.T) {
+	bad := `
+nodes:
+  a:
+    class: unknown
+    max_tokens_in_flight: 1
+`
+	path := writeTempYAML(t, bad)
+	t.Setenv("CLLM_NODES_FILE", path)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for unknown class, got nil")
+	}
+}
+
+func TestBuildAppliesClassDefaultsAndOverrides(t *testing.T) {
+	path := writeTempYAML(t, sampleNodesYAML)
+	t.Setenv("CLLM_NODES_FILE", path)
+	spec, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	fallback := Capacity{
+		MaxTokensInFlight:  4096,
+		MaxTokensPerSecond: 50,
+		MaxWaitingRequests: 50,
+	}
+	nodes := spec.Build(fallback)
+	if len(nodes) != 2 {
+		t.Fatalf("Build: got %d nodes, want 2", len(nodes))
+	}
+
+	// Stable lexical order: H100 < rtx-2000 by ASCII.
+	if nodes[0].ID != "h100-0" || nodes[1].ID != "rtx-2000-0" {
+		t.Fatalf("unexpected order: %s, %s", nodes[0].ID, nodes[1].ID)
+	}
+
+	h100 := nodes[0]
+	if h100.Class != "H100" {
+		t.Fatalf("h100 class: %q", h100.Class)
+	}
+	if h100.Capacity.MaxTokensInFlight != 65536 {
+		t.Fatalf("h100 max_tokens_in_flight: %d", h100.Capacity.MaxTokensInFlight)
+	}
+	// Per-node override wins.
+	if h100.Realism.PrefillRateMultiplier != 14.0 {
+		t.Fatalf("h100 prefill_rate_multiplier: got %v, want 14.0", h100.Realism.PrefillRateMultiplier)
+	}
+	if h100.Degradation.MaxDegradation != 15 {
+		t.Fatalf("h100 max_degradation (from class): %d", h100.Degradation.MaxDegradation)
+	}
+	if h100.Upstream != nil {
+		t.Fatalf("h100 should have nil upstream (not set in YAML), got %+v", h100.Upstream)
+	}
+	if h100.Budget == nil || h100.Estimator == nil {
+		t.Fatalf("h100 missing budget or estimator")
+	}
+
+	rtx := nodes[1]
+	// Class default applies (no per-node override).
+	if rtx.Realism.PrefillRateMultiplier != 4.0 {
+		t.Fatalf("rtx prefill_rate_multiplier (from class): got %v, want 4", rtx.Realism.PrefillRateMultiplier)
+	}
+	if rtx.Upstream == nil || rtx.Upstream.URL != "http://vllm:8000/v1" {
+		t.Fatalf("rtx upstream: %+v", rtx.Upstream)
+	}
+}
+
+func TestBuildUsesFallbackWhenNodeCapacityZero(t *testing.T) {
+	yaml := `
+nodes:
+  bare:
+    class: ""
+`
+	path := writeTempYAML(t, yaml)
+	t.Setenv("CLLM_NODES_FILE", path)
+	spec, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	fallback := Capacity{MaxTokensInFlight: 1024, MaxTokensPerSecond: 25, MaxWaitingRequests: 10}
+	nodes := spec.Build(fallback)
+	if len(nodes) != 1 {
+		t.Fatalf("got %d nodes", len(nodes))
+	}
+	if nodes[0].Capacity != fallback {
+		t.Fatalf("expected fallback capacity, got %+v", nodes[0].Capacity)
+	}
+}

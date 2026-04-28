@@ -51,3 +51,21 @@ tps-512:  "no-delay tps=512"
 tps-1024: "no-delay tps=1024"
 tps-1536: "no-delay tps=1536"
 tps-2048: "no-delay tps=2048"
+
+# ---- KV-pressure sweeps ---------------------------------------------------
+# Probe the second admission axis (max_kv_tokens). kv-cost= sets KVCost
+# directly; on KV-disabled nodes (max_kv_tokens=0) these profiles are
+# no-ops per the backward-compat contract. Use these to drive memory-
+# bound regimes against the cllm-overview KV panels.
+
+# Light KV pressure: each request charges a small fixed KV cost.
+kv-light: "kv-cost=64"
+
+# Heavy KV pressure: each request charges a large KV cost; useful for
+# saturating max_kv_tokens before TotalCost saturates max_tokens_in_flight.
+kv-heavy: "kv-cost=512"
+
+# Pathological KV pressure: oversized KV cost designed to provoke
+# kv_oversize rejections on small nodes.
+kv-stress: "kv-cost=4096"
+

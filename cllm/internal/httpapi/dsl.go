@@ -31,8 +31,10 @@ type replayOverrides struct {
 	reCache              bool
 	noTPS                bool
 	noPrefill            bool
+	noKV                 bool
 	tpsOverride          int     // <=0 means use handler value
 	maxTokensOverride    int     // <=0 means use request value
+	kvCostOverride       int     // <=0 means use estimator value
 	prefillDurationScale float64 // 1.0 means no change
 
 	// delayScaleFn returns a fresh per-segment multiplicative scale applied
@@ -44,6 +46,13 @@ type replayOverrides struct {
 	jitterFn      func(handler int) int
 	variabilityFn func(handler int) int
 	stallFn       func(handler int) int
+
+	// Multi-node routing pins. Set by `:dsl node=<id>` or
+	// `:dsl node-class=<class>`. Both share the directive class "node"
+	// for first-wins. nodeID wins over nodeClass when both are present
+	// in the same prompt.
+	nodeID    string
+	nodeClass string
 
 	directives []string
 }
@@ -88,6 +97,7 @@ var dslDirectiveKeys = map[string]string{
 	"segment":     "delay",
 	"tps":         "tps",
 	"max-tokens":  "max-tokens",
+	"kv-cost":     "kv-cost",
 }
 
 // parseDSL strips :dsl directives from each message's content and returns
@@ -155,6 +165,39 @@ func parseDSLWithDefaultProfile(messages []chatCompletionMessage, draw func() fl
 				seen["profile"] = true
 				profileName = name
 				overrides.directives = append(overrides.directives, "profile="+name)
+			}
+		}
+	}
+
+	// Pre-scan node pins. Both `node=<id>` and `node-class=<class>` share
+	// the "node" class so explicit IDs and class hints don't stack. node=
+	// takes precedence over node-class= because we scan messages in
+	// document order and respect the seen["node"] flag (first-wins).
+	for _, m := range messages {
+		_, dslPart, hadMarker := splitAtDSLMarker(m.Content)
+		if !hadMarker {
+			continue
+		}
+		for _, raw := range strings.Fields(dslPart) {
+			tok := strings.ToLower(raw)
+			if id, ok := strings.CutPrefix(tok, "node="); ok && !seen["node"] {
+				id = strings.TrimSpace(id)
+				if id == "" {
+					continue
+				}
+				seen["node"] = true
+				overrides.nodeID = id
+				overrides.directives = append(overrides.directives, "node="+id)
+				continue
+			}
+			if class, ok := strings.CutPrefix(tok, "node-class="); ok && !seen["node"] {
+				class = strings.TrimSpace(class)
+				if class == "" {
+					continue
+				}
+				seen["node"] = true
+				overrides.nodeClass = class
+				overrides.directives = append(overrides.directives, "node-class="+class)
 			}
 		}
 	}
@@ -232,6 +275,11 @@ func applyDSLTokenList(o *replayOverrides, fields []string, seen map[string]bool
 		}
 		if strings.HasPrefix(raw, "profile=") {
 			// Profiles are pre-scanned in the prompt, never nested in bundles.
+			continue
+		}
+		if strings.HasPrefix(raw, "node=") || strings.HasPrefix(raw, "node-class=") {
+			// Node pins are pre-scanned; ignore here so they aren't
+			// emitted twice or matched by the dslDirectiveKeys path.
 			continue
 		}
 
@@ -335,6 +383,17 @@ func applyDSLBareToken(o *replayOverrides, tok string, seen map[string]bool) boo
 		seen["tps"] = true
 		o.noTPS = true
 		return true
+	case "no-kv":
+		// no-kv means "do not charge a KV-cache cost for this request".
+		// It claims the kv-cost directive class (first-wins) so a later
+		// `kv-cost=N` cannot override it. Has no effect on KV-disabled
+		// nodes (n.KV == nil) per the backward-compat contract.
+		if seen["kv-cost"] {
+			return false
+		}
+		seen["kv-cost"] = true
+		o.noKV = true
+		return true
 	case "no-prefill":
 		if seen["prefill"] {
 			return false
@@ -399,6 +458,13 @@ func applyKeyedDirective(o *replayOverrides, key, val string, seen map[string]bo
 		}
 		seen[class] = true
 		o.maxTokensOverride = n
+	case "kv-cost":
+		n := resolveDelta(lo, hi, draw)
+		if n < 1 {
+			return "", false
+		}
+		seen[class] = true
+		o.kvCostOverride = n
 	case "segment":
 		seen[class] = true
 		o.delayScaleFn = func() float64 { return resolveScalar(lo, hi, draw) }
@@ -513,7 +579,7 @@ func dslDirectiveFamily(tok string) string {
 		return tok
 	}
 	switch tok {
-	case "no-cache", "re-cache", "no-delay", "no-tps", "no-prefill", "no-jitter", "no-variability", "no-stall":
+	case "no-cache", "re-cache", "no-delay", "no-tps", "no-prefill", "no-jitter", "no-variability", "no-stall", "no-kv":
 		return tok
 	}
 	if eq := strings.IndexByte(tok, '='); eq > 0 {

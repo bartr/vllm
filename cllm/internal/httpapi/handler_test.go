@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cllm/internal/buildinfo"
 	"cllm/internal/config"
+	"cllm/internal/node"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -549,7 +550,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(20, 10, 10, 50)
 
-	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/one")
+	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first request slot")
 	}
@@ -560,7 +561,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 		t.Fatalf("delay below threshold = %s, want %s", got, expected)
 	}
 
-	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/two")
+	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second request slot")
 	}
@@ -579,7 +580,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 
 	releases := make([]func(), 0, 52)
 	for i := 0; i < 51; i++ {
-		release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/threshold")
+		release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/threshold")
 		if !ok {
 			t.Fatalf("failed to acquire slot %d", i+1)
 		}
@@ -596,7 +597,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 		t.Fatalf("delay at threshold = %s, want %s", got, expected)
 	}
 
-	release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/threshold-plus-one")
+	release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/threshold-plus-one")
 	if !ok {
 		t.Fatal("failed to acquire threshold+1 slot")
 	}
@@ -787,11 +788,11 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	releaseOne, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/one")
+	releaseOne, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first direct slot")
 	}
-	releaseTwo, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/two")
+	releaseTwo, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second direct slot")
 	}
@@ -802,13 +803,13 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	}
 	acquired := make(chan acquiredRelease, 2)
 	go func() {
-		release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/three")
+		release, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/three")
 		if ok {
 			acquired <- acquiredRelease{path: "/three", release: release}
 		}
 	}()
 	go func() {
-		release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/four")
+		release, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/four")
 		if ok {
 			acquired <- acquiredRelease{path: "/four", release: release}
 		}
@@ -827,7 +828,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 		t.Fatalf("stats after reconfigure = (%d,%d,%d,%d), want (1,2,1,2)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
 
-	if _, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/five"); ok {
+	if _, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/five"); ok {
 		t.Fatal("expected new admission to be rejected while queue remains above max waiting")
 	}
 
@@ -844,7 +845,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 1 || maxWaiting != 1 || waiting != 1 {
 		t.Fatalf("stats after first promotion = (%d,%d,%d,%d), want (1,1,1,1)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
-	if _, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/six"); ok {
+	if _, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/six"); ok {
 		t.Fatal("expected new admission to be rejected while waiting queue is still full")
 	}
 
@@ -857,7 +858,7 @@ func TestSchedulerReconfigureBelowCurrentLengthsPreservesQueuedRequests(t *testi
 	if maxConcurrent, inFlight, maxWaiting, waiting := scheduler.Stats(); maxConcurrent != 1 || inFlight != 0 || maxWaiting != 1 || waiting != 0 {
 		t.Fatalf("final stats = (%d,%d,%d,%d), want (1,0,1,0)", maxConcurrent, inFlight, maxWaiting, waiting)
 	}
-	if release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/seven"); !ok {
+	if release, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/seven"); !ok {
 		t.Fatal("expected direct admission once both queues had space again")
 	} else {
 		release()
@@ -873,14 +874,14 @@ func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 	scheduler := newRequestScheduler(1, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	releaseOne, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/one")
+	releaseOne, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire direct slot")
 	}
 
 	queuedAcquired := make(chan func(), 1)
 	go func() {
-		release, _, ok := scheduler.Acquire(ctx, requestCost{totalCost: 1}, "/two")
+		release, _, ok := scheduler.Acquire(ctx, node.RequestCost{TotalCost: 1}, "/two")
 		if ok {
 			queuedAcquired <- release
 		}
@@ -900,9 +901,9 @@ func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 
 	logOutput := logBuffer.String()
 	for _, want := range []string{
-		`msg=admitted path=/one source=direct`,
-		`msg=queued path=/two`,
-		`msg=admitted path=/two source=waiting_to_concurrent`,
+		`msg=admitted path=/one node=default source=direct`,
+		`msg=queued path=/two node=default`,
+		`msg=admitted path=/two node=default source=waiting_to_concurrent`,
 	} {
 		if !strings.Contains(logOutput, want) {
 			t.Fatalf("log output %q does not contain %q", logOutput, want)
@@ -948,11 +949,11 @@ func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(20, 10, 10, 50)
 
-	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/one")
+	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/one")
 	if !ok {
 		t.Fatal("failed to acquire first request slot")
 	}
-	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/two")
+	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/two")
 	if !ok {
 		t.Fatal("failed to acquire second request slot")
 	}
@@ -978,7 +979,7 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 
 	releases := make([]func(), 0, 52)
 	for i := 0; i < 52; i++ {
-		release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/load")
+		release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/load")
 		if !ok {
 			t.Fatalf("failed to acquire slot %d", i+1)
 		}
@@ -1573,7 +1574,7 @@ func TestChatCompletionsRejectedOverCapacityEmitsLifecycleEvent(t *testing.T) {
 
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(32, 1, 0, 0)
-	release, _, ok := handler.acquireRequestSlot(context.Background(), requestCost{totalCost: 1}, "/v1/chat/completions")
+	release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/v1/chat/completions")
 	if !ok {
 		t.Fatal("failed to acquire baseline slot")
 	}

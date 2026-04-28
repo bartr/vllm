@@ -651,3 +651,63 @@ func TestParseDSLWithDefaultProfileUnknownNameIgnored(t *testing.T) {
 		t.Fatalf("tpsOverride = %d, want 0 (unknown default)", ov.tpsOverride)
 	}
 }
+
+func TestParseDSLNodePin(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: "hello :dsl node=h100-0"}}
+	out, ov := parseDSL(in, func() float64 { return 0 })
+	if out[0].Content != "hello" {
+		t.Fatalf("content = %q, want %q", out[0].Content, "hello")
+	}
+	if ov.nodeID != "h100-0" {
+		t.Fatalf("nodeID = %q, want h100-0", ov.nodeID)
+	}
+	if ov.nodeClass != "" {
+		t.Fatalf("nodeClass = %q, want empty", ov.nodeClass)
+	}
+	if !contains(ov.directives, "node=h100-0") {
+		t.Fatalf("directives = %v, want contains node=h100-0", ov.directives)
+	}
+}
+
+func TestParseDSLNodeClassPin(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: ":dsl node-class=A10"}}
+	_, ov := parseDSL(in, func() float64 { return 0 })
+	if ov.nodeClass != "a10" {
+		t.Fatalf("nodeClass = %q, want a10 (lowercased)", ov.nodeClass)
+	}
+	if ov.nodeID != "" {
+		t.Fatalf("nodeID = %q, want empty", ov.nodeID)
+	}
+}
+
+func TestParseDSLNodeIDWinsOverClass(t *testing.T) {
+	// Both in same prompt; document order is node-class first then
+	// node= — first-wins means node-class= sticks. Reverse order
+	// should make node= win.
+	in := []chatCompletionMessage{{Role: "user", Content: ":dsl node=h100-0 node-class=A10"}}
+	_, ov := parseDSL(in, func() float64 { return 0 })
+	if ov.nodeID != "h100-0" {
+		t.Fatalf("nodeID = %q, want h100-0", ov.nodeID)
+	}
+	if ov.nodeClass != "" {
+		t.Fatalf("nodeClass = %q, want empty (node= seen first)", ov.nodeClass)
+	}
+
+	in2 := []chatCompletionMessage{{Role: "user", Content: ":dsl node-class=A10 node=h100-0"}}
+	_, ov2 := parseDSL(in2, func() float64 { return 0 })
+	if ov2.nodeClass != "a10" {
+		t.Fatalf("nodeClass = %q, want a10", ov2.nodeClass)
+	}
+	if ov2.nodeID != "" {
+		t.Fatalf("nodeID = %q, want empty (node-class= seen first)", ov2.nodeID)
+	}
+}
+
+func TestParseDSLNodeEmptyValueIgnored(t *testing.T) {
+	in := []chatCompletionMessage{{Role: "user", Content: ":dsl node= node-class="}}
+	_, ov := parseDSL(in, func() float64 { return 0 })
+	if ov.nodeID != "" || ov.nodeClass != "" {
+		t.Fatalf("expected both empty, got id=%q class=%q", ov.nodeID, ov.nodeClass)
+	}
+}
+

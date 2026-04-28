@@ -3,6 +3,8 @@ package httpapi
 import (
 	"bytes"
 	"cllm/internal/buildinfo"
+	"cllm/internal/node"
+	"cllm/internal/router"
 	"cllm/internal/runtimeconfig"
 	"container/list"
 	"context"
@@ -119,6 +121,8 @@ type Handler struct {
 	streamStallMin                            time.Duration
 	streamStallMax                            time.Duration
 	scheduler                                 *requestScheduler
+	nodes                                     []*node.Node
+	router                                    router.Router
 	sleep                                     func(context.Context, time.Duration) error
 	jitterSource                              func() float64
 	dslProfiles                               map[string][]string
@@ -147,6 +151,8 @@ func NewHandler() *Handler {
 	handler.streamStallMin = time.Duration(defaultStreamStallMinMs) * time.Millisecond
 	handler.streamStallMax = time.Duration(defaultStreamStallMaxMs) * time.Millisecond
 	handler.scheduler = newRequestScheduler(defaultMaxTokensInFlight, defaultMaxWaitingRequests)
+	handler.nodes = []*node.Node{handler.scheduler.node}
+	handler.router = router.FromPolicy("")
 	handler.sleep = sleepWithContext
 	handler.jitterSource = defaultJitterSource
 	handler.dslProfiles = cloneDSLProfiles(DefaultDSLProfiles)
@@ -180,6 +186,7 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxTokensInFlig
 	if h.scheduler == nil {
 		h.scheduler = newRequestScheduler(maxTokensInFlight, maxWaitingRequests)
 		h.scheduler.metrics = h.metrics
+		h.nodes = []*node.Node{h.scheduler.node}
 	} else {
 		h.scheduler.Reconfigure(maxTokensInFlight, maxWaitingRequests)
 	}
@@ -690,8 +697,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Cost estimate uses tenant p95 first, then global, then max_tokens.
 	cost := estimateRequestCostForTenant(requestPayload, tenant, h.globalEstimator())
 
+	// DSL kv-cost / no-kv overrides shape the second admission axis
+	// without touching cost.TotalCost. no-kv wins over kv-cost (the
+	// directive class "kv-cost" is shared and first-wins). On
+	// KV-disabled nodes (n.KV == nil) the override is a no-op per the
+	// backward-compat contract.
+	//
+	// no-kv encodes "skip the KV gate entirely" via the sentinel
+	// KVCost == -1; kv-cost=N sets KVCost = N directly.
+	if replayDSL.noKV {
+		cost.KVCost = -1
+	} else if replayDSL.kvCostOverride > 0 {
+		cost.KVCost = replayDSL.kvCostOverride
+	}
+
+	// Phase 2.4: route the request to a node and use that node for
+	// admission, per-node metrics, and completion-token observation.
+	// In single-node deployments the routed node is h.nodes[0] which
+	// equals h.scheduler.node; admission is byte-for-byte identical to
+	// the legacy path. In multi-node deployments admission charges the
+	// chosen node's TokenBudget and emits per-node series.
+	routedNode, routedReason := h.pickRoutedNode(ctx, replayDSL, cost)
+	if routedNode != nil {
+		h.logRouterDecisionIfMultiNode(ctx, routedNode, routedReason, replayDSL)
+	}
+
 	// Stage 1: tenant rate limit (token bucket; non-blocking).
-	if !tenant.bucket.tryReserve(float64(cost.totalCost)) {
+	if !tenant.bucket.tryReserve(float64(cost.TotalCost)) {
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
 		h.metrics.observeAdmissionRejection(tenant.name, "tenant_rate")
@@ -700,7 +732,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			"mode", mode,
 			"max_tokens", requestedMaxTokens,
 			"tenant", tenant.name,
-			"cost", cost.totalCost,
+			"cost", cost.TotalCost,
 			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
 		)
 		markCacheHit(w, false)
@@ -709,24 +741,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stage 2: global cost budget (FIFO queue).
-	release, queueWait, ok := h.acquireRequestSlot(ctx, cost, r.URL.RequestURI())
+	release, queueWait, ok, rejectReason := h.acquireRequestSlotOnNode(ctx, cost, r.URL.RequestURI(), routedNode)
 	if !ok {
 		// Global gate refused; refund tenant tokens so a rejection here
 		// doesn't permanently drain rate quota.
-		tenant.bucket.refund(float64(cost.totalCost))
+		tenant.bucket.refund(float64(cost.TotalCost))
+		if rejectReason == "" {
+			rejectReason = "over_capacity"
+		}
+		// HTTP body and lifecycle message vary by reason; the metric
+		// label and lifecycle outcome carry the precise reason.
+		var rejectBody string
+		switch rejectReason {
+		case "kv_pressure":
+			rejectBody = "kv pressure\n"
+		case "kv_oversize":
+			rejectBody = "kv oversize\n"
+		default:
+			rejectBody = "over capacity\n"
+		}
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
-		h.metrics.observeAdmissionRejection(tenant.name, "over_capacity")
-		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "over_capacity", "request rejected",
+		h.metrics.observeAdmissionRejection(tenant.name, rejectReason)
+		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", rejectReason, "request rejected",
 			"status", http.StatusTooManyRequests,
 			"mode", mode,
 			"max_tokens", requestedMaxTokens,
 			"tenant", tenant.name,
-			"cost", cost.totalCost,
+			"cost", cost.TotalCost,
 			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
 		)
 		markCacheHit(w, false)
-		writePlainText(w, http.StatusTooManyRequests, "over capacity\n")
+		writePlainText(w, http.StatusTooManyRequests, rejectBody)
 		return
 	}
 	defer release()
@@ -740,7 +786,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		"mode", mode,
 		"max_tokens", requestedMaxTokens,
 		"tenant", tenant.name,
-		"cost", cost.totalCost,
+		"cost", cost.TotalCost,
 		"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
 	)
 
@@ -752,8 +798,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// real workload.
 		if outcome == "completed" && source == "downstream" && status >= 200 && status < 300 {
 			h.observeCompletionTokens(completionTokens)
+			if routedNode != nil && routedNode.Estimator != nil && routedNode != h.scheduler.node {
+				routedNode.Estimator.Observe(completionTokens)
+			}
 			if tenant != nil && tenant.estimator != nil {
-				tenant.estimator.observe(completionTokens)
+				tenant.estimator.Observe(completionTokens)
 			}
 		}
 		h.emitLifecycleEvent(ctx, level, "completed", outcome, "request completed",
@@ -2220,7 +2269,7 @@ func convertSSEToChatCompletionJSON(body []byte) []byte {
 	return encoded
 }
 
-func (h *Handler) acquireRequestSlot(ctx context.Context, cost requestCost, path string) (func(), time.Duration, bool) {
+func (h *Handler) acquireRequestSlot(ctx context.Context, cost node.RequestCost, path string) (func(), time.Duration, bool) {
 	h.configMu.RLock()
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
@@ -2236,6 +2285,42 @@ func (h *Handler) acquireRequestSlot(ctx context.Context, cost requestCost, path
 		release()
 		h.logComputedDegradationIfChanged("request_completed")
 	}, queueWait, true
+}
+
+// acquireRequestSlotOnNode is the multi-node admission path: it charges
+// cost against the supplied node's TokenBudget instead of the scheduler's
+// own. When n is nil it falls back to acquireRequestSlot, so callers can
+// pass through a router decision without nil-checking. Phase 2.4 of
+// multi-node-design.md.
+//
+// reason is "" on success. On failure it is one of "over_capacity",
+// "kv_pressure", or "kv_oversize"; see scheduler.AcquireOnNode for
+// details. Callers translate the reason into a metric label and an HTTP
+// rejection message.
+func (h *Handler) acquireRequestSlotOnNode(ctx context.Context, cost node.RequestCost, path string, n *node.Node) (func(), time.Duration, bool, string) {
+	if n == nil {
+		release, waited, ok := h.acquireRequestSlot(ctx, cost, path)
+		reason := ""
+		if !ok {
+			reason = "over_capacity"
+		}
+		return release, waited, ok, reason
+	}
+	h.configMu.RLock()
+	scheduler := h.scheduler
+	h.configMu.RUnlock()
+	if scheduler == nil {
+		return func() {}, 0, true, ""
+	}
+	release, queueWait, ok, reason := scheduler.AcquireOnNode(ctx, cost, path, n)
+	if !ok {
+		return nil, 0, false, reason
+	}
+	h.logComputedDegradationIfChanged("request_admitted")
+	return func() {
+		release()
+		h.logComputedDegradationIfChanged("request_completed")
+	}, queueWait, true, ""
 }
 
 // observeCompletionTokens feeds an actual completion-token count into the
@@ -2256,7 +2341,7 @@ func (h *Handler) observeCompletionTokens(completionTokens int) {
 // globalEstimator returns the scheduler's completion-token p95 estimator,
 // used to compute cost before admission. Returns nil if the scheduler is
 // not yet initialized.
-func (h *Handler) globalEstimator() *completionEstimator {
+func (h *Handler) globalEstimator() *node.CompletionEstimator {
 	h.configMu.RLock()
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
@@ -2276,7 +2361,7 @@ func (h *Handler) resolveRequestTenant(r *http.Request) *tenantState {
 	if tenants == nil {
 		// Should not happen in production (NewHandler initializes the
 		// registry) but guard for tests that build Handler{} directly.
-		return &tenantState{name: defaultTenantName, bucket: newTenantBucket(0, 0), estimator: newCompletionEstimator(256, 50)}
+		return &tenantState{name: defaultTenantName, bucket: newTenantBucket(0, 0), estimator: node.NewCompletionEstimator(256, 50)}
 	}
 	return tenants.resolve(r.Header.Get(tenantHeader))
 }
@@ -2665,12 +2750,15 @@ func calibratedTokensPerSecond(configuredTokensPerSecond int) float64 {
 // requestScheduler is a cost-based admission gate. It charges each request
 // a token cost (prompt_tokens + min(max_tokens, p95_completion_tokens)) to a
 // token budget; when the budget is full, requests block FIFO until enough
-// cost is released. It composes a tokenBudget primitive with logging and
-// Prometheus metrics integration.
+// cost is released. It composes a node.Node's primitives (TokenBudget +
+// CompletionEstimator) with logging and Prometheus metrics integration.
+//
+// Phase 1.5 of the multi-node refactor: the scheduler holds a *node.Node
+// rather than separate budget/estimator pointers, so Phase 2 can iterate
+// over Handler.nodes without further moves.
 type requestScheduler struct {
 	mu                sync.Mutex
-	budget            *tokenBudget
-	estimator         *completionEstimator
+	node              *node.Node
 	metrics           *handlerMetrics
 	maxTokensInFlight int64
 	maxWaiting        int
@@ -2683,52 +2771,122 @@ func newRequestScheduler(maxTokensInFlight, maxWaitingRequests int) *requestSche
 	if maxWaitingRequests < 0 {
 		maxWaitingRequests = 0
 	}
+	n := &node.Node{
+		ID:        "default",
+		Class:     "default",
+		Budget:    node.NewTokenBudget(int64(maxTokensInFlight), maxWaitingRequests),
+		Estimator: node.NewCompletionEstimator(256, 50),
+		Capacity: node.Capacity{
+			MaxTokensInFlight:  int64(maxTokensInFlight),
+			MaxWaitingRequests: maxWaitingRequests,
+		},
+	}
 	return &requestScheduler{
-		budget:            newTokenBudget(int64(maxTokensInFlight), maxWaitingRequests),
-		estimator:         newCompletionEstimator(256, 50),
+		node:              n,
 		maxTokensInFlight: int64(maxTokensInFlight),
 		maxWaiting:        maxWaitingRequests,
 	}
 }
 
-// Acquire charges cost.totalCost against the budget. It returns a release
+// Acquire charges cost.TotalCost against the budget. It returns a release
 // closure (which refunds the same cost when called), the time spent waiting,
 // and ok=false when over capacity (queue full or oversized request).
-func (s *requestScheduler) Acquire(ctx context.Context, cost requestCost, path string) (func(), time.Duration, bool) {
+func (s *requestScheduler) Acquire(ctx context.Context, cost node.RequestCost, path string) (func(), time.Duration, bool) {
+	release, waited, ok, _ := s.acquireOn(ctx, cost, path, s.node)
+	return release, waited, ok
+}
+
+// AcquireOnNode is the multi-node variant of Acquire: it charges the cost
+// against the supplied node's TokenBudget instead of the scheduler's own
+// (Phase 2.4 of multi-node-design.md). When n is nil it falls back to
+// s.node so callers can pass through a router decision without
+// nil-checking. Per-node Prometheus metrics are emitted only on this
+// path; legacy callers using Acquire continue to share the global series.
+//
+// reason is "" on success. On failure it is "over_capacity" (TokenBudget
+// rejected: queue full or oversize compute), "kv_pressure" (node KV
+// budget is currently full), or "kv_oversize" (kv_cost alone exceeds
+// MaxKVTokens). See docs/design-memory-pressure.md \u00a75.2.
+func (s *requestScheduler) AcquireOnNode(ctx context.Context, cost node.RequestCost, path string, n *node.Node) (func(), time.Duration, bool, string) {
+	if n == nil {
+		release, waited, ok, reason := s.acquireOn(ctx, cost, path, s.node)
+		return release, waited, ok, reason
+	}
+	return s.acquireOn(ctx, cost, path, n)
+}
+
+func (s *requestScheduler) acquireOn(ctx context.Context, cost node.RequestCost, path string, n *node.Node) (func(), time.Duration, bool, string) {
 	logger := loggerFromContext(ctx)
-	chargedCost := int64(cost.totalCost)
+	chargedCost := int64(cost.TotalCost)
 	if chargedCost < 1 {
 		chargedCost = 1
 	}
+	// kvCost semantics:
+	//   cost.KVCost  > 0  -> charge that many KV tokens
+	//   cost.KVCost == 0  -> cold-start fallback: mirror chargedCost
+	//   cost.KVCost <  0  -> sentinel from `:dsl no-kv`, skip KV gate
+	kvCost := int64(cost.KVCost)
+	skipKV := kvCost < 0
+	if kvCost == 0 {
+		kvCost = chargedCost
+	}
+
+	emitNodeMetric := n != s.node // only emit per-node metrics for routed nodes
 
 	// Peek to determine whether we will be queued. The result is advisory
 	// (used only for logging) and races with concurrent acquirers are
 	// acceptable.
-	capacity, inFlight, _, _ := s.budget.stats()
+	capacity, inFlight, _, _ := n.Budget.Stats()
 	willQueue := inFlight+chargedCost > capacity
 
 	if willQueue {
 		// Pre-log the queue event before blocking on acquire. We log here
 		// because once acquire returns, we cannot distinguish "blocked
 		// briefly" from "rejected after blocking" in the queued log.
-		_, _, waiting, maxWaiting := s.budget.stats()
-		logger.Info("queued", "path", path, "cost", chargedCost, "tokens_in_flight", inFlight, "max_tokens_in_flight", capacity, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
+		_, _, waiting, maxWaiting := n.Budget.Stats()
+		logger.Info("queued", "path", path, "node", n.ID, "cost", chargedCost, "tokens_in_flight", inFlight, "max_tokens_in_flight", capacity, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
 		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "queued", "")
 	}
 
-	queueWait, ok := s.budget.acquire(ctx, chargedCost)
+	queueWait, ok := n.Budget.Acquire(ctx, chargedCost)
 	if !ok {
-		return nil, queueWait, false
+		if emitNodeMetric {
+			s.metrics.observeNodeAdmission(n.ID, n.Class, "rejected")
+		}
+		return nil, queueWait, false, "over_capacity"
+	}
+
+	// KV admission gate. Layered on top of the compute gate per
+	// docs/design-memory-pressure.md \u00a75.2: if the node has KV modeling
+	// enabled and the request's KV cost cannot be charged, release the
+	// just-acquired compute slot and reject. The released compute slot
+	// wakes the next FIFO waiter so the system stays work-conserving.
+	if n.KV != nil {
+		if skipKV {
+			// :dsl no-kv: charge compute only, leave KV alone.
+			kvCost = 0
+		} else if kvOK, kvReason := n.KV.TryCharge(kvCost); !kvOK {
+			n.Budget.Release(chargedCost)
+			if emitNodeMetric {
+				s.metrics.observeNodeAdmission(n.ID, n.Class, "rejected")
+			}
+			logger.Warn("rejected_kv", "path", path, "node", n.ID, "kv_cost", kvCost, "reason", kvReason)
+			return nil, queueWait, false, kvReason
+		}
 	}
 
 	source := "direct"
 	if willQueue {
 		source = "waiting_to_concurrent"
 	}
-	_, postInFlight, waiting, maxWaiting := s.budget.stats()
-	logger.Info("admitted", "path", path, "source", source, "cost", chargedCost, "queue_wait_ms", float64(queueWait)/float64(time.Millisecond), "tokens_in_flight", postInFlight, "max_tokens_in_flight", capacity, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
+	_, postInFlight, waiting, maxWaiting := n.Budget.Stats()
+	logger.Info("admitted", "path", path, "node", n.ID, "source", source, "cost", chargedCost, "queue_wait_ms", float64(queueWait)/float64(time.Millisecond), "tokens_in_flight", postInFlight, "max_tokens_in_flight", capacity, "waiting_requests", waiting, "max_waiting_requests", maxWaiting)
 	s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "admitted", "")
-	return s.releaseFunc(chargedCost), queueWait, true
+	if emitNodeMetric {
+		s.metrics.observeNodeAdmission(n.ID, n.Class, "admitted")
+		s.metrics.observeNodeQueueWait(n.ID, n.Class, queueWait)
+	}
+	return s.releaseFuncWithKV(n, chargedCost, kvCost), queueWait, true, ""
 }
 
 func (s *requestScheduler) Reconfigure(maxTokensInFlight, maxWaitingRequests int) {
@@ -2741,35 +2899,53 @@ func (s *requestScheduler) Reconfigure(maxTokensInFlight, maxWaitingRequests int
 	s.mu.Lock()
 	s.maxTokensInFlight = int64(maxTokensInFlight)
 	s.maxWaiting = maxWaitingRequests
+	s.node.Capacity.MaxTokensInFlight = int64(maxTokensInFlight)
+	s.node.Capacity.MaxWaitingRequests = maxWaitingRequests
 	s.mu.Unlock()
-	s.budget.reconfigure(int64(maxTokensInFlight), maxWaitingRequests)
+	s.node.Budget.Reconfigure(int64(maxTokensInFlight), maxWaitingRequests)
 }
 
 // Observe records actual completion tokens for the global p95 estimator,
 // which improves cost estimates for subsequent requests.
 func (s *requestScheduler) Observe(completionTokens int) {
-	if s == nil || s.estimator == nil {
+	if s == nil || s.node.Estimator == nil {
 		return
 	}
-	s.estimator.observe(completionTokens)
+	s.node.Estimator.Observe(completionTokens)
 }
 
 // Estimator returns the global completion-token p95 estimator.
-func (s *requestScheduler) Estimator() *completionEstimator {
+func (s *requestScheduler) Estimator() *node.CompletionEstimator {
 	if s == nil {
 		return nil
 	}
-	return s.estimator
+	return s.node.Estimator
 }
 
 func (s *requestScheduler) Stats() (int, int64, int, int) {
-	capacity, inFlight, waiting, maxWaiting := s.budget.stats()
+	capacity, inFlight, waiting, maxWaiting := s.node.Budget.Stats()
 	return int(capacity), inFlight, maxWaiting, waiting
 }
 
 func (s *requestScheduler) releaseFunc(cost int64) func() {
+	return s.releaseFuncOn(s.node.Budget, cost)
+}
+
+func (s *requestScheduler) releaseFuncOn(b *node.TokenBudget, cost int64) func() {
 	return func() {
-		s.budget.release(cost)
+		b.Release(cost)
+	}
+}
+
+// releaseFuncWithKV returns a release closure that refunds both the
+// compute slot and the KV slot when called. It is the dual of the
+// admission path in acquireOn that charges both budgets atomically.
+func (s *requestScheduler) releaseFuncWithKV(n *node.Node, cost, kvCost int64) func() {
+	return func() {
+		n.Budget.Release(cost)
+		if n.KV != nil {
+			n.KV.Release(kvCost)
+		}
 	}
 }
 
@@ -2782,20 +2958,36 @@ func (s *requestScheduler) effectiveTokensPerSecond(baseTokensPerSecond, maxDegr
 // endpoint: (maxTokensInFlight, tokensInFlight, maxWaiting, waiting,
 // computedDegradationPercentage, effectiveTokensPerSecond).
 func (s *requestScheduler) processingStats(baseTokensPerSecond, maxDegradation int) (int64, int64, int, int, float64, float64) {
-	capacity, inFlight, waiting, maxWaiting := s.budget.stats()
-	computedDegradationPercentage, effectiveTokensPerSecond := s.degradationMetricsFor(capacity, inFlight, baseTokensPerSecond, maxDegradation)
+	capacity, inFlight, waiting, maxWaiting := s.node.Budget.Stats()
+	computedDegradationPercentage, effectiveTokensPerSecond := s.degradationFromNode(s.node, capacity, inFlight, baseTokensPerSecond, maxDegradation)
 	return capacity, inFlight, maxWaiting, waiting, computedDegradationPercentage, effectiveTokensPerSecond
 }
 
 func (s *requestScheduler) degradationMetrics(baseTokensPerSecond, maxDegradation int) (float64, float64) {
-	capacity, inFlight, _, _ := s.budget.stats()
-	return s.degradationMetricsFor(capacity, inFlight, baseTokensPerSecond, maxDegradation)
+	capacity, inFlight, _, _ := s.node.Budget.Stats()
+	return s.degradationFromNode(s.node, capacity, inFlight, baseTokensPerSecond, maxDegradation)
+}
+
+// degradationFromNode picks the right f(load) path for a node. When KV
+// modeling is disabled (n.KV == nil) it delegates to the integer-
+// arithmetic cost-only formula in degradationMetricsFor so byte-for-byte
+// behavior is preserved for single-node default deployments. When KV
+// modeling is enabled it computes combined_load = max(cost_load, kv_load
+// * kv_weight) and feeds that into the float-arithmetic curve.
+func (s *requestScheduler) degradationFromNode(n *node.Node, capacity, inFlight int64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
+	if n == nil || n.KV == nil {
+		return s.degradationMetricsFor(capacity, inFlight, baseTokensPerSecond, maxDegradation)
+	}
+	return degradationFromLoad(combinedLoadOf(n), baseTokensPerSecond, maxDegradation)
 }
 
 // degradationMetricsFor computes (computedDegradationPercentage,
 // effectiveTokensPerSecond) using the cost-based fill ratio
 // inFlight/capacity. Below the 10% threshold there is no degradation; above
 // it, degradation scales linearly to maxDegradation at full capacity.
+//
+// This is the cost-only path; KV-aware callers should use
+// degradationFromNode (which falls through to here when KV is disabled).
 func (s *requestScheduler) degradationMetricsFor(capacity, inFlight int64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
 	if baseTokensPerSecond < 1 {
 		return 0, 0
@@ -2813,6 +3005,75 @@ func (s *requestScheduler) degradationMetricsFor(capacity, inFlight int64, baseT
 		return 0, calibratedBaseTokensPerSecond
 	}
 	progress := float64(inFlight-thresholdCost) / float64(degradationWindow)
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	computedDegradationPercentage := float64(maxDegradation) * progress
+	effectiveTokensPerSecond := calibratedBaseTokensPerSecond * (1 - computedDegradationPercentage/100)
+	if effectiveTokensPerSecond < 1 {
+		effectiveTokensPerSecond = 1
+	}
+	return computedDegradationPercentage, effectiveTokensPerSecond
+}
+
+// combinedLoadOf returns max(cost_load, kv_load * kv_weight) for the
+// given node, where each load is the budget's in-flight / capacity. A
+// node with KV modeling disabled (n.KV == nil or capacity == 0) falls
+// back to cost_load alone, keeping single-node default deployments
+// byte-for-byte identical to pre-KV behavior.
+func combinedLoadOf(n *node.Node) float64 {
+	if n == nil || n.Budget == nil {
+		return 0
+	}
+	capacity, inFlight, _, _ := n.Budget.Stats()
+	cost := costLoad(capacity, inFlight)
+	if n.KV == nil {
+		return cost
+	}
+	kvCap, kvInFlight := n.KV.Stats()
+	kv := costLoad(kvCap, kvInFlight)
+	weight := n.Capacity.KVWeight
+	if weight <= 0 {
+		weight = 1.0
+	}
+	weighted := kv * weight
+	if weighted > cost {
+		return weighted
+	}
+	return cost
+}
+
+func costLoad(capacity, inFlight int64) float64 {
+	if capacity <= 0 {
+		return 0
+	}
+	return float64(inFlight) / float64(capacity)
+}
+
+// degradationFromLoad applies the piecewise-linear f(load) curve to a
+// normalized load fraction in [0, +inf). Below the 10% deadband there is
+// no degradation; above it, degradation ramps linearly to maxDegradation
+// percent as load reaches 1.0. Loads above 1.0 are clamped (matching the
+// pre-KV inFlight==capacity behavior).
+func degradationFromLoad(load float64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
+	if baseTokensPerSecond < 1 {
+		return 0, 0
+	}
+	calibratedBaseTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
+	if maxDegradation == 0 {
+		return 0, calibratedBaseTokensPerSecond
+	}
+	if load <= degradationThreshold {
+		return 0, calibratedBaseTokensPerSecond
+	}
+	window := 1.0 - degradationThreshold
+	if window <= 0 {
+		return 0, calibratedBaseTokensPerSecond
+	}
+	progress := (load - degradationThreshold) / window
 	if progress < 0 {
 		progress = 0
 	}

@@ -1,0 +1,75 @@
+# Smoke-test prompt list for cllm.
+#
+# Run sequentially against a deployed cllm with `ask --files smoke-test.yaml`,
+# or one-by-one with `ASK_URL=http://... ./ask.sh` style calls. Each prompt
+# exercises a distinct admission, DSL, or routing path. Comments describe
+# the expected outcome on a 2-node fleet where `kv-node` has
+# `max_kv_tokens: 1024` and `default` has KV disabled (see
+# clusters/z01/cllm/nodes-configmap.yaml).
+#
+# Expected outcomes assume a fresh fleet (no other concurrent traffic).
+# Use `:dsl no-cache` everywhere so cached replays don't mask admission.
+
+# ---- 1. Baseline: plain request, no DSL --------------------------------
+# Expect: 200, served by either node, no KV gauges move on `default`.
+- prompt: "what is 2+2?"
+  dsl: "no-cache"
+
+# ---- 2. KV-enabled node, small KV charge -------------------------------
+# Expect: 200, kv-node accepts; cllm_node_kv_tokens_in_flight{node=kv-node}
+# briefly rises to 128 then returns to 0 on completion.
+- prompt: "small kv charge"
+  dsl: "node=kv-node kv-cost=128 no-cache"
+
+# ---- 3. KV-enabled node, mid-band KV charge ----------------------------
+# Expect: 200; KV occupancy panel shows ~50% spike during the request.
+- prompt: "medium kv charge"
+  dsl: "node=kv-node kv-cost=512 no-cache"
+
+# ---- 4. KV oversize on KV-enabled node ---------------------------------
+# Expect: 429 "kv oversize"; cllm_tenant_rejections_total{reason=kv_oversize}
+# increments. The single request alone exceeds max_kv_tokens=1024.
+- prompt: "oversize attempt"
+  dsl: "node=kv-node kv-cost=2000 no-cache"
+
+# ---- 5. Same oversize charge on KV-disabled node -----------------------
+# Expect: 200. Backward-compat contract: KV directives are no-ops on
+# nodes with max_kv_tokens=0 (Node.KV == nil).
+- prompt: "kv-disabled node ignores kv-cost"
+  dsl: "node=default kv-cost=2000 no-cache"
+
+# ---- 6. no-kv directive on KV-enabled node -----------------------------
+# Expect: 200; KV gate is skipped entirely (sentinel KVCost=-1). Useful
+# kill-switch when investigating why a request is being rejected.
+- prompt: "no-kv on kv-node"
+  dsl: "node=kv-node no-kv no-cache"
+
+# ---- 7. no-kv beats a later kv-cost (first-wins) -----------------------
+# Expect: 200. The directive class `kv-cost` is shared between no-kv and
+# kv-cost=N; first-wins means a later kv-cost=2000 cannot overturn the
+# no-kv claim and the request is admitted on kv-node.
+- prompt: "first-wins precedence"
+  dsl: "node=kv-node no-kv kv-cost=2000 no-cache"
+
+# ---- 8. KV-light profile -----------------------------------------------
+# Expect: 200; light KV pressure visible on the cllm-overview KV panel.
+- prompt: "kv-light profile sweep"
+  dsl: "node=kv-node profile=kv-light no-cache"
+
+# ---- 9. KV-heavy profile -----------------------------------------------
+# Expect: 200; KV occupancy spikes to ~50% (kv-cost=512 vs cap=1024).
+- prompt: "kv-heavy profile sweep"
+  dsl: "node=kv-node profile=kv-heavy no-cache"
+
+# ---- 10. KV-stress profile (oversize via profile) ----------------------
+# Expect: 429 "kv oversize"; same outcome as test 4 but driven by a
+# named profile bundle to confirm profile expansion reaches the
+# admission path.
+- prompt: "kv-stress profile"
+  dsl: "node=kv-node profile=kv-stress no-cache"
+
+# ---- 11. Routing without pin: least-loaded fans both ways --------------
+# Expect: 200; router.policy=least-loaded picks whichever node has the
+# lower combined_load. With no pin, both nodes can be selected.
+- prompt: "unpinned routing"
+  dsl: "no-cache"

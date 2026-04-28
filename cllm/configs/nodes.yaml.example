@@ -1,0 +1,61 @@
+# Multi-node simulation config (Phase 2.x of multi-node-design.md).
+#
+# At startup, cLLM reads this file (override with CLLM_NODES_FILE) and
+# builds one *node.Node per entry. If this file is absent, the handler
+# falls back to a single synthesized node from flat config — zero behavior
+# change for existing deployments.
+#
+# Conventions:
+#   - Node IDs are arbitrary strings.
+#   - "class" references a key under "classes:" below (templates).
+#   - "upstream" is optional; if set, the node forwards real requests
+#     instead of synthesizing. If unset, the global downstream_url is used.
+#   - Capacity (max_tokens_*) is per-node, not per-class.
+#   - Realism knobs (prefill_*, stream_*) inherit from the class and may
+#     be overridden per-node.
+
+nodes:
+  rtx-2000-0:
+    class: rtx-2000
+    upstream: http://vllm:8000/v1
+    max_tokens_per_second: 30
+    max_tokens_in_flight: 8192
+    max_waiting_requests: 100
+
+  h100-0:
+    class: H100
+    max_tokens_per_second: 96
+    max_tokens_in_flight: 65536
+    max_waiting_requests: 200
+
+  a10-0:
+    class: A10
+    max_tokens_per_second: 32
+    max_tokens_in_flight: 16384
+    max_waiting_requests: 100
+
+  a10-1:
+    class: A10
+    max_tokens_per_second: 32
+    max_tokens_in_flight: 16384
+    max_waiting_requests: 100
+
+classes:
+  rtx-2000:
+    f_load_shape: piecewise_linear
+    max_degradation: 10
+    prefill_rate_multiplier: 4
+
+  H100:
+    f_load_shape: piecewise_linear
+    max_degradation: 15
+    prefill_rate_multiplier: 12
+
+  A10:
+    f_load_shape: piecewise_linear
+    max_degradation: 10
+    prefill_rate_multiplier: 6
+
+router:
+  policy: least-loaded   # class-pinned | least-loaded | chained
+  fallback: any          # any | none

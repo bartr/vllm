@@ -34,6 +34,12 @@ type handlerMetrics struct {
 	requestLifecycleEvents    *prometheus.CounterVec
 	tenantAdmissionTotal      *prometheus.CounterVec
 	tenantRejectionsTotal     *prometheus.CounterVec
+
+	// Per-node admission metrics. Populated only when nodes.yaml is
+	// loaded and routing assigns each request to a specific node.
+	// Phase 2.4 of the multi-node design.
+	nodeAdmissionsTotal *prometheus.CounterVec
+	nodeQueueWait       *prometheus.HistogramVec
 }
 
 const chatCompletionsRouteLabel = "POST /v1/chat/completions"
@@ -134,8 +140,17 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		}, []string{"tenant"}),
 		tenantRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_tenant_rejections_total",
-			Help: "Total chat completion requests rejected at admission, by tenant and reason (tenant_rate, over_capacity).",
+			Help: "Total chat completion requests rejected at admission, by tenant and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize).",
 		}, []string{"tenant", "reason"}),
+		nodeAdmissionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_node_admissions_total",
+			Help: "Total chat completion requests by per-node admission result (admitted, rejected). Emitted only when nodes.yaml is loaded.",
+		}, []string{"node", "class", "result"}),
+		nodeQueueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "cllm_node_queue_wait_seconds",
+			Help:    "Per-node queue wait duration before admission. Emitted only when nodes.yaml is loaded.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"node", "class"}),
 	}
 
 	registry.MustRegister(
@@ -162,6 +177,8 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		metrics.requestLifecycleEvents,
 		metrics.tenantAdmissionTotal,
 		metrics.tenantRejectionsTotal,
+		metrics.nodeAdmissionsTotal,
+		metrics.nodeQueueWait,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cllm_tokens_in_flight",
 			Help: "Current admitted token cost in flight.",
@@ -225,6 +242,7 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			capacity, _ := handler.cacheStats()
 			return float64(capacity)
 		}),
+		nodeFleetCollector{handler: handler},
 	)
 
 	return metrics

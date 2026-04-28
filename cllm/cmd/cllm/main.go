@@ -18,6 +18,7 @@ import (
 	"cllm/internal/buildinfo"
 	"cllm/internal/config"
 	"cllm/internal/httpapi"
+	"cllm/internal/node"
 )
 
 const queueDepthLogInterval = 30 * time.Second
@@ -80,6 +81,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		handler.SetTenants(converted)
 		logger.Info("loaded tenants", "count", len(converted), "names", handler.TenantNames())
+	}
+	if spec, err := node.Load(); err != nil {
+		logger.Error("load nodes file", "err", err)
+		return 1
+	} else if spec != nil {
+		fallback := node.Capacity{
+			MaxTokensInFlight:  int64(cfg.MaxTokensInFlight),
+			MaxTokensPerSecond: cfg.MaxTokensPerSecond,
+			MaxWaitingRequests: cfg.MaxWaitingRequests,
+		}
+		nodes := spec.Build(fallback)
+		handler.SetNodes(nodes, spec.Router.Policy)
+		logger.Info("loaded nodes", "count", len(nodes), "ids", handler.NodeIDs(), "policy", spec.Router.Policy)
 	}
 	if err := loadStartupCache(logger, handler, cfg.CacheFilePath); err != nil {
 		logger.Error("load startup cache", "err", err, "cache_file_path", cfg.CacheFilePath)

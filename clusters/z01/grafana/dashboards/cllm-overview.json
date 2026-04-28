@@ -1066,6 +1066,337 @@
       ],
       "title": "Latency P95 By DSL Directive",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "tokens",
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "normal"}
+          },
+          "decimals": 0,
+          "min": 0,
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 56},
+      "id": 30,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (node, class) (cllm_node_tokens_in_flight)",
+          "legendFormat": "{{node}} ({{class}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet · Tokens In Flight By Node",
+      "description": "Per-node admitted token cost in flight. Empty in single-node deployments. Multi-node fleets light up automatically when nodes.yaml is loaded.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "fill ratio",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 56},
+      "id": 31,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (node, class) (cllm_node_tokens_in_flight) / clamp_min(sum by (node, class) (cllm_node_max_tokens_in_flight), 1)",
+          "legendFormat": "{{node}} ({{class}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet · Fill Ratio By Node",
+      "description": "in_flight / capacity per node. Drives f(load) degradation. Single-node deployments emit no series.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "req/s",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 64},
+      "id": 32,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (node, class, result) (rate(cllm_node_admissions_total[5m]))",
+          "legendFormat": "{{node}} ({{class}}) · {{result}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet · Admission Rate By Node",
+      "description": "Per-node admit/reject rate. Reject series indicates a node hit its budget.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "p95 wait",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 64},
+      "id": 33,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (node, class, le) (rate(cllm_node_queue_wait_seconds_bucket[5m])))",
+          "legendFormat": "{{node}} ({{class}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet · Queue Wait P95 By Node",
+      "description": "Per-node FIFO queue wait p95. A real fleet has independent queues; long waits on one node do not back up siblings.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "kv occupancy",
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 72},
+      "id": 40,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (node, class) (cllm_node_kv_tokens_in_flight) / clamp_min(sum by (node, class) (cllm_node_max_kv_tokens), 1)",
+          "legendFormat": "{{node}} ({{class}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet · KV Occupancy By Node",
+      "description": "kv_tokens_in_flight / max_kv_tokens per node. Empty unless KV modeling is enabled (max_kv_tokens > 0). When this leads cost fill ratio, the workload is memory-bound.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "combined load",
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 72},
+      "id": 41,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (node, class) (cllm_node_combined_load)",
+          "legendFormat": "{{node}} ({{class}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet · Combined Load By Node",
+      "description": "max(cost_load, kv_load * kv_weight) per node. This is the single signal driving f(load) degradation when KV modeling is enabled.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "rejects/s",
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "normal"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 80},
+      "id": 42,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(cllm_tenant_rejections_total{reason=~\"kv_pressure|kv_oversize|over_capacity\"}[5m]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Admission · Rejection Reasons",
+      "description": "Stacked admission-rejection rate. kv_pressure indicates the second admission gate is binding (memory-bound); over_capacity indicates compute is binding; kv_oversize means a single request exceeds the KV ceiling and would never fit.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "load",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 80},
+      "id": 43,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (node) (cllm_node_tokens_in_flight) / clamp_min(sum by (node) (cllm_node_max_tokens_in_flight), 1)",
+          "legendFormat": "{{node}} · cost_load",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (node) (cllm_node_kv_tokens_in_flight) / clamp_min(sum by (node) (cllm_node_max_kv_tokens), 1)",
+          "legendFormat": "{{node}} · kv_load",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Fleet · Cost vs KV Load",
+      "description": "Side-by-side cost_load and kv_load per node. The higher curve is the binding axis and dominates combined_load. Crossover identifies the transition between compute-bound and memory-bound regimes.",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",
@@ -1087,6 +1418,6 @@
   "timezone": "browser",
   "title": "cLLM Overview",
   "uid": "cllm-overview",
-  "version": 2,
+  "version": 4,
   "weekStart": ""
 }

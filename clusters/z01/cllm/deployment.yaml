@@ -26,6 +26,8 @@ spec:
           env:
             - name: CACHE_DOWNSTREAM_URL
               value: http://vllm.vllm.svc.cluster.local:8000
+            - name: CLLM_NODES_FILE
+              value: /etc/cllm/nodes.yaml
           ports:
             - containerPort: 8080
               name: http
@@ -57,7 +59,13 @@ spec:
           volumeMounts:
             - name: storage
               mountPath: /var/lib/cllm
+            - name: nodes-config
+              mountPath: /etc/cllm
+              readOnly: true
       volumes:
         - name: storage
           persistentVolumeClaim:
             claimName: cllm-storage
+        - name: nodes-config
+          configMap:
+            name: cllm-nodes

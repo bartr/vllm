@@ -19,8 +19,6 @@ mkdir -p $HOME/.k9s
 
 {
     echo ""
-    echo "alias ask='go run -C $HOME/vllm/cllm/cmd/ask'"
-    echo "alias benchmark='go run -C $HOME/vllm/cllm/cmd/ask --bench'"
     echo "alias k='kubectl'"
     echo "alias kaf='kubectl apply -f'"
     echo "alias kdelf='kubectl delete -f'"

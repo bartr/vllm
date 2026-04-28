@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cllm/internal/node"
 )
 
 // Tenant resolution is purely advisory: the X-Tenant-Id header is trusted
@@ -30,7 +32,7 @@ type TenantConfig struct {
 }
 
 // tenantBucket is a classic token-bucket rate limiter over int64 cost
-// units. Unlike tokenBudget (which is a semaphore that permits/refunds),
+// units. Unlike node.TokenBudget (which is a semaphore that permits/refunds),
 // tenantBucket gates RATE: tokens refill at `rate` per second up to
 // `burst`. A request reserves cost atomically; if the bucket lacks
 // tokens, tryReserve returns false (no waiting).
@@ -152,7 +154,7 @@ func (b *tenantBucket) snapshot() (rate, burst, tokens float64) {
 type tenantState struct {
 	name      string
 	bucket    *tenantBucket
-	estimator *completionEstimator
+	estimator *node.CompletionEstimator
 }
 
 // tenantRegistry maps tenant IDs (lower-case) to their state. The
@@ -181,7 +183,7 @@ func (r *tenantRegistry) newTenantState(name string, cfg TenantConfig) *tenantSt
 	return &tenantState{
 		name:      name,
 		bucket:    newTenantBucket(cfg.Rate, cfg.Burst),
-		estimator: newCompletionEstimator(r.estimatorMax, r.estimatorMin),
+		estimator: node.NewCompletionEstimator(r.estimatorMax, r.estimatorMin),
 	}
 }
 
@@ -272,9 +274,9 @@ func (r *tenantRegistry) names() []string {
 // tenant's estimator first, falling back to the global estimator, then
 // to max_tokens. This is a thin wrapper around estimateRequestCost that
 // implements the per-tenant fallback chain.
-func estimateRequestCostForTenant(payload chatCompletionRequest, tenant *tenantState, global *completionEstimator) requestCost {
+func estimateRequestCostForTenant(payload chatCompletionRequest, tenant *tenantState, global *node.CompletionEstimator) node.RequestCost {
 	if tenant != nil && tenant.estimator != nil {
-		if _, ok := tenant.estimator.p95(); ok {
+		if _, ok := tenant.estimator.P95(); ok {
 			return estimateRequestCost(payload, tenant.estimator)
 		}
 	}

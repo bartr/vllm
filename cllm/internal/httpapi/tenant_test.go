@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"cllm/internal/node"
 )
 
 func TestTenantBucketDisabledAlwaysAdmits(t *testing.T) {
@@ -137,55 +139,55 @@ func TestTenantRegistryConfigure(t *testing.T) {
 func TestEstimateRequestCostForTenantUsesTenantWhenWarm(t *testing.T) {
 	tenant := &tenantState{
 		name:      "acme",
-		estimator: newCompletionEstimator(100, 5),
+		estimator: node.NewCompletionEstimator(100, 5),
 	}
-	global := newCompletionEstimator(100, 5)
+	global := node.NewCompletionEstimator(100, 5)
 	for i := 0; i < 10; i++ {
-		tenant.estimator.observe(50)
-		global.observe(500)
+		tenant.estimator.Observe(50)
+		global.Observe(500)
 	}
 	payload := chatCompletionRequest{
 		Messages:  []chatCompletionMessage{{Role: "user", Content: "hi"}},
 		MaxTokens: 1000,
 	}
 	cost := estimateRequestCostForTenant(payload, tenant, global)
-	if cost.estimatedTokens != 50 {
-		t.Fatalf("estimated = %d; want 50 (tenant wins)", cost.estimatedTokens)
+	if cost.EstimatedTokens != 50 {
+		t.Fatalf("estimated = %d; want 50 (tenant wins)", cost.EstimatedTokens)
 	}
 }
 
 func TestEstimateRequestCostForTenantFallsBackToGlobal(t *testing.T) {
 	tenant := &tenantState{
 		name:      "newbie",
-		estimator: newCompletionEstimator(100, 50),
+		estimator: node.NewCompletionEstimator(100, 50),
 	}
 	// Tenant cold (no observations); global warm.
-	global := newCompletionEstimator(100, 5)
+	global := node.NewCompletionEstimator(100, 5)
 	for i := 0; i < 10; i++ {
-		global.observe(80)
+		global.Observe(80)
 	}
 	payload := chatCompletionRequest{
 		Messages:  []chatCompletionMessage{{Role: "user", Content: "hi"}},
 		MaxTokens: 1000,
 	}
 	cost := estimateRequestCostForTenant(payload, tenant, global)
-	if cost.estimatedTokens != 80 {
-		t.Fatalf("estimated = %d; want 80 (global fallback)", cost.estimatedTokens)
+	if cost.EstimatedTokens != 80 {
+		t.Fatalf("estimated = %d; want 80 (global fallback)", cost.EstimatedTokens)
 	}
 }
 
 func TestEstimateRequestCostForTenantFallsBackToMaxTokensWhenAllCold(t *testing.T) {
 	tenant := &tenantState{
 		name:      "newbie",
-		estimator: newCompletionEstimator(100, 50),
+		estimator: node.NewCompletionEstimator(100, 50),
 	}
-	global := newCompletionEstimator(100, 50) // cold
+	global := node.NewCompletionEstimator(100, 50) // cold
 	payload := chatCompletionRequest{
 		Messages:  []chatCompletionMessage{{Role: "user", Content: "hi"}},
 		MaxTokens: 200,
 	}
 	cost := estimateRequestCostForTenant(payload, tenant, global)
-	if cost.estimatedTokens != 200 {
-		t.Fatalf("estimated = %d; want 200 (max_tokens cold-start)", cost.estimatedTokens)
+	if cost.EstimatedTokens != 200 {
+		t.Fatalf("estimated = %d; want 200 (max_tokens cold-start)", cost.EstimatedTokens)
 	}
 }
