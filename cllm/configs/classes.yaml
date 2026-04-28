@@ -1,0 +1,74 @@
+# cllm workload-class configuration (Phases 14A + 14B + 14C + 13).
+#
+# Each entry under `classes` declares a workload class — a third
+# dimension orthogonal to tenant (who) and node class (what hardware).
+# Phase 14A labels every admission, rejection, and lifecycle event by
+# `class`. Phase 14B enforces `max_queue_ms`: if a request would wait
+# longer than the cap in the admission FIFO, it is rejected with reason
+# `class_queue_timeout` (refunded to the tenant bucket so the quota is
+# not drained). Phase 14C makes admission promotion priority-weighted:
+# when a slot frees, the highest-effective-priority waiter that fits is
+# promoted, not the strict FIFO head. `priority` (low|medium|high) maps
+# to scores (-1, 0, +1); a 1 s aging tick adds +1 per second waited, so
+# low-priority traffic still drains. Per-request override:
+# `:dsl priority=low|medium|high`. Phase 13 ships phase-aware token
+# allocation: per-class `initial_tokens` / `initial_tps` /
+# `sustained_tps` drive a two-rate replay loop, surface
+# `cllm_phase_transitions_total` and friends, and accept per-request
+# overrides `:dsl initial-tokens=N`, `:dsl initial-tps=N`,
+# `:dsl sustained-tps=N`, plus the `:dsl no-phase` single-token macro
+# that forces single-rate replay.
+#
+# Class names follow the same rules as tenants: case-insensitive,
+# matched against [a-z0-9_-]{1,32}; unknown / missing / invalid values
+# route to the "default" class (always present). The class is selected
+# in this order, first-wins:
+#   1. `:dsl workload-class=NAME` directive in the prompt
+#   2. `X-Workload-Class` HTTP header
+#   3. "default"
+#
+# priority       admission-queue priority tier (Phase 14C). Values:
+#                low | medium | high (mapped to -1, 0, +1). Per-request
+#                override: `:dsl priority=low|medium|high`.
+# max_queue_ms   admission queue wait cap in milliseconds. 0 disables
+#                the cap (request waits the full global queue budget).
+#                Per-request override: `:dsl max-queue-ms=N` (>0 only).
+# initial_tokens phase-A boundary, in output tokens, for phase-aware
+#                token allocation (item 13). 0 disables phase A
+#                (single-rate behavior). Stored in 13.1; consumed by
+#                the cache replay loop in 13.2.
+# initial_tps    rate (tokens/sec) during the responsiveness phase.
+#                0 inherits the handler base TPS for that phase.
+# sustained_tps  rate (tokens/sec) during the sustained phase.
+#                0 inherits the handler base TPS for that phase.
+#
+# Validation: `initial_tokens > 0` requires at least one of
+# `initial_tps` / `sustained_tps` to be set explicitly; otherwise the
+# loader rejects the file (the envelope would emit phase-transition
+# metrics with no observable timing effect).
+
+classes:
+  default:
+    priority: medium
+    max_queue_ms: 0
+
+  # Example: snappy chat traffic. Short queue tolerance, high priority.
+  # Two-phase pacing: 100 tokens at 32 tps, then 16 tps for the tail.
+  # interactive:
+  #   priority: high
+  #   max_queue_ms: 500
+  #   initial_tokens: 100
+  #   initial_tps: 32
+  #   sustained_tps: 16
+
+  # Example: throughput-oriented batch jobs. Long queue tolerance, low priority.
+  # Sustained-only pacing (initial_tokens omitted / 0).
+  # batch:
+  #   priority: low
+  #   max_queue_ms: 10000
+  #   sustained_tps: 32
+
+  # Example: medium-priority offline evaluation runs.
+  # eval:
+  #   priority: medium
+  #   max_queue_ms: 2000

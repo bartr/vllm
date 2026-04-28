@@ -1,7 +1,7 @@
 GO ?= go
 BINARY ?= cllm
 DOCKER ?= docker
-IMAGE ?= cllm:0.8.0
+IMAGE ?= cllm:0.9.0
 K3S ?= sudo k3s
 GOBIN ?= $(shell $(GO) env GOBIN)
 ifeq ($(GOBIN),)

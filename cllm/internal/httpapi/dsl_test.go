@@ -250,7 +250,7 @@ func TestComputePrefillDelayHonorsNoPrefill(t *testing.T) {
 func TestCachedReplayDelayHonorsNoTPS(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(100, 10, 10, 0)
-	if d := handler.cachedReplayDelay(50, replayOverrides{noTPS: true}); d != 0 {
+	if d := handler.cachedReplayDelay(50, 0, replayOverrides{noTPS: true}); d != 0 {
 		t.Fatalf("delay = %s, want 0 with noTPS", d)
 	}
 }
@@ -258,8 +258,8 @@ func TestCachedReplayDelayHonorsNoTPS(t *testing.T) {
 func TestCachedReplayDelayUsesTPSOverride(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(100, 10, 10, 0)
-	withDefault := handler.cachedReplayDelay(100, replayOverrides{})
-	withOverride := handler.cachedReplayDelay(100, replayOverrides{tpsOverride: 1000})
+	withDefault := handler.cachedReplayDelay(100, 0, replayOverrides{})
+	withOverride := handler.cachedReplayDelay(100, 0, replayOverrides{tpsOverride: 1000})
 	if !(withOverride < withDefault) {
 		t.Fatalf("override (%s) should be faster than default (%s)", withOverride, withDefault)
 	}
@@ -271,8 +271,8 @@ func TestComputeStreamSegmentDelayAppliesDelayScale(t *testing.T) {
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	handler.jitterSource = func() float64 { return 0 }
 
-	base, _ := handler.computeStreamSegmentDelay(10, replayOverrides{})
-	scaled, _ := handler.computeStreamSegmentDelay(10, replayOverrides{
+	base, _ := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
+	scaled, _ := handler.computeStreamSegmentDelay(10, 0, replayOverrides{
 		delayScaleFn: func() float64 { return 2.0 },
 	})
 	if scaled != 2*base {

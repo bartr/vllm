@@ -128,6 +128,7 @@ type Handler struct {
 	dslProfiles                               map[string][]string
 	dslDefaultProfile                         string
 	tenants                                   *tenantRegistry
+	classes                                   *classRegistry
 	lastLoggedComputedDegradationMilliPercent atomic.Int64
 }
 
@@ -157,6 +158,7 @@ func NewHandler() *Handler {
 	handler.jitterSource = defaultJitterSource
 	handler.dslProfiles = cloneDSLProfiles(DefaultDSLProfiles)
 	handler.tenants = newTenantRegistry(TenantConfig{}, 256, 50)
+	handler.classes = newClassRegistry()
 	handler.lastLoggedComputedDegradationMilliPercent.Store(-1)
 	handler.metrics = newHandlerMetrics(handler)
 	handler.scheduler.metrics = handler.metrics
@@ -694,6 +696,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Stage 0: resolve tenant. Unknown / missing tenant → "default".
 	tenant := h.resolveRequestTenant(r)
 
+	// Stage 0b: resolve workload class. Phase 14A surfaces the
+	// (tenant × class) cross-product on every admission metric and
+	// lifecycle event without altering admission behavior. DSL
+	// `workload-class=NAME` wins over the X-Workload-Class header;
+	// unknown / malformed values resolve to the "default" class.
+	class := h.resolveRequestClass(r, replayDSL)
+
+	// Phase 13.1: resolve the phase-aware token-allocation envelope
+	// from the class (DSL overrides land in Phase 13.4). Stored on
+	// replayDSL so the replay loop can read it without an extra
+	// argument; a zero-value envelope keeps the legacy single-rate
+	// pacing path active.
+	replayDSL.phase = resolvePhaseEnvelope(class, replayDSL)
+
 	// Cost estimate uses tenant p95 first, then global, then max_tokens.
 	cost := estimateRequestCostForTenant(requestPayload, tenant, h.globalEstimator())
 
@@ -711,6 +727,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		cost.KVCost = replayDSL.kvCostOverride
 	}
 
+	// Phase 14C: stamp admission-queue priority. Resolved order: per-request
+	// `:dsl priority=NAME` (when set) overrides the class default. Names
+	// map to small integers (low=-1, medium=0, high=+1); unknown / empty
+	// names fall back to medium so legacy traffic stays at the FIFO
+	// equivalent. The TokenBudget uses this score (plus aging) when it
+	// promotes a waiter.
+	cost.Priority = priorityScore(replayDSL.priorityOverride)
+	if replayDSL.priorityOverride == "" {
+		cost.Priority = priorityScore(class.config.Priority)
+	}
+
 	// Phase 2.4: route the request to a node and use that node for
 	// admission, per-node metrics, and completion-token observation.
 	// In single-node deployments the routed node is h.nodes[0] which
@@ -726,12 +753,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !tenant.bucket.tryReserve(float64(cost.TotalCost)) {
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
-		h.metrics.observeAdmissionRejection(tenant.name, "tenant_rate")
+		h.metrics.observeAdmissionRejection(tenant.name, class.name, "tenant_rate")
 		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "tenant_rate", "request rejected",
 			"status", http.StatusTooManyRequests,
 			"mode", mode,
 			"max_tokens", requestedMaxTokens,
 			"tenant", tenant.name,
+			"class", class.name,
 			"cost", cost.TotalCost,
 			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
 		)
@@ -741,8 +769,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stage 2: global cost budget (FIFO queue).
-	release, queueWait, ok, rejectReason := h.acquireRequestSlotOnNode(ctx, cost, r.URL.RequestURI(), routedNode)
+	//
+	// Phase 14B: per-class admission queue cap. When the resolved class
+	// (or a `:dsl max-queue-ms=N` override) sets a positive
+	// MaxQueueMs, wrap the admit context with that timeout. If the
+	// budget queue makes the request wait longer than the cap, the
+	// nested context fires DeadlineExceeded and Acquire returns ok=false
+	// — we then reclassify the rejection as "class_queue_timeout"
+	// rather than "over_capacity".
+	effectiveMaxQueueMs := class.config.MaxQueueMs
+	if replayDSL.maxQueueMsOverride > 0 {
+		effectiveMaxQueueMs = replayDSL.maxQueueMsOverride
+	}
+	admitCtx := ctx
+	var cancelAdmit context.CancelFunc
+	if effectiveMaxQueueMs > 0 {
+		admitCtx, cancelAdmit = context.WithTimeout(ctx, time.Duration(effectiveMaxQueueMs)*time.Millisecond)
+		defer cancelAdmit()
+	}
+	release, queueWait, ok, rejectReason := h.acquireRequestSlotOnNode(admitCtx, cost, r.URL.RequestURI(), routedNode)
 	if !ok {
+		// Reclassify deadline-driven rejection as class_queue_timeout
+		// so dashboards can split it from generic over-capacity. The
+		// parent ctx must NOT be done — that would mean the client
+		// disconnected, which is a different failure mode.
+		if effectiveMaxQueueMs > 0 && admitCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			rejectReason = "class_queue_timeout"
+		}
 		// Global gate refused; refund tenant tokens so a rejection here
 		// doesn't permanently drain rate quota.
 		tenant.bucket.refund(float64(cost.TotalCost))
@@ -757,18 +810,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rejectBody = "kv pressure\n"
 		case "kv_oversize":
 			rejectBody = "kv oversize\n"
+		case "class_queue_timeout":
+			rejectBody = "class queue timeout\n"
 		default:
 			rejectBody = "over capacity\n"
 		}
 		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
-		h.metrics.observeAdmissionRejection(tenant.name, rejectReason)
+		h.metrics.observeAdmissionRejection(tenant.name, class.name, rejectReason)
 		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", rejectReason, "request rejected",
 			"status", http.StatusTooManyRequests,
 			"mode", mode,
 			"max_tokens", requestedMaxTokens,
 			"tenant", tenant.name,
+			"class", class.name,
 			"cost", cost.TotalCost,
+			"max_queue_ms", effectiveMaxQueueMs,
+			"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
 			"duration_ms", float64(time.Since(receivedAt))/float64(time.Millisecond),
 		)
 		markCacheHit(w, false)
@@ -777,7 +835,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
-	h.metrics.observeAdmissionAccept(tenant.name, mode)
+	h.metrics.observeAdmissionAccept(tenant.name, class.name, mode)
 	if queueWait > 0 {
 		h.metrics.observeQueueWait(endpoint, queueWait)
 	}
@@ -786,6 +844,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		"mode", mode,
 		"max_tokens", requestedMaxTokens,
 		"tenant", tenant.name,
+		"class", class.name,
 		"cost", cost.TotalCost,
 		"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
 	)
@@ -810,6 +869,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			"mode", mode,
 			"status", status,
 			"tenant", tenant.name,
+			"class", class.name,
 			"queue_wait_ms", float64(queueWait)/float64(time.Millisecond),
 			"duration_ms", float64(time.Since(processingStartedAt))/float64(time.Millisecond),
 			"prompt_tokens", promptTokens,
@@ -886,6 +946,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				includeUsage: requestPayload.StreamOptions != nil && requestPayload.StreamOptions.IncludeUsage,
 				stream:       requestPayload.Stream,
 				overrides:    replayDSL,
+				class:        class.name,
 			}
 			if requestPayload.Stream {
 				h.replayCachedStream(ctx, timedWriter, cachedResponse, replay)
@@ -1864,6 +1925,10 @@ type replayOptions struct {
 	includeUsage bool
 	stream       bool
 	overrides    replayOverrides
+	// class is the resolved workload-class name; used as the Prometheus
+	// label on phase-transition metrics. Empty defaults to
+	// defaultClassName at the call site.
+	class string
 }
 
 func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, opts replayOptions) {
@@ -1886,6 +1951,20 @@ func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	contentEmitted := 0
+	// Phase 13.2: track whether this request has already crossed its
+	// phase boundary so we emit the transition exactly once. The
+	// boundary is checked against contentEmitted *before* each
+	// segment's throttle delay, since that delay paces the gap to
+	// the next token.
+	phaseTransitionEmitted := false
+	phaseStartedAt := time.Now()
+	// Phase 13.3: emit per-stream phase summary metrics on every
+	// exit path (including early return on context cancel). Captured
+	// closures read contentEmitted via a pointer-style read at defer
+	// time so the latest value is observed.
+	defer func() {
+		h.recordPhaseSummary(opts, contentEmitted)
+	}()
 	for _, segment := range segments {
 		kind := classifyStreamSegment(segment.line)
 		switch kind {
@@ -1913,6 +1992,17 @@ func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter,
 		if flusher != nil {
 			flusher.Flush()
 		}
+		// Phase 13.2: if the resolved envelope is two-phase and we
+		// just crossed (or straddled) the boundary, emit a single
+		// phase_transition lifecycle event + counter increment. We
+		// fire after the flush so the transition timestamp aligns
+		// with the wire-observable end of phase A. Streams that
+		// finish before InitialTokens never emit \u2014 absence is the
+		// diagnostic signal for \"interactive request was a short ack.\"
+		if env := opts.overrides.phase; env.active() && !phaseTransitionEmitted && contentEmitted >= env.InitialTokens {
+			phaseTransitionEmitted = true
+			h.emitPhaseTransition(ctx, opts.class, env, contentEmitted, time.Since(phaseStartedAt))
+		}
 		// Throttle AFTER emitting the chunk, not before. This matches the
 		// timing of a real LLM stream: prefill delay covers the time to the
 		// first token (handled separately by simulatePrefillDelay before the
@@ -1921,7 +2011,17 @@ func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter,
 		// content write would double-count prefill and inflate TTFT
 		// proportional to however many tokens happened to be packed into
 		// the first cached SSE chunk.
-		if err := h.throttleStreamSegment(ctx, segment.tokenCount, opts.overrides); err != nil {
+		//
+		// tokensSoFar = contentEmitted - segment.tokenCount picks the
+		// rate appropriate for the *position* of this segment's first
+		// token. A segment that straddles the phase boundary is paced
+		// at the higher (phase-A) rate; sub-segment fractional accounting
+		// is intentionally out of scope (see design \u00a75.2).
+		tokensSoFar := contentEmitted - segment.tokenCount
+		if tokensSoFar < 0 {
+			tokensSoFar = 0
+		}
+		if err := h.throttleStreamSegment(ctx, segment.tokenCount, tokensSoFar, opts.overrides); err != nil {
 			return
 		}
 	}
@@ -2410,11 +2510,54 @@ func (h *Handler) TenantNames() []string {
 	return registry.names()
 }
 
+// resolveRequestClass returns the classState for a request, applying
+// first-wins precedence: a `:dsl workload-class=NAME` directive in the
+// prompt beats the X-Workload-Class header beats "default". Always
+// returns non-nil and a name that is safe to use as a Prometheus label.
+func (h *Handler) resolveRequestClass(r *http.Request, dsl replayOverrides) *classState {
+	h.configMu.RLock()
+	classes := h.classes
+	h.configMu.RUnlock()
+	if classes == nil {
+		return &classState{name: defaultClassName, config: ClassConfig{Priority: "medium"}}
+	}
+	if dsl.workloadClass != "" {
+		return classes.resolve(dsl.workloadClass)
+	}
+	return classes.resolve(r.Header.Get(classHeader))
+}
+
+// SetClasses installs a new workload-class configuration set. The
+// "default" class is always preserved; existing classes matching new
+// names are updated in place; missing classes are removed. Pass
+// nil/empty to reset to default-only.
+func (h *Handler) SetClasses(classes map[string]ClassConfig) {
+	h.configMu.RLock()
+	registry := h.classes
+	h.configMu.RUnlock()
+	if registry == nil {
+		return
+	}
+	registry.configure(classes)
+}
+
+// ClassNames returns a snapshot of registered workload-class names
+// with "default" first.
+func (h *Handler) ClassNames() []string {
+	h.configMu.RLock()
+	registry := h.classes
+	h.configMu.RUnlock()
+	if registry == nil {
+		return nil
+	}
+	return registry.names()
+}
+
 func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int, overrides replayOverrides) error {
 	if tokenCount < 1 {
 		return nil
 	}
-	delay := h.cachedReplayDelay(tokenCount, overrides)
+	delay := h.cachedReplayDelay(tokenCount, 0, overrides)
 	if delay <= 0 {
 		return nil
 	}
@@ -2430,11 +2573,16 @@ func (h *Handler) throttleCachedReplay(ctx context.Context, tokenCount int, over
 	return h.sleep(ctx, delay)
 }
 
-func (h *Handler) throttleStreamSegment(ctx context.Context, tokenCount int, overrides replayOverrides) error {
+// throttleStreamSegment paces one cached SSE segment. tokensSoFar is
+// the count of output tokens emitted *before* this segment, used by
+// phase-aware token allocation (item 13) to pick the responsiveness
+// vs. sustained rate. Pass 0 for callers without phase tracking; an
+// inactive envelope yields legacy single-rate behavior.
+func (h *Handler) throttleStreamSegment(ctx context.Context, tokenCount, tokensSoFar int, overrides replayOverrides) error {
 	if tokenCount < 1 {
 		return nil
 	}
-	delay, stall := h.computeStreamSegmentDelay(tokenCount, overrides)
+	delay, stall := h.computeStreamSegmentDelay(tokenCount, tokensSoFar, overrides)
 	if delay <= 0 {
 		return nil
 	}
@@ -2444,7 +2592,21 @@ func (h *Handler) throttleStreamSegment(ctx context.Context, tokenCount int, ove
 	return h.sleep(ctx, delay)
 }
 
-func (h *Handler) cachedReplayDelay(tokenCount int, overrides replayOverrides) time.Duration {
+// cachedReplayDelay returns the simulated decode duration for one
+// segment of `tokenCount` tokens.
+//
+// tokensSoFar is the count of tokens already emitted by the request
+// before this segment. It selects the active rate when the resolved
+// phaseEnvelope is two-phase (item 13): tokens whose index is below
+// `phase.InitialTokens` are paced at `phase.InitialTPS`; later tokens
+// are paced at `phase.SustainedTPS`. Both rates pass through the same
+// degradation curve as the legacy single rate, so phase-aware pacing
+// composes with cost-based slowdown rather than overriding it.
+//
+// Precedence: a per-request `:dsl tps=N` (overrides.tpsOverride > 0)
+// always wins — it explicitly says "single rate." The phase envelope
+// only fires when no DSL tps override is in effect.
+func (h *Handler) cachedReplayDelay(tokenCount, tokensSoFar int, overrides replayOverrides) time.Duration {
 	if tokenCount < 1 {
 		return 0
 	}
@@ -2458,8 +2620,17 @@ func (h *Handler) cachedReplayDelay(tokenCount int, overrides replayOverrides) t
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
 
-	if overrides.tpsOverride > 0 {
+	switch {
+	case overrides.tpsOverride > 0:
 		baseTokensPerSecond = overrides.tpsOverride
+	case overrides.phase.active():
+		rate := overrides.phase.SustainedTPS
+		if tokensSoFar < overrides.phase.InitialTokens {
+			rate = overrides.phase.InitialTPS
+		}
+		if rate > 0 {
+			baseTokensPerSecond = rate
+		}
 	}
 
 	effectiveTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
@@ -2633,14 +2804,14 @@ func (h *Handler) SetStreamRealism(variabilityPercent, jitterPercent, stallProba
 // returned separately so callers can record metrics distinct from the base
 // pacing delay. Returns (0, 0) when pacing is disabled (rate=0) or when the
 // segment carries no tokens.
-func (h *Handler) computeStreamSegmentDelay(tokenCount int, overrides replayOverrides) (total, stall time.Duration) {
+func (h *Handler) computeStreamSegmentDelay(tokenCount, tokensSoFar int, overrides replayOverrides) (total, stall time.Duration) {
 	if tokenCount < 1 {
 		return 0, 0
 	}
 	if overrides.noTPS {
 		return 0, 0
 	}
-	base := h.cachedReplayDelay(tokenCount, overrides)
+	base := h.cachedReplayDelay(tokenCount, tokensSoFar, overrides)
 	if base <= 0 {
 		return 0, 0
 	}
@@ -2848,12 +3019,15 @@ func (s *requestScheduler) acquireOn(ctx context.Context, cost node.RequestCost,
 		s.metrics.observeLifecycleEvent(chatCompletionEndpoint, "queued", "")
 	}
 
-	queueWait, ok := n.Budget.Acquire(ctx, chargedCost)
+	queueWait, skipped, ok := n.Budget.AcquireWithPriority(ctx, chargedCost, cost.Priority)
 	if !ok {
 		if emitNodeMetric {
 			s.metrics.observeNodeAdmission(n.ID, n.Class, "rejected")
 		}
 		return nil, queueWait, false, "over_capacity"
+	}
+	if skipped && emitNodeMetric {
+		s.metrics.observePrioritySkip(n.ID, n.Class)
 	}
 
 	// KV admission gate. Layered on top of the compute gate per

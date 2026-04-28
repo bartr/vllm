@@ -35,6 +35,7 @@ type replayOverrides struct {
 	tpsOverride          int     // <=0 means use handler value
 	maxTokensOverride    int     // <=0 means use request value
 	kvCostOverride       int     // <=0 means use estimator value
+	maxQueueMsOverride   int     // <=0 means use class.MaxQueueMs (Phase 14B)
 	prefillDurationScale float64 // 1.0 means no change
 
 	// delayScaleFn returns a fresh per-segment multiplicative scale applied
@@ -53,6 +54,37 @@ type replayOverrides struct {
 	// in the same prompt.
 	nodeID    string
 	nodeClass string
+
+	// Workload-class override. Set by `:dsl workload-class=NAME`.
+	// Validated by resolveClassHeader at admission time; an unknown
+	// name resolves to the default class. The directive class
+	// "workload-class" is shared with no other directive (no `no-class`
+	// macro yet) and is first-wins.
+	workloadClass string
+
+	// phase is the resolved phase-aware token-allocation envelope
+	// (system-design §14, item 13). Populated by the handler after
+	// class resolution via resolvePhaseEnvelope. A zero-value envelope
+	// (InitialTokens == 0) keeps legacy single-rate behavior. Phase
+	// 13.1 stores it; Phase 13.2 reads it in cachedReplayDelay.
+	phase phaseEnvelope
+
+	// Per-request DSL overrides for phase-aware allocation (Phase
+	// 13.4). Each field overlays the resolved class envelope. A
+	// presence flag is required for InitialTokens because 0 is a
+	// meaningful override ("skip phase A"). InitialTPS / SustainedTPS
+	// use the >0 convention (rates < 1 are out of range).
+	dslInitialTokensSet      bool
+	dslInitialTokens         int
+	dslInitialTPSOverride    int
+	dslSustainedTPSOverride  int
+	noPhase                  bool
+
+	// priorityOverride, when non-empty, is the lower-cased value of a
+	// per-request `:dsl priority=NAME` directive (Phase 14C). The
+	// handler maps this onto a numeric priority via priorityScore. ""
+	// means inherit from the resolved class.
+	priorityOverride string
 
 	directives []string
 }
@@ -90,14 +122,18 @@ func (o replayOverrides) resolveStallPercent(handler int) int {
 // and B are signed integers; ranges with mixed signs (e.g. `-20:20`) are
 // allowed and lo/hi are normalized so lo<=hi.
 var dslDirectiveKeys = map[string]string{
-	"jitter":      "jitter",
-	"variability": "variability",
-	"stall":       "stall",
-	"prefill":     "prefill",
-	"segment":     "delay",
-	"tps":         "tps",
-	"max-tokens":  "max-tokens",
-	"kv-cost":     "kv-cost",
+	"jitter":         "jitter",
+	"variability":    "variability",
+	"stall":          "stall",
+	"prefill":        "prefill",
+	"segment":        "delay",
+	"tps":            "tps",
+	"max-tokens":     "max-tokens",
+	"kv-cost":        "kv-cost",
+	"max-queue-ms":   "max-queue-ms",
+	"initial-tokens": "phase-boundary",
+	"initial-tps":    "initial-tps",
+	"sustained-tps":  "sustained-tps",
 }
 
 // parseDSL strips :dsl directives from each message's content and returns
@@ -202,6 +238,63 @@ func parseDSLWithDefaultProfile(messages []chatCompletionMessage, draw func() fl
 		}
 	}
 
+	// Pre-scan workload-class pins. Shape: `workload-class=NAME`. NAME is
+	// validated by resolveClassHeader; an empty or syntactically invalid
+	// value is dropped here (resolveClassHeader returns defaultClassName,
+	// which is the implicit no-op). first-wins per the "workload-class"
+	// directive class.
+	for _, m := range messages {
+		_, dslPart, hadMarker := splitAtDSLMarker(m.Content)
+		if !hadMarker {
+			continue
+		}
+		for _, raw := range strings.Fields(dslPart) {
+			tok := strings.ToLower(raw)
+			name, ok := strings.CutPrefix(tok, dslWorkloadClassPrefix)
+			if !ok || seen[dslWorkloadClassKey] {
+				continue
+			}
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			resolved := resolveClassHeader(name)
+			if resolved == defaultClassName && !strings.EqualFold(name, defaultClassName) {
+				// Malformed value: do not record the directive (matches
+				// behavior of out-of-range numeric directives).
+				continue
+			}
+			seen[dslWorkloadClassKey] = true
+			overrides.workloadClass = resolved
+			overrides.directives = append(overrides.directives, dslWorkloadClassPrefix+resolved)
+		}
+	}
+
+	// Pre-scan priority overrides (Phase 14C). Shape:
+	// `:dsl priority=low|medium|high`. Invalid values are dropped
+	// silently to match the rest of the DSL parser. first-wins per the
+	// "priority" directive class.
+	for _, m := range messages {
+		_, dslPart, hadMarker := splitAtDSLMarker(m.Content)
+		if !hadMarker {
+			continue
+		}
+		for _, raw := range strings.Fields(dslPart) {
+			tok := strings.ToLower(raw)
+			name, ok := strings.CutPrefix(tok, dslPriorityPrefix)
+			if !ok || seen[dslPriorityKey] {
+				continue
+			}
+			name = strings.TrimSpace(name)
+			if !validPriorityName(name) {
+				continue
+			}
+			seen[dslPriorityKey] = true
+			overrides.priorityOverride = strings.ToLower(name)
+			overrides.directives = append(overrides.directives, dslPriorityPrefix+overrides.priorityOverride)
+		}
+	}
+
 	out := make([]chatCompletionMessage, len(messages))
 	anyMarker := false
 	for i, m := range messages {
@@ -280,6 +373,15 @@ func applyDSLTokenList(o *replayOverrides, fields []string, seen map[string]bool
 		if strings.HasPrefix(raw, "node=") || strings.HasPrefix(raw, "node-class=") {
 			// Node pins are pre-scanned; ignore here so they aren't
 			// emitted twice or matched by the dslDirectiveKeys path.
+			continue
+		}
+		if strings.HasPrefix(raw, dslWorkloadClassPrefix) {
+			// Workload class is pre-scanned; ignore here for the same
+			// reason (no double-emit, no spurious matches).
+			continue
+		}
+		if strings.HasPrefix(raw, dslPriorityPrefix) {
+			// Priority override is pre-scanned (Phase 14C); ignore here.
 			continue
 		}
 
@@ -422,6 +524,29 @@ func applyDSLBareToken(o *replayOverrides, tok string, seen map[string]bool) boo
 		seen["stall"] = true
 		o.stallFn = func(int) int { return 0 }
 		return true
+	case "no-phase":
+		// no-phase forces single-rate: zero out any DSL phase fields
+		// and claim all three phase directive classes so a later
+		// `initial-tokens=`, `initial-tps=`, or `sustained-tps=` is
+		// silently dropped (first-wins). Mirrors the no-delay /
+		// no-tps / no-kv pattern.
+		applied := false
+		if !seen["phase-boundary"] {
+			seen["phase-boundary"] = true
+			applied = true
+		}
+		if !seen["initial-tps"] {
+			seen["initial-tps"] = true
+			applied = true
+		}
+		if !seen["sustained-tps"] {
+			seen["sustained-tps"] = true
+			applied = true
+		}
+		if applied {
+			o.noPhase = true
+		}
+		return applied
 	}
 	return false
 }
@@ -465,6 +590,35 @@ func applyKeyedDirective(o *replayOverrides, key, val string, seen map[string]bo
 		}
 		seen[class] = true
 		o.kvCostOverride = n
+	case "max-queue-ms":
+		n := resolveDelta(lo, hi, draw)
+		if n < 0 {
+			return "", false
+		}
+		seen[class] = true
+		o.maxQueueMsOverride = n
+	case "initial-tokens":
+		n := resolveDelta(lo, hi, draw)
+		if n < 0 {
+			return "", false
+		}
+		seen[class] = true
+		o.dslInitialTokensSet = true
+		o.dslInitialTokens = n
+	case "initial-tps":
+		n := resolveDelta(lo, hi, draw)
+		if n < 1 || n > 2048 {
+			return "", false
+		}
+		seen[class] = true
+		o.dslInitialTPSOverride = n
+	case "sustained-tps":
+		n := resolveDelta(lo, hi, draw)
+		if n < 1 || n > 2048 {
+			return "", false
+		}
+		seen[class] = true
+		o.dslSustainedTPSOverride = n
 	case "segment":
 		seen[class] = true
 		o.delayScaleFn = func() float64 { return resolveScalar(lo, hi, draw) }
@@ -579,12 +733,16 @@ func dslDirectiveFamily(tok string) string {
 		return tok
 	}
 	switch tok {
-	case "no-cache", "re-cache", "no-delay", "no-tps", "no-prefill", "no-jitter", "no-variability", "no-stall", "no-kv":
+	case "no-cache", "re-cache", "no-delay", "no-tps", "no-prefill", "no-jitter", "no-variability", "no-stall", "no-kv", "no-phase":
 		return tok
 	}
 	if eq := strings.IndexByte(tok, '='); eq > 0 {
 		key := tok[:eq]
 		if _, ok := dslDirectiveKeys[key]; ok {
+			return key
+		}
+		// Non-numeric key=value directive families (Phase 14C).
+		if key == dslPriorityKey {
 			return key
 		}
 	}

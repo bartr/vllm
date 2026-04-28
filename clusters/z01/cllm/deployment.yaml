@@ -21,7 +21,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: cllm
-          image: cllm:0.8.0
+          image: cllm:0.9.0
           imagePullPolicy: Never
           env:
             - name: CACHE_DOWNSTREAM_URL

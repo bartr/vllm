@@ -248,6 +248,14 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 			Realism:     realism,
 			Upstream:    upstream,
 		}
+		// Phase 14C: enable priority-aging on every node budget so a
+		// long-waiting low-priority request eventually outranks fresh
+		// high-priority traffic. The default tick (1000 ms) means a
+		// low-priority waiter that has waited 2+ seconds out-ranks a
+		// fresh high-priority waiter; small enough that aging is
+		// observable in the smoke flow, large enough that it does not
+		// invert ordering for typical sub-second waits.
+		n.Budget.SetAgingStepMs(DefaultPriorityAgingStepMs)
 		if cap.MaxKVTokens > 0 {
 			n.KV = NewKVBudget(cap.MaxKVTokens)
 		}

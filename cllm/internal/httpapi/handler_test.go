@@ -557,7 +557,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 	defer releaseOne()
 
 	expected := time.Duration(float64(2) * float64(time.Second) / calibratedTokensPerSecond(20))
-	if got := handler.cachedReplayDelay(2, replayOverrides{}); got != expected {
+	if got := handler.cachedReplayDelay(2, 0, replayOverrides{}); got != expected {
 		t.Fatalf("delay below threshold = %s, want %s", got, expected)
 	}
 
@@ -569,7 +569,7 @@ func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
 
 	expectedTokensPerSecond := calibratedTokensPerSecond(20) * (1 - ((50.0 / 100.0) * ((0.2 - degradationThreshold) / (1 - degradationThreshold))))
 	expected = time.Duration(float64(2) * float64(time.Second) / expectedTokensPerSecond)
-	if got := handler.cachedReplayDelay(2, replayOverrides{}); got != expected {
+	if got := handler.cachedReplayDelay(2, 0, replayOverrides{}); got != expected {
 		t.Fatalf("delay above threshold = %s, want %s", got, expected)
 	}
 }
@@ -593,7 +593,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 	}()
 
 	expected := time.Duration(float64(10) * float64(time.Second) / calibratedTokensPerSecond(100))
-	if got := handler.cachedReplayDelay(10, replayOverrides{}); got != expected {
+	if got := handler.cachedReplayDelay(10, 0, replayOverrides{}); got != expected {
 		t.Fatalf("delay at threshold = %s, want %s", got, expected)
 	}
 
@@ -605,7 +605,7 @@ func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
 
 	expectedTokensPerSecond := calibratedTokensPerSecond(100) * (1 - ((10.0 / 100.0) * (1.0 / float64(512-51))))
 	expected = time.Duration(float64(10) * float64(time.Second) / expectedTokensPerSecond)
-	if got := handler.cachedReplayDelay(10, replayOverrides{}); got != expected {
+	if got := handler.cachedReplayDelay(10, 0, replayOverrides{}); got != expected {
 		t.Fatalf("delay above whole-request threshold = %s, want %s", got, expected)
 	}
 }
@@ -1003,7 +1003,7 @@ func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
 func TestCachedReplayDelayDisabledWhenTokensPerSecondZero(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(0, 10, 10, 10)
-	if got := handler.cachedReplayDelay(20, replayOverrides{}); got != 0 {
+	if got := handler.cachedReplayDelay(20, 0, replayOverrides{}); got != 0 {
 		t.Fatalf("cached replay delay = %s, want 0", got)
 	}
 }
@@ -1929,11 +1929,11 @@ func TestComputeStreamSegmentDelayBaseline(t *testing.T) {
 	handler.SetRequestProcessingLimits(100, 10, 10, 0)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	handler.jitterSource = func() float64 { return 0 }
-	delay, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	delay, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
 	if stall != 0 {
 		t.Fatalf("stall = %s, want 0", stall)
 	}
-	want := handler.cachedReplayDelay(10, replayOverrides{})
+	want := handler.cachedReplayDelay(10, 0, replayOverrides{})
 	if delay != want {
 		t.Fatalf("delay = %s, want %s", delay, want)
 	}
@@ -1944,7 +1944,7 @@ func TestComputeStreamSegmentDelayDisabledWhenRateZero(t *testing.T) {
 	handler.SetRequestProcessingLimits(0, 10, 10, 0)
 	handler.SetStreamRealism(50, 50, 100, 100, 200)
 	handler.jitterSource = func() float64 { return 1 }
-	delay, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	delay, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
 	if delay != 0 || stall != 0 {
 		t.Fatalf("delay=%s stall=%s, want 0,0 when rate=0", delay, stall)
 	}
@@ -1954,13 +1954,13 @@ func TestComputeStreamSegmentDelayVariabilitySigns(t *testing.T) {
 	handler := NewHandler()
 	handler.SetRequestProcessingLimits(100, 10, 10, 0)
 	handler.SetStreamRealism(50, 0, 0, 0, 0)
-	base := handler.cachedReplayDelay(10, replayOverrides{})
+	base := handler.cachedReplayDelay(10, 0, replayOverrides{})
 
 	handler.jitterSource = func() float64 { return 1 }
-	high, _ := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	high, _ := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
 
 	handler.jitterSource = func() float64 { return -1 }
-	low, _ := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	low, _ := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
 
 	if !(low < base && base < high) {
 		t.Fatalf("expected low(%s) < base(%s) < high(%s)", low, base, high)
@@ -1977,11 +1977,11 @@ func TestComputeStreamSegmentDelayStallAlwaysFires(t *testing.T) {
 		calls++
 		return 0 // (0+1)/2 = 0.5 — but with prob=100 we always stall; r=0.5 -> midpoint
 	}
-	delay, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	delay, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
 	if stall != 100*time.Millisecond {
 		t.Fatalf("stall = %s, want 100ms (min==max)", stall)
 	}
-	base := handler.cachedReplayDelay(10, replayOverrides{})
+	base := handler.cachedReplayDelay(10, 0, replayOverrides{})
 	if delay != base+stall {
 		t.Fatalf("delay = %s, want %s", delay, base+stall)
 	}
@@ -1995,7 +1995,7 @@ func TestComputeStreamSegmentDelayStallNeverFires(t *testing.T) {
 	handler.SetRequestProcessingLimits(100, 10, 10, 0)
 	handler.SetStreamRealism(0, 0, 0, 100, 200)
 	handler.jitterSource = func() float64 { return 1 }
-	_, stall := handler.computeStreamSegmentDelay(10, replayOverrides{})
+	_, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
 	if stall != 0 {
 		t.Fatalf("stall = %s, want 0 when probability=0", stall)
 	}
@@ -2007,7 +2007,7 @@ func TestThrottleStreamSegmentRecordsStallMetric(t *testing.T) {
 	handler.SetStreamRealism(0, 0, 100, 50, 50)
 	handler.jitterSource = func() float64 { return 0 }
 	handler.sleep = func(_ context.Context, _ time.Duration) error { return nil }
-	if err := handler.throttleStreamSegment(context.Background(), 5, replayOverrides{}); err != nil {
+	if err := handler.throttleStreamSegment(context.Background(), 5, 0, replayOverrides{}); err != nil {
 		t.Fatalf("err = %v", err)
 	}
 }

@@ -107,7 +107,30 @@ tenants:
     burst: 500000
 ```
 
-Two Prometheus counters surface tenant decisions: `cllm_tenant_admissions_total{tenant}` and `cllm_tenant_rejections_total{tenant, reason}` where `reason` is `tenant_rate` or `over_capacity`. Lifecycle log events include `tenant` and `cost` fields.
+Two Prometheus counters surface tenant decisions: `cllm_tenant_admissions_total{tenant, class}` and `cllm_tenant_rejections_total{tenant, class, reason}` where `reason` is `tenant_rate` or `over_capacity`. Lifecycle log events include `tenant`, `class`, and `cost` fields.
+
+### Workload classes
+
+Workload class is a third dimension orthogonal to tenant (who) and node class (what hardware), introduced in cllm 0.9.x as **Phase 14A** (labeled dimension only — no behavior change yet). Classes are loaded from `configs/classes.yaml` (override path with `CLLM_CLASSES_FILE`):
+
+```yaml
+classes:
+  default:     { priority: medium, max_queue_ms: 0 }
+  interactive: { priority: high,   max_queue_ms: 500 }
+  batch:       { priority: low,    max_queue_ms: 10000 }
+```
+
+Class is selected per-request, first-wins:
+
+1. `:dsl workload-class=NAME` directive in the prompt (highest precedence).
+2. `X-Workload-Class` HTTP header.
+3. `default`.
+
+Names are matched case-insensitively, validated against `[a-z0-9_-]{1,32}`; unknown / missing / malformed values resolve to `default` so Prometheus label cardinality stays bounded by `configs/classes.yaml`. Phase 14A surfaces `class` on the admission counters and on `started`/`completed`/`rejected` lifecycle events.
+
+**Phase 14B (cllm 0.9.x): `max_queue_ms` enforcement.** When a class sets `max_queue_ms > 0`, requests that would wait longer than the cap in the admission FIFO are rejected with HTTP 429 `class queue timeout` and `cllm_tenant_rejections_total{tenant, class, reason="class_queue_timeout"}` increments. The tenant bucket is refunded, so a deadline-driven rejection does not drain rate quota. Per-request override: `:dsl max-queue-ms=N` (positive integer; wins over the class default). Immediate over-capacity rejections (request larger than the entire budget, or queue full at arrival) keep `reason=over_capacity` — the deadline path only fires after waiting.
+
+**Phase 14C (cllm 0.9.x): priority-weighted dequeue.** When admission frees a slot, the highest-priority waiter that fits is promoted instead of the strict FIFO head. The class `priority` (`low`, `medium`, `high`) maps to numeric scores (`-1`, `0`, `+1`); a per-request `:dsl priority=NAME` directive overrides the class default for that request only. Within a tier, ordering remains arrival-order FIFO. Aging is on by default (1 s tick): for every full second a waiter spends queued, its effective priority gains `+1`, so a low-priority request waiting more than two seconds eventually out-ranks a fresh high-priority arrival — starvation is bounded without an explicit ordering scheduler. The new counter `cllm_admission_priority_skips_total{node, class}` increments whenever the queue promotes a non-head waiter, so dashboards can confirm priority is doing work in production. Strict over-capacity / KV-pressure rejections are unchanged.
 
 Cached responses are replayed at the configured token rate. Once the in-flight token budget rises above `10%` of capacity, cached replay throughput degrades gradually up to the configured maximum. The live computed degradation percentage and effective token rate are exposed through `/config`, logged whenever they change, and included in the periodic queue-depth logs. Live downstream responses still stream through once admitted.
 
@@ -138,6 +161,13 @@ Numeric directives use a uniform `key=value` shape. The `=` is optional — `seg
 | `variability=N` (or `variability=A:B`) | same shape, on rate variability percent |
 | `stall=N` (or `stall=A:B`) | same shape, on stall probability percent |
 | `prefill=N` (or `prefill=A:B`) | scale the prefill duration once by `(1 + N/100)`; use negatives to shrink |
+| `workload-class=NAME` | tag the request with a workload class (Phase 14A: labels admission + lifecycle metrics; see [Workload classes](#workload-classes)). Wins over the `X-Workload-Class` header. |
+| `max-queue-ms=N` (or `max-queue-ms=A:B`) | per-request admission queue wait cap, in milliseconds (Phase 14B). Wins over the resolved class's `max_queue_ms`. Must be `>= 0`; `0` is a no-op. Exceeding the cap returns `429 class queue timeout` and refunds the tenant bucket. |
+| `initial-tokens=N` (or `initial-tokens=A:B`) | phase-aware token allocation (Phase 13.4): size of the prefill-fast band before the stream slows to `sustained-tps`. `0` explicitly disables phase A for this request (single-rate). Wins over the resolved class's `initial_tokens`. |
+| `initial-tps=N` (or `initial-tps=A:B`) | per-request override for the phase A token rate (range `1..2048`). Wins over the resolved class's `initial_tps`. |
+| `sustained-tps=N` (or `sustained-tps=A:B`) | per-request override for the phase B (sustained) token rate (range `1..2048`). Wins over the resolved class's `sustained_tps` and over `tps=N`'s effect on the tail when both are set; if `tps=N` is also present it forces single-rate and the phase fields are ignored. |
+| `no-phase` | force single-rate replay for this request even when the resolved class declares a phase envelope. Claims `initial-tokens`, `initial-tps`, and `sustained-tps` simultaneously, so later per-field directives are first-wins-dropped. Pairs with `cllm_phase_transitions_total` staying flat. |
+| `priority=low\|medium\|high` | per-request admission-queue priority override (Phase 14C). Wins over the resolved class's `priority`. `high` lifts the request above same-cost queued waiters at lower tiers; `low` defers to higher tiers but is protected from starvation by the 1 s aging tick. Invalid values are dropped silently. |
 
 Random ranges are drawn fresh per segment for `segment=A:B`; once per request for `jitter`, `variability`, `stall`, `prefill`, `tps`, and `max-tokens`. Unknown or malformed tokens are silently ignored. A bare keyword (e.g. `jitter`) followed by a non-numeric next token is treated as a no-op and the next token is processed independently. Each parsed directive emits a `dsl_applied` lifecycle event and increments `cllm_dsl_directives_total{directive}`.
 
@@ -288,7 +318,7 @@ For `POST /v1/chat/completions`, structured lifecycle events are emitted as logs
 make build
 ```
 
-This builds the local container image `cllm:0.8.0`.
+This builds the local container image `cllm:0.9.0`.
 
 To build and import that image into the local k3s container runtime:
 
@@ -299,8 +329,8 @@ make deploy
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.8.0 .
-docker save cllm:0.8.0 | sudo k3s ctr images import -
+docker build -t cllm:0.9.0 .
+docker save cllm:0.9.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -312,8 +342,8 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.8.0 .
-docker run --rm -p 8080:8080 cllm:0.8.0
+docker build -t cllm:0.9.0 .
+docker run --rm -p 8080:8080 cllm:0.9.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
@@ -326,7 +356,7 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.8.0`
+- deploy `cllm:0.9.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
 - mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path

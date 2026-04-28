@@ -40,6 +40,35 @@ type handlerMetrics struct {
 	// Phase 2.4 of the multi-node design.
 	nodeAdmissionsTotal *prometheus.CounterVec
 	nodeQueueWait       *prometheus.HistogramVec
+
+	// Phase-aware token allocation (item 13). Counts streams that
+	// crossed a phase boundary, labelled by class and the (from, to)
+	// pair. Today only (phase_a, phase_b) fires; future expansions
+	// (e.g. an explicit cool-down phase C) reuse the same counter.
+	phaseTransitionsTotal *prometheus.CounterVec
+	// Phase-A and phase-B tokens emitted, per class. The split lets
+	// the dashboard render the responsiveness vs. sustained mix as a
+	// stacked rate.
+	phaseATokensTotal *prometheus.CounterVec
+	phaseBTokensTotal *prometheus.CounterVec
+	// Most recently observed effective phase-A and phase-B TPS, per
+	// class. Each cached-replay completion sets the value to its own
+	// computed rate; this is a sample, not a moving average. Useful
+	// as a sanity check that the configured rate is actually in force.
+	phaseInitialTPSEffective   *prometheus.GaugeVec
+	phaseSustainedTPSEffective *prometheus.GaugeVec
+	// Reclaim counter: (initial_tps - sustained_tps) * tokens_in_phase_b.
+	// Always >= 0 because rates with sustained >= initial are degenerate
+	// (legacy single-rate, no reclaim). The headline efficiency metric
+	// for the design.
+	phaseReclaimTokenSecondsTotal *prometheus.CounterVec
+
+	// Priority-skips counter: how often the admission queue promoted a
+	// non-head waiter, by node + class (Phase 14C). A zero series after
+	// load means priority did not affect ordering (everything in the
+	// queue had matching priority). Emitted only on the multi-node
+	// admission path.
+	prioritySkipsTotal *prometheus.CounterVec
 }
 
 const chatCompletionsRouteLabel = "POST /v1/chat/completions"
@@ -136,12 +165,12 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		}, []string{"endpoint", "event", "outcome"}),
 		tenantAdmissionTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_tenant_admissions_total",
-			Help: "Total chat completion requests admitted past both tenant rate limit and global cost budget, by tenant.",
-		}, []string{"tenant"}),
+			Help: "Total chat completion requests admitted past both tenant rate limit and global cost budget, by tenant and workload class.",
+		}, []string{"tenant", "class"}),
 		tenantRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_tenant_rejections_total",
-			Help: "Total chat completion requests rejected at admission, by tenant and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize).",
-		}, []string{"tenant", "reason"}),
+			Help: "Total chat completion requests rejected at admission, by tenant, workload class, and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize, class_queue_timeout).",
+		}, []string{"tenant", "class", "reason"}),
 		nodeAdmissionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_node_admissions_total",
 			Help: "Total chat completion requests by per-node admission result (admitted, rejected). Emitted only when nodes.yaml is loaded.",
@@ -150,6 +179,34 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			Name:    "cllm_node_queue_wait_seconds",
 			Help:    "Per-node queue wait duration before admission. Emitted only when nodes.yaml is loaded.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"node", "class"}),
+		phaseTransitionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_phase_transitions_total",
+			Help: "Total cache-replay streams that crossed a phase-aware token-allocation boundary, by class and (from, to) phase pair.",
+		}, []string{"class", "from", "to"}),
+		phaseATokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_phase_a_tokens_total",
+			Help: "Total tokens emitted under phase-A (responsiveness) pacing, by class. Phase-aware token allocation (item 13).",
+		}, []string{"class"}),
+		phaseBTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_phase_b_tokens_total",
+			Help: "Total tokens emitted under phase-B (sustained) pacing, by class. Phase-aware token allocation (item 13).",
+		}, []string{"class"}),
+		phaseInitialTPSEffective: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cllm_class_initial_tps_effective",
+			Help: "Most recently observed effective phase-A tokens-per-second for the class, after degradation. Phase-aware token allocation (item 13).",
+		}, []string{"class"}),
+		phaseSustainedTPSEffective: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cllm_class_sustained_tps_effective",
+			Help: "Most recently observed effective phase-B tokens-per-second for the class, after degradation. Phase-aware token allocation (item 13).",
+		}, []string{"class"}),
+		phaseReclaimTokenSecondsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_class_reclaim_token_seconds_total",
+			Help: "Throughput reclaimed by phase-aware token allocation, per class: sum over completed streams of (initial_tps - sustained_tps) * tokens_in_phase_b. Always >= 0.",
+		}, []string{"class"}),
+		prioritySkipsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cllm_admission_priority_skips_total",
+			Help: "Total times the admission queue promoted a waiter that was not at the FIFO head, attributed by routed node and workload class. Phase 14C priority-weighted dequeue (or priority-aging) caused the reorder.",
 		}, []string{"node", "class"}),
 	}
 
@@ -179,6 +236,13 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		metrics.tenantRejectionsTotal,
 		metrics.nodeAdmissionsTotal,
 		metrics.nodeQueueWait,
+		metrics.phaseTransitionsTotal,
+		metrics.phaseATokensTotal,
+		metrics.phaseBTokensTotal,
+		metrics.phaseInitialTPSEffective,
+		metrics.phaseSustainedTPSEffective,
+		metrics.phaseReclaimTokenSecondsTotal,
+		metrics.prioritySkipsTotal,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cllm_tokens_in_flight",
 			Help: "Current admitted token cost in flight.",
@@ -354,18 +418,73 @@ func (m *handlerMetrics) observeLifecycleEvent(endpoint, event, outcome string) 
 	m.requestLifecycleEvents.WithLabelValues(endpoint, event, outcome).Inc()
 }
 
-func (m *handlerMetrics) observeAdmissionAccept(tenant, _ string) {
+func (m *handlerMetrics) observeAdmissionAccept(tenant, class, _ string) {
 	if m == nil || m.tenantAdmissionTotal == nil {
 		return
 	}
-	m.tenantAdmissionTotal.WithLabelValues(tenant).Inc()
+	m.tenantAdmissionTotal.WithLabelValues(tenant, class).Inc()
 }
 
-func (m *handlerMetrics) observeAdmissionRejection(tenant, reason string) {
+func (m *handlerMetrics) observeAdmissionRejection(tenant, class, reason string) {
 	if m == nil || m.tenantRejectionsTotal == nil {
 		return
 	}
-	m.tenantRejectionsTotal.WithLabelValues(tenant, reason).Inc()
+	m.tenantRejectionsTotal.WithLabelValues(tenant, class, reason).Inc()
+}
+
+// observePhaseTransition increments the phase-transition counter. The
+// `from` and `to` labels are constants today ("phase_a", "phase_b") but
+// the counter is shaped to accept future phases without a metric
+// migration.
+func (m *handlerMetrics) observePhaseTransition(class, from, to string) {
+	if m == nil || m.phaseTransitionsTotal == nil {
+		return
+	}
+	m.phaseTransitionsTotal.WithLabelValues(class, from, to).Inc()
+}
+
+// observePhaseTokens adds tokens emitted in phase A and phase B.
+// Either count may be 0 (e.g. a request that never crossed the
+// boundary contributes phaseB == 0).
+func (m *handlerMetrics) observePhaseTokens(class string, phaseA, phaseB int) {
+	if m == nil {
+		return
+	}
+	if phaseA > 0 && m.phaseATokensTotal != nil {
+		m.phaseATokensTotal.WithLabelValues(class).Add(float64(phaseA))
+	}
+	if phaseB > 0 && m.phaseBTokensTotal != nil {
+		m.phaseBTokensTotal.WithLabelValues(class).Add(float64(phaseB))
+	}
+}
+
+// observePhaseEffectiveTPS records the effective phase-A and phase-B
+// rates seen on the most recent completed stream for the class. Pass
+// 0 to skip an axis (e.g. a request that never reached phase B).
+func (m *handlerMetrics) observePhaseEffectiveTPS(class string, initialTPS, sustainedTPS float64) {
+	if m == nil {
+		return
+	}
+	if initialTPS > 0 && m.phaseInitialTPSEffective != nil {
+		m.phaseInitialTPSEffective.WithLabelValues(class).Set(initialTPS)
+	}
+	if sustainedTPS > 0 && m.phaseSustainedTPSEffective != nil {
+		m.phaseSustainedTPSEffective.WithLabelValues(class).Set(sustainedTPS)
+	}
+}
+
+// observePhaseReclaim adds the reclaimed token-seconds for one
+// completed stream. Caller is responsible for clamping non-positive
+// reclaim (initial_tps <= sustained_tps) to zero so the counter never
+// goes backwards.
+func (m *handlerMetrics) observePhaseReclaim(class string, tokenSeconds float64) {
+	if m == nil || m.phaseReclaimTokenSecondsTotal == nil {
+		return
+	}
+	if tokenSeconds <= 0 {
+		return
+	}
+	m.phaseReclaimTokenSecondsTotal.WithLabelValues(class).Add(tokenSeconds)
 }
 
 func (m *handlerMetrics) observeJob(endpoint, result, source, _ string, duration time.Duration) {

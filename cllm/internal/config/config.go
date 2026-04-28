@@ -87,6 +87,7 @@ type Config struct {
 	DSLProfiles           map[string][]string
 	DSLProfile            string
 	Tenants               map[string]TenantSpec
+	Classes               map[string]ClassSpec
 	ShutdownTimeout       time.Duration
 }
 
@@ -122,6 +123,11 @@ func LoadFromArgs(args []string) (Config, error) {
 		return Config{}, err
 	}
 
+	classes, err := loadClasses()
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		Addr:                  net.JoinHostPort("", strconv.Itoa(portNumber)),
 		CacheSize:             runtimeOptions.cacheSize,
@@ -148,6 +154,7 @@ func LoadFromArgs(args []string) (Config, error) {
 		DSLProfiles:           dslProfiles,
 		DSLProfile:            runtimeOptions.dslProfile,
 		Tenants:               tenants,
+		Classes:               classes,
 		ShutdownTimeout:       shutdownTimeout,
 	}, nil
 }

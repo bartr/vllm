@@ -22,6 +22,15 @@ type RequestCost struct {
 	// override it without changing the call sites that construct
 	// RequestCost via EstimateCost.
 	KVCost int
+
+	// Priority is the admission-queue priority for this request
+	// (Phase 14C). Higher = preferred when capacity frees up. Defaults
+	// to 0 (FIFO equivalent); the handler maps the resolved class /
+	// `:dsl priority=` directive to a small integer (low=-1, medium=0,
+	// high=+1) and stores it here just before calling
+	// scheduler.AcquireOnNode. Pre-Phase-14C call sites that construct
+	// RequestCost{} directly stay at 0 \u2014 byte-for-byte FIFO behavior.
+	Priority int
 }
 
 // EstimateCost computes the admission cost from the primitive inputs.

@@ -1340,7 +1340,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (reason) (rate(cllm_tenant_rejections_total{reason=~\"kv_pressure|kv_oversize|over_capacity\"}[5m]))",
+          "expr": "sum by (reason) (rate(cllm_tenant_rejections_total{reason=~\"kv_pressure|kv_oversize|over_capacity|class_queue_timeout\"}[5m]))",
           "legendFormat": "{{reason}}",
           "range": true,
           "refId": "A"
@@ -1397,6 +1397,176 @@
       "title": "Fleet · Cost vs KV Load",
       "description": "Side-by-side cost_load and kv_load per node. The higher curve is the binding axis and dominates combined_load. Crossover identifies the transition between compute-bound and memory-bound regimes.",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "transitions/s",
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 3,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 88},
+      "id": 44,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (class) (rate(cllm_phase_transitions_total[5m]))",
+          "legendFormat": "{{class}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Phase · Transition Rate By Class",
+      "description": "Rate of streams crossing the phase-A → phase-B boundary, per workload class. A class without an active envelope contributes nothing. Useful for spotting classes whose envelopes never fire (boundary too high) or always fire (boundary too low).",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "tokens/s",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "normal"}
+          },
+          "decimals": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 88},
+      "id": 45,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (class) (rate(cllm_phase_a_tokens_total[5m]))",
+          "legendFormat": "{{class}} · phase A",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (class) (rate(cllm_phase_b_tokens_total[5m]))",
+          "legendFormat": "{{class}} · phase B",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Phase · Token Mix By Class",
+      "description": "Stacked phase-A vs. phase-B token rate. The top band shows how much of each class's stream is paced at the responsiveness rate vs. the sustained rate.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "tokens/s",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 96},
+      "id": 46,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "cllm_class_initial_tps_effective",
+          "legendFormat": "{{class}} · phase A",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "cllm_class_sustained_tps_effective",
+          "legendFormat": "{{class}} · phase B",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Phase · Effective TPS By Class",
+      "description": "Most recently observed effective TPS per class and phase, after the cost-degradation curve. Tracks the ratio between phase A and phase B even when global f(load) degrades the absolute rate.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "token-seconds/s",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "decimals": 2,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 96},
+      "id": 47,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (class) (rate(cllm_class_reclaim_token_seconds_total[5m]))",
+          "legendFormat": "{{class}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Phase · Reclaimed Token-Seconds By Class",
+      "description": "Headline efficiency metric for phase-aware allocation: (initial_tps - sustained_tps) × tokens_in_phase_b accumulated across completed streams. Positive area means interactive traffic gave throughput back to the fleet.",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",
@@ -1418,6 +1588,6 @@
   "timezone": "browser",
   "title": "cLLM Overview",
   "uid": "cllm-overview",
-  "version": 4,
+  "version": 5,
   "weekStart": ""
 }

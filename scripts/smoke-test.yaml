@@ -73,3 +73,77 @@
 # lower combined_load. With no pin, both nodes can be selected.
 - prompt: "unpinned routing"
   dsl: "no-cache"
+
+# ---- 12. Workload class via DSL (Phase 14A) ----------------------------
+# Expect: 200; cllm_tenant_admissions_total{class="interactive"}
+# increments. Class is purely a label in 14A — admission behavior is
+# unchanged. Unknown class names route to the "default" label. Pinned to
+# `node=default` so the post-prompt-14 inflated kv-node estimator does not
+# bounce the request with kv_oversize — that admission gate is exercised
+# explicitly by prompts 4 and 10.
+- prompt: "workload-class via DSL"
+  dsl: "node=default workload-class=interactive no-cache"
+
+# ---- 13. Workload class falls back to default when name not registered -
+# Expect: 200; cllm_tenant_admissions_total{class="default"} increments.
+# Names that pass the syntax check but are not registered in
+# configs/classes.yaml resolve to the "default" class label so dashboard
+# cardinality stays bounded by config.
+- prompt: "workload-class fallback to default"
+  dsl: "node=default workload-class=does-not-exist no-cache"
+
+# ---- 14. Class queue timeout via DSL override (Phase 14B) --------------
+# Expect: 200 in isolation (no contention to time out against). Under
+# load this directive caps the admission queue wait at 50 ms; if the
+# request would wait longer it gets 429 "class queue timeout" and
+# cllm_tenant_rejections_total{class,reason="class_queue_timeout"}
+# increments. Useful for the noisy-neighbor demo: pin interactive
+# traffic to a tight deadline while a batch flood saturates the budget.
+- prompt: "max-queue-ms via DSL"
+  dsl: "node=default max-queue-ms=50 no-cache"
+
+# ---- 15. Phase-aware token allocation via DSL (Phase 13.4) -------------
+# Expect: 200; the stream emits ~20 tokens of phase A at ~200 tps then
+# slows to ~20 tps for the tail. cllm_phase_transitions_total{class=
+# default,from=phase_a,to=phase_b} increments by 1, and the
+# `Phase · Token Mix By Class` panel shows both bands. `no-cache` pulls
+# fresh content so the replay path actually paces the response.
+- prompt: "phase-aware allocation via DSL"
+  dsl: "node=default initial-tokens=20 initial-tps=200 sustained-tps=20 no-cache"
+
+# ---- 16. Class-resolved phase envelope ---------------------------------
+# Expect: 200; uses the `interactive` class envelope (when configured in
+# configs/classes.yaml). This is the production shape of the directive:
+# operators tune the class once and clients never have to know the
+# rates. With the shipped commented-out example uncommented in
+# classes.yaml (initial_tokens=100, initial_tps=32, sustained_tps=16),
+# a transition fires after 100 tokens.
+- prompt: "phase-aware via class"
+  dsl: "node=default workload-class=interactive no-cache"
+
+# ---- 17. Force single-rate with no-phase -------------------------------
+# Expect: 200; baseline comparison against prompt 15. Even if the
+# resolved class declares an envelope, `no-phase` zeros it out for this
+# request. cllm_phase_transitions_total stays unchanged.
+- prompt: "no-phase forces single-rate"
+  dsl: "node=default workload-class=interactive no-phase no-cache"
+
+# ---- 18. Priority override via DSL (Phase 14C) -------------------------
+# Expect: 200 in isolation. Under load this directive lifts the request
+# above same-cost requests at lower priority in the admission queue.
+# `cllm_admission_priority_skips_total{node,class}` increments whenever
+# the queue promotes a non-head waiter (i.e., priority actually bumped
+# something out of the way). Use against a saturated default node to see
+# the skip counter move.
+- prompt: "priority=high via DSL"
+  dsl: "node=default priority=high no-cache"
+
+# ---- 19. Low priority demonstrates aging ------------------------------
+# Expect: 200. With the default 1 s aging step, a low-priority waiter
+# stuck behind sustained high-priority traffic eventually out-ranks the
+# fresh high-priority arrivals. Useful for the noisy-neighbor demo:
+# customer-b runs `priority=low` batches under sustained customer-a
+# `priority=high` traffic and still drains via aging without explicit
+# scheduler intervention.
+- prompt: "priority=low via DSL"
+  dsl: "node=default priority=low no-cache"

@@ -82,6 +82,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		handler.SetTenants(converted)
 		logger.Info("loaded tenants", "count", len(converted), "names", handler.TenantNames())
 	}
+	if len(cfg.Classes) > 0 {
+		converted := make(map[string]httpapi.ClassConfig, len(cfg.Classes))
+		for name, spec := range cfg.Classes {
+			converted[name] = httpapi.ClassConfig{
+				Priority:      spec.Priority,
+				MaxQueueMs:    spec.MaxQueueMs,
+				InitialTokens: spec.InitialTokens,
+				InitialTPS:    spec.InitialTPS,
+				SustainedTPS:  spec.SustainedTPS,
+			}
+		}
+		handler.SetClasses(converted)
+		logger.Info("loaded workload classes", "count", len(converted), "names", handler.ClassNames())
+	}
 	if spec, err := node.Load(); err != nil {
 		logger.Error("load nodes file", "err", err)
 		return 1

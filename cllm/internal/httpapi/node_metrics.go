@@ -105,3 +105,14 @@ func (m *handlerMetrics) observeNodeQueueWait(nodeID, class string, d time.Durat
 	}
 	m.nodeQueueWait.WithLabelValues(nodeID, class).Observe(d.Seconds())
 }
+
+// observePrioritySkip increments the per-node priority-skip counter when
+// the admission queue promoted a waiter past the FIFO head (Phase 14C).
+// Class is the routed node's class, not the resolved workload class \u2014
+// kept consistent with the rest of the per-node metric family.
+func (m *handlerMetrics) observePrioritySkip(nodeID, class string) {
+	if m == nil || m.prioritySkipsTotal == nil {
+		return
+	}
+	m.prioritySkipsTotal.WithLabelValues(nodeID, class).Inc()
+}
