@@ -18,7 +18,7 @@ description: cllm Go server architecture invariants and code conventions. Loaded
 - DSL parser: presence flag (e.g. `dslInitialTokensSet`) is required when 0 is a meaningful override. Rate-shaped fields (`>0 == set`) don't need a flag because parser validation rejects <1.
 - New `kv_estimator`-style features are gated on `MaxKVTokens > 0` in `loader.go`. Don't allocate the estimator unconditionally.
 - New `cllm_*_total{class,...}` counters MUST add a case in `dslDirectiveFamily` if the directive is non-numeric, otherwise it buckets as `"other"`.
-- Smoke-fixture rule: prompts that don't specifically exercise the KV gate must pin `node=default` (KV-disabled). Unpinned routing + estimator inflation on `kv-node` causes spurious `kv_oversize` rejections.
+- Smoke-fixture rule: prompts that don't specifically exercise the KV gate must pin `node=cllm` (KV-disabled). Unpinned routing + estimator inflation on `kv-node` causes spurious `kv_oversize` rejections.
 - Streaming: every `http.ResponseWriter` wrapper must implement its own `Flush()` forwarding to the underlying writer. Type assertions don't traverse embedded fields. See `loggingResponseWriter.Flush()` in `cllm/internal/httpapi/handler.go`.
 - Tests: never re-pin via `Acquire` between releases in budget tests. Each `Release(1)` immediately promotes the next waiter inside `promoteLocked` while holding the lock; calling `Acquire` afterward queues behind remaining waiters and deadlocks.
 

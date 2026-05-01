@@ -58,9 +58,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
-	handler.SetRequestProcessingLimits(cfg.MaxTokensInFlight, cfg.MaxWaitingRequests)
-	handler.SetPrefillSimulation(cfg.PrefillRateMultiplier, cfg.PrefillBaseOverheadMs, cfg.PrefillJitterPercent, cfg.PrefillMaxMs)
-	handler.SetStreamRealism(cfg.StreamVariabilityPercent, cfg.StreamJitterPercent, cfg.StreamStallProbabilityPercent, cfg.StreamStallMinMs, cfg.StreamStallMaxMs)
 	if cfg.DSLProfiles != nil {
 		handler.SetDSLProfiles(cfg.DSLProfiles)
 		logger.Info("loaded DSL profiles", "count", len(cfg.DSLProfiles))
@@ -101,11 +98,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		logger.Error("load nodes file", "err", err)
 		return 1
 	} else if spec != nil {
-		fallback := node.Capacity{
-			MaxTokensInFlight:  int64(cfg.MaxTokensInFlight),
-			MaxWaitingRequests: cfg.MaxWaitingRequests,
-		}
-		nodes := spec.Build(fallback)
+		nodes := spec.Build()
 		handler.SetNodes(nodes, spec.Router.Policy)
 		logger.Info("loaded nodes", "count", len(nodes), "ids", handler.NodeIDs(), "policy", spec.Router.Policy)
 	}
@@ -134,15 +127,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"max_waiting_requests", processingStats.MaxWaitingRequests,
 			"waiting_requests", processingStats.WaitingRequests,
 			"temperature", cfg.Temperature,
-			"prefill_rate_multiplier", cfg.PrefillRateMultiplier,
-			"prefill_base_overhead_ms", cfg.PrefillBaseOverheadMs,
-			"prefill_jitter_percent", cfg.PrefillJitterPercent,
-			"prefill_max_ms", cfg.PrefillMaxMs,
-			"stream_variability_percent", cfg.StreamVariabilityPercent,
-			"stream_jitter_percent", cfg.StreamJitterPercent,
-			"stream_stall_probability_percent", cfg.StreamStallProbabilityPercent,
-			"stream_stall_min_ms", cfg.StreamStallMinMs,
-			"stream_stall_max_ms", cfg.StreamStallMaxMs,
 		)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

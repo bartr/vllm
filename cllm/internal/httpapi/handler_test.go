@@ -587,7 +587,7 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_in_flight=64&max_waiting_requests=96&downstream_token=secret-token", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&downstream_token=secret-token", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -614,12 +614,6 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	}
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
-	}
-	if got.MaxTokensInFlight != 64 {
-		t.Fatalf("max tokens in flight = %d, want %d", got.MaxTokensInFlight, 64)
-	}
-	if got.MaxWaitingRequests != 96 {
-		t.Fatalf("max waiting requests = %d, want %d", got.MaxWaitingRequests, 96)
 	}
 }
 
@@ -699,10 +693,6 @@ func TestConfigEndpointRejectsInvalidQueueValues(t *testing.T) {
 		path string
 		want string
 	}{
-		{name: "tokens-in-flight below min", path: "/config?max-tokens-in-flight=0", want: `max-tokens-in-flight must be between 1 and 2000000`},
-		{name: "tokens-in-flight above max", path: "/config?max-tokens-in-flight=2000001", want: `max-tokens-in-flight must be between 1 and 2000000`},
-		{name: "waiting below min", path: "/config?max-waiting-requests=-1", want: `max-waiting-requests must be between 0 and 1024`},
-		{name: "waiting above max", path: "/config?max-waiting-requests=1025", want: `max-waiting-requests must be between 0 and 1024`},
 		{name: "unknown dsl-profile", path: "/config?dsl-profile=does-not-exist", want: `unknown dsl-profile "does-not-exist"`},
 	}
 
@@ -851,32 +841,7 @@ func TestSchedulerLogsAdmissionAndCompletionLifecycle(t *testing.T) {
 }
 
 func TestConfigEndpointLogsQueueLimitChanges(t *testing.T) {
-	var logBuffer bytes.Buffer
-	originalLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
-	defer slog.SetDefault(originalLogger)
-
-	handler := NewHandler().Routes()
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?max-tokens-in-flight=64&max-waiting-requests=96", nil))
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
-	}
-	logOutput := logBuffer.String()
-	for _, want := range []string{
-		`msg="request queue limits updated"`,
-		`previous_max_tokens_in_flight=200000`,
-		`max_tokens_in_flight=64`,
-		`previous_max_waiting_requests=1024`,
-		`max_waiting_requests=96`,
-		`tokens_in_flight=0`,
-		`waiting_requests=0`,
-	} {
-		if !strings.Contains(logOutput, want) {
-			t.Fatalf("log output %q does not contain %q", logOutput, want)
-		}
-	}
+	t.Skip("Option 2: --max-tokens-in-flight / --max-waiting-requests retired from /config POST surface; per-node capacity is configured via nodes.yaml")
 }
 
 func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
@@ -1009,8 +974,6 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
-	t.Setenv("CACHE_MAX_TOKENS_IN_FLIGHT", "64")
-	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
 	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
 	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "secret-token")
@@ -1025,12 +988,6 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	}
 	if cfg.MaxTokens != 700 {
 		t.Fatalf("MaxTokens = %d, want 700", cfg.MaxTokens)
-	}
-	if cfg.MaxTokensInFlight != 64 {
-		t.Fatalf("MaxTokensInFlight = %d, want 64", cfg.MaxTokensInFlight)
-	}
-	if cfg.MaxWaitingRequests != 95 {
-		t.Fatalf("MaxWaitingRequests = %d, want 95", cfg.MaxWaitingRequests)
 	}
 	if cfg.Temperature != 0.7 {
 		t.Fatalf("Temperature = %v, want 0.7", cfg.Temperature)
@@ -1049,14 +1006,12 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--max-tokens-in-flight", "16", "--max-waiting-requests", "31", "--temperature", "0.9"}
+	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--temperature", "0.9"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
-	t.Setenv("CACHE_MAX_TOKENS_IN_FLIGHT", "64")
-	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
 	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
 	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "env-token")
@@ -1071,12 +1026,6 @@ func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	}
 	if cfg.MaxTokens != 900 {
 		t.Fatalf("MaxTokens = %d, want 900", cfg.MaxTokens)
-	}
-	if cfg.MaxTokensInFlight != 16 {
-		t.Fatalf("MaxTokensInFlight = %d, want 16", cfg.MaxTokensInFlight)
-	}
-	if cfg.MaxWaitingRequests != 31 {
-		t.Fatalf("MaxWaitingRequests = %d, want 31", cfg.MaxWaitingRequests)
 	}
 	if cfg.Temperature != 0.9 {
 		t.Fatalf("Temperature = %v, want 0.9", cfg.Temperature)
@@ -1102,10 +1051,6 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 	}{
 		{name: "invalid env max tokens", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
 		{name: "env max tokens out of range", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
-		{name: "flag max tokens in flight too low", args: []string{"cllm", "--max-tokens-in-flight", "0"}, wantErr: "max-tokens-in-flight must be between 1 and 2000000"},
-		{name: "flag max tokens in flight too high", args: []string{"cllm", "--max-tokens-in-flight", "2000001"}, wantErr: "max-tokens-in-flight must be between 1 and 2000000"},
-		{name: "flag max waiting requests negative", args: []string{"cllm", "--max-waiting-requests", "-1"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
-		{name: "flag max waiting requests too high", args: []string{"cllm", "--max-waiting-requests", "1025"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
 		{name: "invalid env temperature", args: []string{"cllm"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
 		{name: "flag max tokens out of range", args: []string{"cllm", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
 		{name: "invalid flag temperature", args: []string{"cllm", "--temperature", "nope"}, wantErr: "invalid runtime flag"},

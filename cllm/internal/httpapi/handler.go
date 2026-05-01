@@ -31,49 +31,25 @@ import (
 )
 
 const (
-	defaultVLLMURL                    = runtimeconfig.DefaultDownstreamURL
-	defaultCacheSize                  = runtimeconfig.DefaultCacheSize
-	defaultCacheFilePath              = runtimeconfig.DefaultCacheFilePath
-	defaultSystemPrompt               = runtimeconfig.DefaultSystemPrompt
-	minMaxTokens                      = runtimeconfig.MinMaxTokens
-	maxMaxTokens                      = runtimeconfig.MaxMaxTokens
-	minMaxTokensInFlight              = runtimeconfig.MinMaxTokensInFlight
-	maxMaxTokensInFlight              = runtimeconfig.MaxMaxTokensInFlight
-	minMaxWaitingRequests             = runtimeconfig.MinMaxWaitingRequests
-	maxMaxWaitingRequests             = runtimeconfig.MaxMaxWaitingRequests
-	defaultMaxTokens                  = runtimeconfig.DefaultMaxTokens
-	defaultTemperature                = runtimeconfig.DefaultTemperature
-	defaultVLLMHTTPTimeout            = 120 * time.Second
+	defaultVLLMURL         = runtimeconfig.DefaultDownstreamURL
+	defaultCacheSize       = runtimeconfig.DefaultCacheSize
+	defaultCacheFilePath   = runtimeconfig.DefaultCacheFilePath
+	defaultSystemPrompt    = runtimeconfig.DefaultSystemPrompt
+	minMaxTokens           = runtimeconfig.MinMaxTokens
+	maxMaxTokens           = runtimeconfig.MaxMaxTokens
+	defaultMaxTokens       = runtimeconfig.DefaultMaxTokens
+	defaultTemperature     = runtimeconfig.DefaultTemperature
+	defaultVLLMHTTPTimeout = 120 * time.Second
 	// defaultPerRequestTPS seeds the implicit single-node fallback's
 	// Capacity.PerRequestTPS when no nodes.yaml is present, so cached
-	// replay still paces at the legacy 32 tok/s/req default. Removed
-	// global flag `--max-tokens-per-second` (item 16, 0.14.0).
-	defaultPerRequestTPS              = runtimeconfig.DefaultMaxTokensPerSecond
-	defaultMaxTokensInFlight          = runtimeconfig.DefaultMaxTokensInFlight
-	defaultMaxWaitingRequests         = runtimeconfig.DefaultMaxWaitingRequests
-	defaultPrefillRateMultiplier      = runtimeconfig.DefaultPrefillRateMultiplier
-	defaultPrefillBaseOverheadMs      = runtimeconfig.DefaultPrefillBaseOverheadMs
-	defaultPrefillJitterPercent       = runtimeconfig.DefaultPrefillJitterPercent
-	defaultPrefillMaxMs               = runtimeconfig.DefaultPrefillMaxMs
-	minPrefillRateMultiplier          = runtimeconfig.MinPrefillRateMultiplier
-	maxPrefillRateMultiplier          = runtimeconfig.MaxPrefillRateMultiplier
-	minPrefillBaseOverheadMs          = runtimeconfig.MinPrefillBaseOverheadMs
-	maxPrefillBaseOverheadMs          = runtimeconfig.MaxPrefillBaseOverheadMs
-	minPrefillJitterPercent           = runtimeconfig.MinPrefillJitterPercent
-	maxPrefillJitterPercent           = runtimeconfig.MaxPrefillJitterPercent
-	defaultStreamVariabilityPercent      = runtimeconfig.DefaultStreamVariabilityPercent
-	defaultStreamJitterPercent           = runtimeconfig.DefaultStreamJitterPercent
-	defaultStreamStallProbabilityPercent = runtimeconfig.DefaultStreamStallProbabilityPercent
-	defaultStreamStallMinMs              = runtimeconfig.DefaultStreamStallMinMs
-	defaultStreamStallMaxMs              = runtimeconfig.DefaultStreamStallMaxMs
-	minStreamVariabilityPercent          = runtimeconfig.MinStreamVariabilityPercent
-	maxStreamVariabilityPercent          = runtimeconfig.MaxStreamVariabilityPercent
-	minStreamJitterPercent               = runtimeconfig.MinStreamJitterPercent
-	maxStreamJitterPercent               = runtimeconfig.MaxStreamJitterPercent
-	minStreamStallProbabilityPercent     = runtimeconfig.MinStreamStallProbabilityPercent
-	maxStreamStallProbabilityPercent     = runtimeconfig.MaxStreamStallProbabilityPercent
-	minStreamStallMs                     = runtimeconfig.MinStreamStallMs
-	maxStreamStallMs                     = runtimeconfig.MaxStreamStallMs
+	// replay still paces at the legacy 32 tok/s/req default.
+	defaultPerRequestTPS = runtimeconfig.DefaultMaxTokensPerSecond
+	// fallbackMaxTokensInFlight / fallbackMaxWaitingRequests seed the
+	// implicit single-node scheduler created by NewHandler() before any
+	// nodes.yaml SetNodes() call replaces it. They are intentionally not
+	// configurable: production deployments always supply nodes.yaml.
+	fallbackMaxTokensInFlight  = 200000
+	fallbackMaxWaitingRequests = 1024
 )
 
 type askOptions struct {
@@ -95,36 +71,28 @@ func NewAskOptions(systemPrompt string, maxTokens int, temperature float64) askO
 }
 
 type Handler struct {
-	ready                                     atomic.Bool
-	cache                                     *lruCache
-	cacheFilePath                             string
-	metrics                                   *handlerMetrics
-	configMu                                  sync.RWMutex
-	defaults                                  askOptions
-	vllmURL                                   string
-	downstreamToken                           string
-	downstreamModel                           string
-	httpClient                                *http.Client
-	modelsMu                                  sync.RWMutex
-	modelsCache                               *cachedModelsResponse
-	prefillRateMultiplier                     float64
-	prefillBaseOverhead                       time.Duration
-	prefillJitterPercent                      int
-	prefillMaxDuration                        time.Duration
-	streamVariabilityPercent                  int
-	streamJitterPercent                       int
-	streamStallProbabilityPercent             int
-	streamStallMin                            time.Duration
-	streamStallMax                            time.Duration
-	scheduler                                 *requestScheduler
-	nodes                                     []*node.Node
-	router                                    router.Router
-	sleep                                     func(context.Context, time.Duration) error
-	jitterSource                              func() float64
-	dslProfiles                               map[string][]string
-	dslDefaultProfile                         string
-	tenants                                   *tenantRegistry
-	classes                                   *classRegistry
+	ready             atomic.Bool
+	cache             *lruCache
+	cacheFilePath     string
+	metrics           *handlerMetrics
+	configMu          sync.RWMutex
+	defaults          askOptions
+	vllmURL           string
+	downstreamToken   string
+	downstreamModel   string
+	httpClient        *http.Client
+	modelsMu          sync.RWMutex
+	modelsCache       *cachedModelsResponse
+	scheduler         *requestScheduler
+	nodes             []*node.Node
+	router            router.Router
+	nodeRouterPolicy  string
+	sleep             func(context.Context, time.Duration) error
+	jitterSource      func() float64
+	dslProfiles       map[string][]string
+	dslDefaultProfile string
+	tenants           *tenantRegistry
+	classes           *classRegistry
 }
 
 func NewHandler() *Handler {
@@ -135,16 +103,7 @@ func NewHandler() *Handler {
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
-	handler.prefillRateMultiplier = defaultPrefillRateMultiplier
-	handler.prefillBaseOverhead = time.Duration(defaultPrefillBaseOverheadMs) * time.Millisecond
-	handler.prefillJitterPercent = defaultPrefillJitterPercent
-	handler.prefillMaxDuration = time.Duration(defaultPrefillMaxMs) * time.Millisecond
-	handler.streamVariabilityPercent = defaultStreamVariabilityPercent
-	handler.streamJitterPercent = defaultStreamJitterPercent
-	handler.streamStallProbabilityPercent = defaultStreamStallProbabilityPercent
-	handler.streamStallMin = time.Duration(defaultStreamStallMinMs) * time.Millisecond
-	handler.streamStallMax = time.Duration(defaultStreamStallMaxMs) * time.Millisecond
-	handler.scheduler = newRequestScheduler(defaultMaxTokensInFlight, defaultMaxWaitingRequests)
+	handler.scheduler = newRequestScheduler(fallbackMaxTokensInFlight, fallbackMaxWaitingRequests)
 	handler.nodes = []*node.Node{handler.scheduler.node}
 	handler.router = router.FromPolicy("")
 	handler.sleep = sleepWithContext
@@ -166,11 +125,11 @@ func NewHandler() *Handler {
 // PerRequestTPS at the historical 32 tok/s default so cached replay
 // still paces by default.
 func (h *Handler) SetRequestProcessingLimits(maxTokensInFlight, maxWaitingRequests int) {
-	if maxTokensInFlight < minMaxTokensInFlight || maxTokensInFlight > maxMaxTokensInFlight {
-		maxTokensInFlight = defaultMaxTokensInFlight
+	if maxTokensInFlight < 1 {
+		maxTokensInFlight = fallbackMaxTokensInFlight
 	}
-	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests {
-		maxWaitingRequests = defaultMaxWaitingRequests
+	if maxWaitingRequests < 0 {
+		maxWaitingRequests = fallbackMaxWaitingRequests
 	}
 
 	h.configMu.Lock()
@@ -354,6 +313,11 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /cache/{key}", h.cacheItemEndpoint)
 	mux.HandleFunc("GET /config", h.config)
 	mux.HandleFunc("POST /config", h.configPost)
+	mux.HandleFunc("GET /nodes", h.nodesEndpoint)
+	mux.HandleFunc("GET /nodes/{id}", h.nodeEndpoint)
+	mux.HandleFunc("POST /nodes/{id}", h.nodeEndpoint)
+	mux.HandleFunc("PUT /nodes/{id}", h.nodeEndpoint)
+	mux.HandleFunc("DELETE /nodes/{id}", h.nodeEndpoint)
 	mux.HandleFunc("GET /health", h.healthEndpoint)
 	mux.Handle("GET /metrics", h.metrics.Handler())
 	mux.HandleFunc("GET /ready", h.readyEndpoint)
@@ -364,28 +328,19 @@ func (h *Handler) Routes() http.Handler {
 }
 
 type runtimeConfig struct {
-	TokensInFlight                int64   `json:"tokens_in_flight"`
-	WaitingRequests               int     `json:"waiting_requests"`
-	Version                       string  `json:"version"`
-	CacheSize                     int     `json:"cache_size"`
-	CacheEntries                  int     `json:"cache_entries"`
-	DownstreamURL                 string  `json:"downstream_url"`
-	DownstreamModel               string  `json:"downstream_model"`
-	SystemPrompt                  string  `json:"system_prompt"`
-	MaxTokens                     int     `json:"max_tokens"`
-	MaxTokensInFlight             int64   `json:"max_tokens_in_flight"`
-	MaxWaitingRequests            int     `json:"max_waiting_requests"`
-	Temperature                   float64 `json:"temperature"`
-	PrefillRateMultiplier         float64 `json:"prefill_rate_multiplier"`
-	PrefillBaseOverheadMs         int     `json:"prefill_base_overhead_ms"`
-	PrefillJitterPercent          int     `json:"prefill_jitter_percent"`
-	PrefillMaxMs                  int     `json:"prefill_max_ms"`
-	StreamVariabilityPercent      int     `json:"stream_variability_percent"`
-	StreamJitterPercent           int     `json:"stream_jitter_percent"`
-	StreamStallProbabilityPercent int     `json:"stream_stall_probability_percent"`
-	StreamStallMinMs              int     `json:"stream_stall_min_ms"`
-	StreamStallMaxMs              int     `json:"stream_stall_max_ms"`
-	DSLDefaultProfile             string  `json:"dsl_default_profile"`
+	TokensInFlight     int64   `json:"tokens_in_flight"`
+	WaitingRequests    int     `json:"waiting_requests"`
+	Version            string  `json:"version"`
+	CacheSize          int     `json:"cache_size"`
+	CacheEntries       int     `json:"cache_entries"`
+	DownstreamURL      string  `json:"downstream_url"`
+	DownstreamModel    string  `json:"downstream_model"`
+	SystemPrompt       string  `json:"system_prompt"`
+	MaxTokens          int     `json:"max_tokens"`
+	MaxTokensInFlight  int64   `json:"max_tokens_in_flight"`
+	MaxWaitingRequests int     `json:"max_waiting_requests"`
+	Temperature        float64 `json:"temperature"`
+	DSLDefaultProfile  string  `json:"dsl_default_profile"`
 }
 
 type cacheEntrySummary struct {
@@ -471,10 +426,10 @@ func (h *Handler) config(w http.ResponseWriter, r *http.Request) {
 		markCacheHit(w, false)
 		if wantsHTML {
 			h.renderConfigHTML(w, r, configFormState{
-				Edit:    true,
-				Values:  r.URL.Query(),
-				Error:   err.Error(),
-				Status:  http.StatusBadRequest,
+				Edit:   true,
+				Values: r.URL.Query(),
+				Error:  err.Error(),
+				Status: http.StatusBadRequest,
 			})
 			return
 		}
@@ -721,6 +676,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// pacer can consult per-node capacity (item 15, 0.13.0). Falls
 	// back to handler globals when nil.
 	replayDSL.routedNode = routedNode
+	// Per-node cache bypass: a node configured with
+	// `bypass_cache: true` (e.g. the real-GPU `vllm` lane) forces
+	// `:dsl no-cache` semantics for every request routed to it. We
+	// flip only the noCache flag (not directives), since the bypass
+	// is a node-config decision, not an inbound DSL token; per-node
+	// metrics already carry the node label.
+	if routedNode != nil && routedNode.Capacity.BypassCache {
+		replayDSL.noCache = true
+	}
 	// nodeLabel resolves the routed node's ID for per-node metric
 	// labels. It returns "unknown" for the byte-for-byte legacy path
 	// where pickRoutedNode falls back to the implicit single-node
@@ -1191,41 +1155,23 @@ func (h *Handler) currentConfig() runtimeConfig {
 	h.modelsMu.RUnlock()
 
 	h.configMu.RLock()
-	prefillRateMultiplier := h.prefillRateMultiplier
-	prefillBaseOverhead := h.prefillBaseOverhead
-	prefillJitterPercent := h.prefillJitterPercent
-	prefillMaxDuration := h.prefillMaxDuration
-	streamVariabilityPercent := h.streamVariabilityPercent
-	streamJitterPercent := h.streamJitterPercent
-	streamStallProbabilityPercent := h.streamStallProbabilityPercent
-	streamStallMin := h.streamStallMin
-	streamStallMax := h.streamStallMax
 	dslDefaultProfile := h.dslDefaultProfile
 	h.configMu.RUnlock()
 
 	return runtimeConfig{
-		TokensInFlight:                processingStats.TokensInFlight,
-		WaitingRequests:               processingStats.WaitingRequests,
-		Version:                       buildinfo.Version,
-		CacheSize:                     cacheSize,
-		CacheEntries:                  cacheEntries,
-		DownstreamURL:                 downstreamURL,
-		DownstreamModel:               downstreamModel,
-		SystemPrompt:                  defaults.systemPrompt,
-		MaxTokens:                     defaults.maxTokens,
-		MaxTokensInFlight:             processingStats.MaxTokensInFlight,
-		MaxWaitingRequests:            processingStats.MaxWaitingRequests,
-		Temperature:                   defaults.temperature,
-		PrefillRateMultiplier:         prefillRateMultiplier,
-		PrefillBaseOverheadMs:         int(prefillBaseOverhead / time.Millisecond),
-		PrefillJitterPercent:          prefillJitterPercent,
-		PrefillMaxMs:                  int(prefillMaxDuration / time.Millisecond),
-		StreamVariabilityPercent:      streamVariabilityPercent,
-		StreamJitterPercent:           streamJitterPercent,
-		StreamStallProbabilityPercent: streamStallProbabilityPercent,
-		StreamStallMinMs:              int(streamStallMin / time.Millisecond),
-		StreamStallMaxMs:              int(streamStallMax / time.Millisecond),
-		DSLDefaultProfile:             dslDefaultProfile,
+		TokensInFlight:     processingStats.TokensInFlight,
+		WaitingRequests:    processingStats.WaitingRequests,
+		Version:            buildinfo.Version,
+		CacheSize:          cacheSize,
+		CacheEntries:       cacheEntries,
+		DownstreamURL:      downstreamURL,
+		DownstreamModel:    downstreamModel,
+		SystemPrompt:       defaults.systemPrompt,
+		MaxTokens:          defaults.maxTokens,
+		MaxTokensInFlight:  processingStats.MaxTokensInFlight,
+		MaxWaitingRequests: processingStats.MaxWaitingRequests,
+		Temperature:        defaults.temperature,
+		DSLDefaultProfile:  dslDefaultProfile,
 	}
 }
 
@@ -1361,165 +1307,12 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 		defaults.maxTokens = maxTokens
 	}
 
-	h.configMu.RLock()
-	scheduler := h.scheduler
-	h.configMu.RUnlock()
-	var maxTokensInFlight int64
-	var maxWaitingRequests int
-	if scheduler != nil {
-		cap, _, mw, _ := scheduler.Stats()
-		maxTokensInFlight = int64(cap)
-		maxWaitingRequests = mw
-	}
-	previousMaxTokensInFlight := maxTokensInFlight
-	previousMaxWaitingRequests := maxWaitingRequests
-
-	if maxTokensInFlightRaw := configQueryValue(queryValues, "max-tokens-in-flight", "max_tokens_in_flight"); maxTokensInFlightRaw != "" {
-		parsed, err := strconv.ParseInt(maxTokensInFlightRaw, 10, 64)
-		if err != nil {
-			return false, fmt.Errorf("invalid max-tokens-in-flight %q", maxTokensInFlightRaw)
-		}
-		if parsed < int64(minMaxTokensInFlight) || parsed > int64(maxMaxTokensInFlight) {
-			return false, fmt.Errorf("max-tokens-in-flight must be between %d and %d", minMaxTokensInFlight, maxMaxTokensInFlight)
-		}
-		maxTokensInFlight = parsed
-	}
-
-	if maxWaitingRequestsRaw := configQueryValue(queryValues, "max-waiting-requests", "max_waiting_requests"); maxWaitingRequestsRaw != "" {
-		parsed, err := strconv.Atoi(maxWaitingRequestsRaw)
-		if err != nil {
-			return false, fmt.Errorf("invalid max-waiting-requests %q", maxWaitingRequestsRaw)
-		}
-		if parsed < minMaxWaitingRequests || parsed > maxMaxWaitingRequests {
-			return false, fmt.Errorf("max-waiting-requests must be between %d and %d", minMaxWaitingRequests, maxMaxWaitingRequests)
-		}
-		maxWaitingRequests = parsed
-	}
-
 	if temperatureRaw := configQueryValue(queryValues, "temperature"); temperatureRaw != "" {
 		temperature, err := strconv.ParseFloat(temperatureRaw, 64)
 		if err != nil {
 			return false, fmt.Errorf("invalid temperature %q", temperatureRaw)
 		}
 		defaults.temperature = temperature
-	}
-
-	h.configMu.RLock()
-	prefillRateMultiplier := h.prefillRateMultiplier
-	prefillBaseOverheadMs := int(h.prefillBaseOverhead / time.Millisecond)
-	prefillJitterPercent := h.prefillJitterPercent
-	prefillMaxMs := int(h.prefillMaxDuration / time.Millisecond)
-	h.configMu.RUnlock()
-	prefillChanged := false
-
-	if raw := configQueryValue(queryValues, "prefill-rate-multiplier", "prefill_rate_multiplier"); raw != "" {
-		parsed, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return false, fmt.Errorf("invalid prefill-rate-multiplier %q", raw)
-		}
-		if parsed < minPrefillRateMultiplier || parsed > maxPrefillRateMultiplier {
-			return false, fmt.Errorf("prefill-rate-multiplier must be between %g and %g", minPrefillRateMultiplier, maxPrefillRateMultiplier)
-		}
-		prefillRateMultiplier = parsed
-		prefillChanged = true
-	}
-	if raw := configQueryValue(queryValues, "prefill-base-overhead-ms", "prefill_base_overhead_ms"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid prefill-base-overhead-ms %q", raw)
-		}
-		if parsed < minPrefillBaseOverheadMs || parsed > maxPrefillBaseOverheadMs {
-			return false, fmt.Errorf("prefill-base-overhead-ms must be between %d and %d", minPrefillBaseOverheadMs, maxPrefillBaseOverheadMs)
-		}
-		prefillBaseOverheadMs = parsed
-		prefillChanged = true
-	}
-	if raw := configQueryValue(queryValues, "prefill-jitter-percent", "prefill_jitter_percent"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid prefill-jitter-percent %q", raw)
-		}
-		if parsed < minPrefillJitterPercent || parsed > maxPrefillJitterPercent {
-			return false, fmt.Errorf("prefill-jitter-percent must be between %d and %d", minPrefillJitterPercent, maxPrefillJitterPercent)
-		}
-		prefillJitterPercent = parsed
-		prefillChanged = true
-	}
-	if raw := configQueryValue(queryValues, "prefill-max-ms", "prefill_max_ms"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid prefill-max-ms %q", raw)
-		}
-		if parsed < 1 {
-			return false, fmt.Errorf("prefill-max-ms must be positive")
-		}
-		prefillMaxMs = parsed
-		prefillChanged = true
-	}
-
-	h.configMu.RLock()
-	streamVariabilityPercent := h.streamVariabilityPercent
-	streamJitterPercent := h.streamJitterPercent
-	streamStallProbabilityPercent := h.streamStallProbabilityPercent
-	streamStallMinMs := int(h.streamStallMin / time.Millisecond)
-	streamStallMaxMs := int(h.streamStallMax / time.Millisecond)
-	h.configMu.RUnlock()
-	streamChanged := false
-
-	if raw := configQueryValue(queryValues, "stream-variability-percent", "stream_variability_percent"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid stream-variability-percent %q", raw)
-		}
-		if parsed < minStreamVariabilityPercent || parsed > maxStreamVariabilityPercent {
-			return false, fmt.Errorf("stream-variability-percent must be between %d and %d", minStreamVariabilityPercent, maxStreamVariabilityPercent)
-		}
-		streamVariabilityPercent = parsed
-		streamChanged = true
-	}
-	if raw := configQueryValue(queryValues, "stream-jitter-percent", "stream_jitter_percent"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid stream-jitter-percent %q", raw)
-		}
-		if parsed < minStreamJitterPercent || parsed > maxStreamJitterPercent {
-			return false, fmt.Errorf("stream-jitter-percent must be between %d and %d", minStreamJitterPercent, maxStreamJitterPercent)
-		}
-		streamJitterPercent = parsed
-		streamChanged = true
-	}
-	if raw := configQueryValue(queryValues, "stream-stall-probability-percent", "stream_stall_probability_percent"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid stream-stall-probability-percent %q", raw)
-		}
-		if parsed < minStreamStallProbabilityPercent || parsed > maxStreamStallProbabilityPercent {
-			return false, fmt.Errorf("stream-stall-probability-percent must be between %d and %d", minStreamStallProbabilityPercent, maxStreamStallProbabilityPercent)
-		}
-		streamStallProbabilityPercent = parsed
-		streamChanged = true
-	}
-	if raw := configQueryValue(queryValues, "stream-stall-min-ms", "stream_stall_min_ms"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid stream-stall-min-ms %q", raw)
-		}
-		if parsed < minStreamStallMs || parsed > maxStreamStallMs {
-			return false, fmt.Errorf("stream-stall-min-ms must be between %d and %d", minStreamStallMs, maxStreamStallMs)
-		}
-		streamStallMinMs = parsed
-		streamChanged = true
-	}
-	if raw := configQueryValue(queryValues, "stream-stall-max-ms", "stream_stall_max_ms"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return false, fmt.Errorf("invalid stream-stall-max-ms %q", raw)
-		}
-		if parsed < minStreamStallMs || parsed > maxStreamStallMs {
-			return false, fmt.Errorf("stream-stall-max-ms must be between %d and %d", minStreamStallMs, maxStreamStallMs)
-		}
-		streamStallMaxMs = parsed
-		streamChanged = true
 	}
 
 	cacheSize, _ := h.cacheStats()
@@ -1574,28 +1367,9 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamToken(downstreamToken)
 	h.SetDownstreamModel(downstreamModel)
-	h.SetRequestProcessingLimits(int(maxTokensInFlight), maxWaitingRequests)
-	if prefillChanged {
-		h.SetPrefillSimulation(prefillRateMultiplier, prefillBaseOverheadMs, prefillJitterPercent, prefillMaxMs)
-	}
-	if streamChanged {
-		h.SetStreamRealism(streamVariabilityPercent, streamJitterPercent, streamStallProbabilityPercent, streamStallMinMs, streamStallMaxMs)
-	}
 	if dslProfileChanged {
 		// Validation already passed above; ignore the error path.
 		_ = h.SetDSLDefaultProfile(dslProfileNew)
-	}
-	updatedMaxTokensInFlight, updatedTokensInFlight, updatedMaxWaitingRequests, updatedWaitingRequests := h.RequestQueueStats()
-	if updatedMaxTokensInFlight != previousMaxTokensInFlight || updatedMaxWaitingRequests != previousMaxWaitingRequests {
-		slog.Info(
-			"request queue limits updated",
-			"max_tokens_in_flight", updatedMaxTokensInFlight,
-			"previous_max_tokens_in_flight", previousMaxTokensInFlight,
-			"tokens_in_flight", updatedTokensInFlight,
-			"max_waiting_requests", updatedMaxWaitingRequests,
-			"previous_max_waiting_requests", previousMaxWaitingRequests,
-			"waiting_requests", updatedWaitingRequests,
-		)
 	}
 
 	return true, nil
@@ -1926,11 +1700,11 @@ var cacheKeyStopWords = map[string]struct{}{
 	"had": {}, "has": {}, "have": {}, "he": {}, "her": {}, "hers": {}, "him": {}, "his": {}, "how": {},
 	"i": {}, "if": {}, "in": {}, "into": {}, "is": {}, "it": {}, "its": {},
 	"just": {},
-	"me": {}, "my": {},
+	"me":   {}, "my": {},
 	"no": {}, "not": {},
 	"of": {}, "on": {}, "or": {}, "our": {}, "ours": {},
 	"please": {},
-	"she": {}, "should": {}, "so": {},
+	"she":    {}, "should": {}, "so": {},
 	"than": {}, "that": {}, "the": {}, "their": {}, "them": {}, "then": {}, "there": {}, "these": {}, "they": {}, "this": {}, "those": {}, "to": {},
 	"us":  {},
 	"was": {}, "we": {}, "were": {}, "what": {}, "when": {}, "where": {}, "which": {}, "who": {}, "why": {}, "will": {}, "with": {}, "would": {},
@@ -2716,29 +2490,37 @@ func defaultJitterSource() float64 {
 	return f*2 - 1
 }
 
-// SetPrefillSimulation configures the simulated prefill latency model used on
-// cache hits. The effective prefill rate is rateMultiplier * max-tokens-per-second.
-// A rateMultiplier of 0 disables prefill simulation entirely.
+// SetPrefillSimulation configures the implicit fallback Node's prefill
+// realism knobs. Used in single-node fallback mode (no nodes.yaml) and
+// by tests; production deployments configure per-node Realism via
+// nodes.yaml. A rateMultiplier of 0 disables prefill simulation.
 func (h *Handler) SetPrefillSimulation(rateMultiplier float64, baseOverheadMs, jitterPercent, maxMs int) {
-	if rateMultiplier < minPrefillRateMultiplier || rateMultiplier > maxPrefillRateMultiplier {
-		rateMultiplier = defaultPrefillRateMultiplier
-	}
-	if baseOverheadMs < minPrefillBaseOverheadMs || baseOverheadMs > maxPrefillBaseOverheadMs {
-		baseOverheadMs = defaultPrefillBaseOverheadMs
-	}
-	if jitterPercent < minPrefillJitterPercent || jitterPercent > maxPrefillJitterPercent {
-		jitterPercent = defaultPrefillJitterPercent
-	}
-	if maxMs < 1 {
-		maxMs = defaultPrefillMaxMs
-	}
-
 	h.configMu.Lock()
-	h.prefillRateMultiplier = rateMultiplier
-	h.prefillBaseOverhead = time.Duration(baseOverheadMs) * time.Millisecond
-	h.prefillJitterPercent = jitterPercent
-	h.prefillMaxDuration = time.Duration(maxMs) * time.Millisecond
-	h.configMu.Unlock()
+	defer h.configMu.Unlock()
+	if h.scheduler == nil || h.scheduler.node == nil {
+		return
+	}
+	h.scheduler.node.Realism.PrefillRateMultiplier = rateMultiplier
+	h.scheduler.node.Realism.PrefillBaseOverheadMs = baseOverheadMs
+	h.scheduler.node.Realism.PrefillJitterPercent = jitterPercent
+	h.scheduler.node.Realism.PrefillMaxMs = maxMs
+}
+
+// SetStreamRealism configures the implicit fallback Node's stream
+// realism knobs. Used in single-node fallback mode (no nodes.yaml) and
+// by tests; production deployments configure per-node Realism via
+// nodes.yaml.
+func (h *Handler) SetStreamRealism(variabilityPercent, jitterPercent, stallProbabilityPercent, stallMinMs, stallMaxMs int) {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if h.scheduler == nil || h.scheduler.node == nil {
+		return
+	}
+	h.scheduler.node.Realism.StreamVariabilityPct = variabilityPercent
+	h.scheduler.node.Realism.StreamJitterPct = jitterPercent
+	h.scheduler.node.Realism.StreamStallProbPct = stallProbabilityPercent
+	h.scheduler.node.Realism.StreamStallMinMs = stallMinMs
+	h.scheduler.node.Realism.StreamStallMaxMs = stallMaxMs
 }
 
 // computePrefillDelay returns the simulated prefill latency for the given
@@ -2803,28 +2585,24 @@ func (h *Handler) computePrefillDelay(promptTokens int, overrides replayOverride
 // computation. Returns ok=false when prefill simulation is effectively
 // disabled (zero rate multiplier or zero decode rate). Shared by
 // computePrefillDelay, computePrefillDelayDeterministic, and predictTTFTms.
+//
+// Per-node Realism (from nodes.yaml) is authoritative; when no node is
+// routed, the implicit single-node scheduler fallback Node provides the
+// realism source so single-node mode and tests still simulate prefill.
 func (h *Handler) resolvePrefillParams(overrides replayOverrides) (rateMultiplier float64, base time.Duration, jitterPercent int, maxDuration time.Duration, effectiveDecodeRate float64, ok bool) {
-	h.configMu.RLock()
-	rateMultiplier = h.prefillRateMultiplier
-	base = h.prefillBaseOverhead
-	jitterPercent = h.prefillJitterPercent
-	maxDuration = h.prefillMaxDuration
-	h.configMu.RUnlock()
-
-	// Per-node Realism overrides (zero falls back to global).
-	if n := overrides.routedNode; n != nil {
-		if n.Realism.PrefillRateMultiplier > 0 {
-			rateMultiplier = n.Realism.PrefillRateMultiplier
+	n := overrides.routedNode
+	if n == nil {
+		h.configMu.RLock()
+		if h.scheduler != nil {
+			n = h.scheduler.node
 		}
-		if n.Realism.PrefillBaseOverheadMs > 0 {
-			base = time.Duration(n.Realism.PrefillBaseOverheadMs) * time.Millisecond
-		}
-		if n.Realism.PrefillJitterPercent > 0 {
-			jitterPercent = n.Realism.PrefillJitterPercent
-		}
-		if n.Realism.PrefillMaxMs > 0 {
-			maxDuration = time.Duration(n.Realism.PrefillMaxMs) * time.Millisecond
-		}
+		h.configMu.RUnlock()
+	}
+	if n != nil {
+		rateMultiplier = n.Realism.PrefillRateMultiplier
+		base = time.Duration(n.Realism.PrefillBaseOverheadMs) * time.Millisecond
+		jitterPercent = n.Realism.PrefillJitterPercent
+		maxDuration = time.Duration(n.Realism.PrefillMaxMs) * time.Millisecond
 	}
 	if rateMultiplier <= 0 {
 		return
@@ -2961,39 +2739,6 @@ func (h *Handler) computePrefillDelayDeterministic(promptTokens int, overrides r
 	return delay
 }
 
-// SetStreamRealism configures variability, jitter, and partial-stall behavior
-// applied per content segment during cached stream replay. Setting all knobs
-// to zero (or rate-multiplier-equivalent: max-tokens-per-second to 0) disables
-// stream realism beyond the base pacing model.
-func (h *Handler) SetStreamRealism(variabilityPercent, jitterPercent, stallProbabilityPercent, stallMinMs, stallMaxMs int) {
-	if variabilityPercent < minStreamVariabilityPercent || variabilityPercent > maxStreamVariabilityPercent {
-		variabilityPercent = defaultStreamVariabilityPercent
-	}
-	if jitterPercent < minStreamJitterPercent || jitterPercent > maxStreamJitterPercent {
-		jitterPercent = defaultStreamJitterPercent
-	}
-	if stallProbabilityPercent < minStreamStallProbabilityPercent || stallProbabilityPercent > maxStreamStallProbabilityPercent {
-		stallProbabilityPercent = defaultStreamStallProbabilityPercent
-	}
-	if stallMinMs < minStreamStallMs || stallMinMs > maxStreamStallMs {
-		stallMinMs = defaultStreamStallMinMs
-	}
-	if stallMaxMs < minStreamStallMs || stallMaxMs > maxStreamStallMs {
-		stallMaxMs = defaultStreamStallMaxMs
-	}
-	if stallMaxMs < stallMinMs {
-		stallMaxMs = stallMinMs
-	}
-
-	h.configMu.Lock()
-	h.streamVariabilityPercent = variabilityPercent
-	h.streamJitterPercent = jitterPercent
-	h.streamStallProbabilityPercent = stallProbabilityPercent
-	h.streamStallMin = time.Duration(stallMinMs) * time.Millisecond
-	h.streamStallMax = time.Duration(stallMaxMs) * time.Millisecond
-	h.configMu.Unlock()
-}
-
 // computeStreamSegmentDelay returns the simulated delay for one streamed
 // content segment, plus any stall added on top. The stall component is
 // returned separately so callers can record metrics distinct from the base
@@ -3011,12 +2756,33 @@ func (h *Handler) computeStreamSegmentDelay(tokenCount, tokensSoFar int, overrid
 		return 0, 0
 	}
 
+	// Per-node Realism (from nodes.yaml) is the sole source for stream
+	// realism knobs; DSL overrides may add deltas on top. When no node
+	// is routed, fall back to the implicit single-node scheduler Node
+	// so single-node mode and tests still see realism.
+	n := overrides.routedNode
+	if n == nil {
+		h.configMu.RLock()
+		if h.scheduler != nil {
+			n = h.scheduler.node
+		}
+		h.configMu.RUnlock()
+	}
+	var nodeVar, nodeJitter, nodeStall int
+	var nodeStallMin, nodeStallMax time.Duration
+	if n != nil {
+		nodeVar = n.Realism.StreamVariabilityPct
+		nodeJitter = n.Realism.StreamJitterPct
+		nodeStall = n.Realism.StreamStallProbPct
+		nodeStallMin = time.Duration(n.Realism.StreamStallMinMs) * time.Millisecond
+		nodeStallMax = time.Duration(n.Realism.StreamStallMaxMs) * time.Millisecond
+	}
+	variabilityPercent := overrides.resolveVariabilityPercent(nodeVar)
+	jitterPercent := overrides.resolveJitterPercent(nodeJitter)
+	stallProbPercent := overrides.resolveStallPercent(nodeStall)
+	stallMin := nodeStallMin
+	stallMax := nodeStallMax
 	h.configMu.RLock()
-	variabilityPercent := overrides.resolveVariabilityPercent(h.streamVariabilityPercent)
-	jitterPercent := overrides.resolveJitterPercent(h.streamJitterPercent)
-	stallProbPercent := overrides.resolveStallPercent(h.streamStallProbabilityPercent)
-	stallMin := h.streamStallMin
-	stallMax := h.streamStallMax
 	jitterSource := h.jitterSource
 	h.configMu.RUnlock()
 

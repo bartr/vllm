@@ -2,8 +2,8 @@ package node
 
 // Capacity holds the per-node admission and streaming limits.
 type Capacity struct {
-	MaxTokensInFlight  int64
-	MaxWaitingRequests int
+	MaxTokensInFlight  int64 `json:"max_tokens_in_flight"`
+	MaxWaitingRequests int   `json:"max_waiting_requests"`
 
 	// PerRequestTPS is the per-request decode rate (tokens/second) the
 	// node applies during cache-replay pacing. Models real vLLM
@@ -14,7 +14,7 @@ type Capacity struct {
 	// the global handler-level max-tokens-per-second / scheduler
 	// degradation curve is used instead). Used by `passthrough` style
 	// nodes that should add no shaping to upstream traffic.
-	PerRequestTPS int
+	PerRequestTPS int `json:"per_request_tokens_per_second"`
 
 	// DegradationThreshold is the per-node concurrent-request count at
 	// which per-request rate begins to degrade. Below this, every
@@ -24,7 +24,7 @@ type Capacity struct {
 	//
 	// 0 disables the soft band (rate is constant = PerRequestTPS up to
 	// MaxConcurrency, then queueing).
-	DegradationThreshold int
+	DegradationThreshold int `json:"degradation_threshold"`
 
 	// MaxConcurrency is the maximum number of concurrent decoding
 	// requests the node will admit. Past this, additional requests
@@ -34,17 +34,29 @@ type Capacity struct {
 	// gate enforces admission). Models a real GPU's batch-slot limit:
 	// at MaxConcurrency the per-request rate has fully degraded by
 	// MaxDegradation%, and any further request waits for a slot.
-	MaxConcurrency int
+	MaxConcurrency int `json:"max_concurrency"`
+
+	// BypassCache, when true, makes every request routed to this node
+	// behave as if `:dsl no-cache` were set: the response cache is
+	// neither consulted nor written. Used for "real GPU baseline"
+	// passthrough lanes (e.g. the `vllm` node) so cache hits from
+	// other lanes never contaminate the upstream-only measurement.
+	//
+	// The bypass is applied immediately after routing by stamping
+	// `replayDSL.noCache = true`; downstream behavior (TTFT-budget
+	// gate skip, cache-write skip, metrics) follows the existing
+	// no-cache path byte-for-byte.
+	BypassCache bool `json:"bypass_cache"`
 
 	// MaxKVTokens is the per-node KV-cache occupancy ceiling, in KV
 	// tokens. 0 disables the KV admission axis entirely (§10 of
 	// docs/design-memory-pressure.md): no charge, no gate, no metrics.
-	MaxKVTokens int64
+	MaxKVTokens int64 `json:"max_kv_tokens"`
 
 	// KVWeight scales kv_load when computing the combined load fed
 	// into f(load). 0 falls back to 1.0 (KV pressure dominates equally
 	// with compute pressure once both pass the 10% deadband).
-	KVWeight float64
+	KVWeight float64 `json:"kv_weight"`
 
 	// KVCompletionFactor scales the KV estimator's p95 completion
 	// prediction when computing per-request KVCost (Phase 4 of
@@ -53,7 +65,7 @@ type Capacity struct {
 	// where peak KV residency is below prompt+completion. 0 falls
 	// back to 1.0; values are clamped to (0, 4.0]. Only consulted
 	// when the node has KV modeling enabled and KVEstimator is warm.
-	KVCompletionFactor float64
+	KVCompletionFactor float64 `json:"kv_completion_factor"`
 }
 
 // Degradation holds the per-node f(load) curve parameters.
@@ -62,23 +74,23 @@ type Capacity struct {
 // MaxDegradation is operator-tunable. Future: pluggable shapes (see §14
 // item 2 in system-design.md).
 type Degradation struct {
-	Shape          string // "piecewise_linear" for now
-	MaxDegradation int    // percent, 0-95
+	Shape          string `json:"f_load_shape"`    // "piecewise_linear" for now
+	MaxDegradation int    `json:"max_degradation"` // percent, 0-95
 }
 
 // Realism holds the per-node opt-in realism knobs (prefill simulation and
 // stream perturbations). Mirrors the runtime-tunable knobs documented in
 // §7.1 and §7.2 of system-design.md.
 type Realism struct {
-	PrefillRateMultiplier   float64
-	PrefillBaseOverheadMs   int
-	PrefillJitterPercent    int
-	PrefillMaxMs            int
-	StreamVariabilityPct    int
-	StreamJitterPct         int
-	StreamStallProbPct      int
-	StreamStallMinMs        int
-	StreamStallMaxMs        int
+	PrefillRateMultiplier float64 `json:"prefill_rate_multiplier"`
+	PrefillBaseOverheadMs int     `json:"prefill_base_overhead_ms"`
+	PrefillJitterPercent  int     `json:"prefill_jitter_percent"`
+	PrefillMaxMs          int     `json:"prefill_max_ms"`
+	StreamVariabilityPct  int     `json:"stream_variability_percent"`
+	StreamJitterPct       int     `json:"stream_jitter_percent"`
+	StreamStallProbPct    int     `json:"stream_stall_probability_percent"`
+	StreamStallMinMs      int     `json:"stream_stall_min_ms"`
+	StreamStallMaxMs      int     `json:"stream_stall_max_ms"`
 }
 
 // Upstream describes a Chat Completions API backend a node may pass requests
@@ -86,9 +98,9 @@ type Realism struct {
 // Upstream != nil is a pass-through node (e.g., a real GPU-backed vLLM
 // instance).
 type Upstream struct {
-	URL   string
-	Token string
-	Model string
+	URL   string `json:"upstream"`
+	Token string `json:"token,omitempty"`
+	Model string `json:"model,omitempty"`
 }
 
 // Node models a single vLLM-like instance: an admission stock (Budget), a
@@ -134,6 +146,32 @@ type Node struct {
 	Realism     Realism
 
 	Upstream *Upstream // nil = pure synthetic
+}
+
+// New constructs a Node from already-resolved effective configuration. It is
+// used by both file loading and runtime CRUD so every node gets identical
+// budget, estimator, KV, and concurrency initialization.
+func New(id, class string, capacity Capacity, degradation Degradation, realism Realism, upstream *Upstream) *Node {
+	n := &Node{
+		ID:          id,
+		Class:       class,
+		Budget:      NewTokenBudget(capacity.MaxTokensInFlight, capacity.MaxWaitingRequests),
+		Estimator:   NewCompletionEstimator(256, 50),
+		Capacity:    capacity,
+		Degradation: degradation,
+		Realism:     realism,
+		Upstream:    upstream,
+	}
+	n.Budget.SetAgingStepMs(DefaultPriorityAgingStepMs)
+	if capacity.MaxKVTokens > 0 {
+		n.KV = NewKVBudget(capacity.MaxKVTokens)
+		n.KVEstimator = NewCompletionEstimator(256, 50)
+	}
+	if capacity.MaxConcurrency > 0 {
+		n.Concurrency = NewTokenBudget(int64(capacity.MaxConcurrency), capacity.MaxWaitingRequests)
+		n.Concurrency.SetAgingStepMs(DefaultPriorityAgingStepMs)
+	}
+	return n
 }
 
 // PerRequestRate returns the simulated per-request decode rate

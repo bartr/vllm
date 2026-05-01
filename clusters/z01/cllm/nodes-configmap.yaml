@@ -27,12 +27,13 @@ data:
     # Predicted vs measured within 11% mid-curve, <7% at endpoints.
     nodes:
       # Modeled lane: vLLM-shaped per-request pacing.
-      cllm-rtx:
-        class: cllm-rtx
-        # Legacy token-cost gate kept generous so the new request-slot
-        # gate (max_concurrency) is the binding admission control.
-        max_tokens_per_second: 4096
-        max_tokens_in_flight: 1000000
+      cllm:
+        class: cllm
+        # Token-budget gate sized for the real GPU ceiling: 128 concurrent
+        # × ~1.5K tokens/request ≈ 200K. Leaves max_concurrency as the
+        # binding admission control for typical loads while still guarding
+        # against outlier prompts.
+        max_tokens_in_flight: 200000
         max_waiting_requests: 32
         # vLLM-shaped per-request pacing (item 15, 0.13.0).
         per_request_tokens_per_second: 32
@@ -43,20 +44,27 @@ data:
       # no shaping to upstream traffic. Use as the "real vLLM" baseline.
       vllm:
         class: vllm
-        max_tokens_per_second: 1000000
-        max_tokens_in_flight: 1000000000
+        # bypass_cache forces `:dsl no-cache` semantics for every
+        # request routed here, so this lane always hits the real GPU
+        # and is never contaminated by cached replays from other lanes.
+        bypass_cache: true
+        # Matched to cllm so router policy=least-loaded compares
+        # in_flight/capacity ratios on equal denominators and balances
+        # un-pinned traffic across both lanes (~50/50). With max_concurrency=0
+        # this is the ONLY admission gate for the vllm lane; 200K ≈ 128
+        # concurrent × ~1.5K tokens, matching the shared GPU's real ceiling.
+        max_tokens_in_flight: 200000
         max_waiting_requests: 100000
         # 0 disables the per-request pacing model entirely.
         per_request_tokens_per_second: 0
         max_concurrency: 0
 
-      # KV-pressure lane: same per-request shape as cllm-rtx, plus the
+      # KV-pressure lane: same per-request shape as cllm, plus the
       # KV admission gate. Not used in the throughput A/B; kept for KV
       # demos.
       # kv-node:
       #   class: kv-test
-      #   max_tokens_per_second: 4096
-      #   max_tokens_in_flight: 1000000
+      #   max_tokens_in_flight: 200000
       #   max_waiting_requests: 32
       #   per_request_tokens_per_second: 32
       #   degradation_threshold: 10
@@ -64,12 +72,17 @@ data:
       #   max_kv_tokens: 16384
       #   kv_weight: 1.0
     classes:
-      cllm-rtx:
+      cllm:
         f_load_shape: piecewise_linear
         # Calibrated from measured vLLM curve: 32 → 12.8 tok/s/req
         # across c=10..128 ⇒ 60% degradation at saturation.
         max_degradation: 60
-        prefill_rate_multiplier: 4
+        prefill_rate_multiplier: 10
+        # Prefill realism (was global in 0.15.0; per-class in 0.16.0).
+        # Tuned to vLLM Qwen2.5-3B TTFT curve (40ms @ c=1, ~500ms @ c=128).
+        prefill_base_overhead_ms: 30
+        prefill_jitter_percent: 10
+        prefill_max_ms: 800
       vllm:
         f_load_shape: piecewise_linear
         max_degradation: 0

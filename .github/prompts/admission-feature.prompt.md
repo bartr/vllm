@@ -43,8 +43,8 @@ Same shape as `max_queue_ms` (14B), `priority` (14C), `max_ttft_ms` (item 13 fol
 - If you need a new gauge/counter, mirror `cllm_class_initial_tps_effective{class}` style. Always include the `class` label.
 
 ### 6. Smoke fixtures (TWO new prompts in `scripts/smoke-test.yaml`)
-- One that PASSES the gate (loose limit). Pin `node=default`. Use `no-cache`.
-- One that REJECTS (tight limit + provoking conditions). Pin `node=default`. Use `no-cache`.
+- One that PASSES the gate (loose limit). Pin `node=cllm`. Use `no-cache`.
+- One that REJECTS (tight limit + provoking conditions). Pin `node=cllm`. Use `no-cache`.
 - Append at end of the file; renumber comments accordingly.
 
 ### 7. Tests

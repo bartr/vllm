@@ -9,7 +9,7 @@
 #   A) node=vllm  - caps so loose that admission/queue/
 #                          degradation never fire. Proxies to vLLM
 #                          unmodified; latency reflects vLLM only.
-#   B) node=cllm-rtx      - production-shape modeled node:
+#   B) node=cllm          - production-shape modeled node:
 #                            max_tokens_per_second: 600
 #                            max_tokens_in_flight:  6000
 #                            max_degradation:       50
@@ -21,7 +21,7 @@
 #   BENCH=40 DURATION=2m ./scripts/ab-vllm-vs-cllm.sh
 #   COUNT=400 ./scripts/ab-vllm-vs-cllm.sh       # bounded by request count
 #
-# Dashboard tip: filter cllm-overview by node=~"cllm-rtx|vllm"
+# Dashboard tip: filter cllm-overview by node=~"cllm|vllm"
 # and put per-node panels side by side.
 
 set -euo pipefail
@@ -62,7 +62,7 @@ run_side() {
 }
 
 run_side "A-passthrough" "vllm"
-run_side "B-modeled"     "cllm-rtx"
+run_side "B-modeled"     "cllm"
 
 echo
 echo "=========================================================="
@@ -87,4 +87,4 @@ done
 
 echo
 echo "Raw NDJSON: $OUT/{A,B}-*.ndjson"
-echo "Dashboards: http://localhost:8088/grafana — filter node=~\"cllm-rtx|vllm\""
+echo "Dashboards: http://localhost:8088/grafana — filter node=~\"cllm|vllm\""

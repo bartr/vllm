@@ -2,7 +2,7 @@
 # Long-running, balanced load generator for the cllm dashboards.
 #
 # Launches two independent `ask` workers in parallel — one pinned to
-# node=cllm-rtx, one pinned to node=vllm — so each lane has its own
+# node=cllm, one pinned to node=vllm — so each lane has its own
 # concurrency pool. Without separate workers a single shared pool
 # drifts toward the slower lane and per-node fleet TPS lines equalize.
 #
@@ -41,9 +41,9 @@ run_lane() {
 }
 
 echo "dashboard-load: url=$URL bench=$BENCH/lane max-tokens=$MAX_TOKENS files=$FILES"
-echo "dashboard-load: lanes=cllm-rtx (cacheable), vllm (no-cache)"
+echo "dashboard-load: lanes=cllm (cacheable), vllm (no-cache)"
 echo "dashboard-load: Ctrl-C to stop"
 
-run_lane "cllm-rtx" ""         &
+run_lane "cllm"     ""         &
 run_lane "vllm"     "no-cache" &
 wait

@@ -116,11 +116,7 @@ func TestBuildAppliesClassDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	fallback := Capacity{
-		MaxTokensInFlight:  4096,
-		MaxWaitingRequests: 50,
-	}
-	nodes := spec.Build(fallback)
+	nodes := spec.Build()
 	if len(nodes) != 2 {
 		t.Fatalf("Build: got %d nodes, want 2", len(nodes))
 	}
@@ -173,13 +169,16 @@ nodes:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	fallback := Capacity{MaxTokensInFlight: 1024, MaxWaitingRequests: 10}
-	nodes := spec.Build(fallback)
+	nodes := spec.Build()
 	if len(nodes) != 1 {
 		t.Fatalf("got %d nodes", len(nodes))
 	}
-	if nodes[0].Capacity != fallback {
-		t.Fatalf("expected fallback capacity, got %+v", nodes[0].Capacity)
+	// With the fallback parameter retired, a node with no capacity
+	// fields gets a zero Capacity. The Node is still constructed
+	// (Budget is non-nil) but admission will reject because the
+	// budget is zero. Operators must set capacity per node.
+	if nodes[0].Capacity.MaxTokensInFlight != 0 {
+		t.Fatalf("expected zero capacity, got %+v", nodes[0].Capacity)
 	}
 }
 
@@ -214,8 +213,7 @@ classes:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	fallback := Capacity{MaxTokensInFlight: 4096, MaxWaitingRequests: 50}
-	nodes := spec.Build(fallback)
+	nodes := spec.Build()
 	if len(nodes) != 3 {
 		t.Fatalf("got %d nodes, want 3", len(nodes))
 	}
@@ -242,5 +240,40 @@ classes:
 	}
 	if byID["no-kv"].KVEstimator != nil {
 		t.Errorf("no-kv has KVEstimator but KV modeling is disabled")
+	}
+}
+
+// TestBuildBypassCache confirms that `bypass_cache: true` on a node
+// surfaces on Capacity.BypassCache and defaults to false elsewhere.
+// Per-node only — there is no class fallback.
+func TestBuildBypassCache(t *testing.T) {
+	yaml := `
+nodes:
+  bypassed:
+    class: passthrough
+    max_tokens_in_flight: 1024
+    bypass_cache: true
+  cached:
+    class: passthrough
+    max_tokens_in_flight: 1024
+classes:
+  passthrough: {}
+`
+	path := writeTempYAML(t, yaml)
+	t.Setenv("CLLM_NODES_FILE", path)
+	spec, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	nodes := spec.Build()
+	byID := map[string]*Node{}
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	if !byID["bypassed"].Capacity.BypassCache {
+		t.Errorf("bypassed.BypassCache = false, want true")
+	}
+	if byID["cached"].Capacity.BypassCache {
+		t.Errorf("cached.BypassCache = true, want false (default)")
 	}
 }

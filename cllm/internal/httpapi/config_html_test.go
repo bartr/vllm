@@ -37,15 +37,22 @@ func TestConfigEndpointHTMLWhenAcceptHTML(t *testing.T) {
 		"cllm runtime configuration",
 		"Status (read-only)",
 		"<h2>Cache</h2>",
-		"<h2>Throughput Limits</h2>",
-		"<h2>Prefill Simulation</h2>",
-		"<h2>Stream Realism</h2>",
 		"<h2>DSL</h2>",
 		`href="/config?edit=1"`,
 		`readonly`, // edit=0 view
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	// Vestigial sections (managed per-node in nodes.yaml) must NOT be rendered.
+	for _, gone := range []string{
+		"<h2>Throughput Limits</h2>",
+		"<h2>Prefill Simulation</h2>",
+		"<h2>Stream Realism</h2>",
+	} {
+		if strings.Contains(body, gone) {
+			t.Fatalf("body still contains vestigial section %q", gone)
 		}
 	}
 	// Save button must NOT be present in read-only view.

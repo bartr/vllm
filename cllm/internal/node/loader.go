@@ -52,6 +52,12 @@ type NodeSpec struct {
 	DegradationThreshold *int `yaml:"degradation_threshold,omitempty"`
 	MaxConcurrency       *int `yaml:"max_concurrency,omitempty"`
 
+	// BypassCache, when true, forces `:dsl no-cache` semantics for
+	// every request routed to this node — used for "real GPU
+	// baseline" passthrough lanes (per-node only; no class
+	// fallback).
+	BypassCache *bool `yaml:"bypass_cache,omitempty"`
+
 	// MaxKVTokens / KVWeight are the per-node KV-cache axis knobs. 0
 	// for MaxKVTokens disables the entire axis on this node and
 	// inherits from the class default; KVWeight uses class default
@@ -110,7 +116,8 @@ type ClassSpec struct {
 	// KV estimator multiplier (Phase 4 of
 	// docs/design-memory-pressure.md). 0 falls back to 1.0 at use
 	// time; only consulted on nodes with KV modeling enabled.
-	KVCompletionFactor float64 `yaml:"kv_completion_factor"`}
+	KVCompletionFactor float64 `yaml:"kv_completion_factor"`
+}
 
 // RouterSpec is the routing policy section of nodes.yaml. Phase 2.2 will
 // consume this; Phase 2.1 only persists it.
@@ -221,10 +228,10 @@ func (s *FileSpec) Validate() error {
 // class defaults and per-node overrides. The returned slice is sorted by
 // node ID for stable iteration.
 //
-// Capacity must be > 0 for the resulting Node to be usable; a node whose
-// capacity values are zero in the file inherits the supplied fallback
-// values (typically the global flat-config defaults).
-func (s *FileSpec) Build(fallback Capacity) []*Node {
+// Each node must set its own capacity values (max_tokens_in_flight,
+// max_waiting_requests) in the YAML; nodes whose values are zero will
+// have unusable budgets.
+func (s *FileSpec) Build() []*Node {
 	if s == nil || len(s.Nodes) == 0 {
 		return nil
 	}
@@ -241,8 +248,8 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 		class, _ := s.Classes[spec.Class]
 
 		cap := Capacity{
-			MaxTokensInFlight:  pickInt64(spec.MaxTokensInFlight, fallback.MaxTokensInFlight),
-			MaxWaitingRequests: pickInt(spec.MaxWaitingRequests, fallback.MaxWaitingRequests),
+			MaxTokensInFlight:  spec.MaxTokensInFlight,
+			MaxWaitingRequests: spec.MaxWaitingRequests,
 			MaxKVTokens:        pickInt64(spec.MaxKVTokens, class.MaxKVTokens),
 			KVWeight:           derefFloat64(spec.KVWeight, class.KVWeight),
 			KVCompletionFactor: derefFloat64(spec.KVCompletionFactor, class.KVCompletionFactor),
@@ -251,6 +258,7 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 			PerRequestTPS:        derefInt(spec.PerRequestTPS, class.PerRequestTPS),
 			DegradationThreshold: derefInt(spec.DegradationThreshold, class.DegradationThreshold),
 			MaxConcurrency:       derefInt(spec.MaxConcurrency, class.MaxConcurrency),
+			BypassCache:          derefBool(spec.BypassCache, false),
 		}
 		// Only normalize KVWeight when KV modeling is enabled; leave
 		// it zero otherwise so a node with KV disabled has a Capacity
@@ -281,55 +289,12 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 			upstream = &Upstream{URL: spec.Upstream, Token: spec.Token, Model: spec.Model}
 		}
 
-		n := &Node{
-			ID:          id,
-			Class:       spec.Class,
-			Budget:      NewTokenBudget(cap.MaxTokensInFlight, cap.MaxWaitingRequests),
-			Estimator:   NewCompletionEstimator(256, 50),
-			Capacity:    cap,
-			Degradation: degradation,
-			Realism:     realism,
-			Upstream:    upstream,
-		}
-		// Phase 14C: enable priority-aging on every node budget so a
-		// long-waiting low-priority request eventually outranks fresh
-		// high-priority traffic. The default tick (1000 ms) means a
-		// low-priority waiter that has waited 2+ seconds out-ranks a
-		// fresh high-priority waiter; small enough that aging is
-		// observable in the smoke flow, large enough that it does not
-		// invert ordering for typical sub-second waits.
-		n.Budget.SetAgingStepMs(DefaultPriorityAgingStepMs)
-		if cap.MaxKVTokens > 0 {
-			n.KV = NewKVBudget(cap.MaxKVTokens)
-			// Phase 4: each KV-modeled node carries an independent
-			// p95 estimator stream so KVCost can decouple from
-			// TotalCost (per-node KVCompletionFactor amortization,
-			// future prefix-cache modeling). Same window/warm-up as
-			// the cost estimator so the two converge in lock-step
-			// when the operator hasn't supplied a factor.
-			n.KVEstimator = NewCompletionEstimator(256, 50)
-		}
-		// vLLM-style request-slot gate (item 15, 0.13.0). Created only
-		// when MaxConcurrency > 0; cost=1 per request. Queue depth is
-		// MaxWaitingRequests, shared with the token-cost Budget. nil
-		// when disabled = byte-for-byte legacy admission.
-		if cap.MaxConcurrency > 0 {
-			n.Concurrency = NewTokenBudget(int64(cap.MaxConcurrency), cap.MaxWaitingRequests)
-			n.Concurrency.SetAgingStepMs(DefaultPriorityAgingStepMs)
-		}
-		out = append(out, n)
+		out = append(out, New(id, spec.Class, cap, degradation, realism, upstream))
 	}
 	return out
 }
 
 func pickInt64(v, fallback int64) int64 {
-	if v > 0 {
-		return v
-	}
-	return fallback
-}
-
-func pickInt(v, fallback int) int {
 	if v > 0 {
 		return v
 	}
@@ -344,6 +309,13 @@ func derefInt(p *int, fallback int) int {
 }
 
 func derefFloat64(p *float64, fallback float64) float64 {
+	if p != nil {
+		return *p
+	}
+	return fallback
+}
+
+func derefBool(p *bool, fallback bool) bool {
 	if p != nil {
 		return *p
 	}

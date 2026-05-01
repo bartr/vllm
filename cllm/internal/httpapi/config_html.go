@@ -166,109 +166,13 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 				},
 			},
 		},
-		{
-			Title: "Throughput Limits",
-			Fields: []configField{
-				{
-					Key: "max_tokens_in_flight", Label: "max_tokens_in_flight", Kind: fieldInt,
-					Help:    "Maximum admitted token cost in flight.",
-					Min:     strconv.Itoa(runtimeconfig.MinMaxTokensInFlight),
-					Max:     strconv.Itoa(runtimeconfig.MaxMaxTokensInFlight),
-					Default: strconv.Itoa(runtimeconfig.DefaultMaxTokensInFlight),
-					Current: pickInt("max_tokens_in_flight", "max-tokens-in-flight", int(cfg.MaxTokensInFlight)),
-				},
-				{
-					Key: "max_waiting_requests", Label: "max_waiting_requests", Kind: fieldInt,
-					Help:    "Maximum waiting requests. Must be < 2 \u00d7 max_concurrent_requests.",
-					Min:     strconv.Itoa(runtimeconfig.MinMaxWaitingRequests),
-					Max:     strconv.Itoa(runtimeconfig.MaxMaxWaitingRequests),
-					Default: strconv.Itoa(runtimeconfig.DefaultMaxWaitingRequests),
-					Current: pickInt("max_waiting_requests", "max-waiting-requests", cfg.MaxWaitingRequests),
-				},
-			},
-		},
-		{
-			Title: "Prefill Simulation",
-			Fields: []configField{
-				{
-					Key: "prefill_rate_multiplier", Label: "prefill_rate_multiplier", Kind: fieldFloat,
-					Help:    "Simulated prefill rate as a multiple of max_tokens_per_second. 0 disables prefill simulation.",
-					Min:     fmt.Sprintf("%g", runtimeconfig.MinPrefillRateMultiplier),
-					Max:     fmt.Sprintf("%g", runtimeconfig.MaxPrefillRateMultiplier),
-					Step:    "0.1",
-					Default: fmt.Sprintf("%g", float64(runtimeconfig.DefaultPrefillRateMultiplier)),
-					Current: pickFloat("prefill_rate_multiplier", "prefill-rate-multiplier", cfg.PrefillRateMultiplier),
-				},
-				{
-					Key: "prefill_base_overhead_ms", Label: "prefill_base_overhead_ms", Kind: fieldInt,
-					Help:    "Fixed simulated prefill startup overhead, ms.",
-					Min:     strconv.Itoa(runtimeconfig.MinPrefillBaseOverheadMs),
-					Max:     strconv.Itoa(runtimeconfig.MaxPrefillBaseOverheadMs),
-					Default: strconv.Itoa(runtimeconfig.DefaultPrefillBaseOverheadMs),
-					Current: pickInt("prefill_base_overhead_ms", "prefill-base-overhead-ms", cfg.PrefillBaseOverheadMs),
-				},
-				{
-					Key: "prefill_jitter_percent", Label: "prefill_jitter_percent", Kind: fieldInt,
-					Help:    "\u00b1 jitter applied to simulated prefill latency, percent.",
-					Min:     strconv.Itoa(runtimeconfig.MinPrefillJitterPercent),
-					Max:     strconv.Itoa(runtimeconfig.MaxPrefillJitterPercent),
-					Default: strconv.Itoa(runtimeconfig.DefaultPrefillJitterPercent),
-					Current: pickInt("prefill_jitter_percent", "prefill-jitter-percent", cfg.PrefillJitterPercent),
-				},
-				{
-					Key: "prefill_max_ms", Label: "prefill_max_ms", Kind: fieldInt,
-					Help:    "Safety cap on simulated prefill latency, ms.",
-					Min:     "1",
-					Default: strconv.Itoa(runtimeconfig.DefaultPrefillMaxMs),
-					Current: pickInt("prefill_max_ms", "prefill-max-ms", cfg.PrefillMaxMs),
-				},
-			},
-		},
-		{
-			Title: "Stream Realism",
-			Fields: []configField{
-				{
-					Key: "stream_variability_percent", Label: "stream_variability_percent", Kind: fieldInt,
-					Help:    "\u00b1 token-rate oscillation during cached stream replay, percent. 0 disables.",
-					Min:     strconv.Itoa(runtimeconfig.MinStreamVariabilityPercent),
-					Max:     strconv.Itoa(runtimeconfig.MaxStreamVariabilityPercent),
-					Default: strconv.Itoa(runtimeconfig.DefaultStreamVariabilityPercent),
-					Current: pickInt("stream_variability_percent", "stream-variability-percent", cfg.StreamVariabilityPercent),
-				},
-				{
-					Key: "stream_jitter_percent", Label: "stream_jitter_percent", Kind: fieldInt,
-					Help:    "\u00b1 per-segment jitter during cached stream replay, percent. 0 disables.",
-					Min:     strconv.Itoa(runtimeconfig.MinStreamJitterPercent),
-					Max:     strconv.Itoa(runtimeconfig.MaxStreamJitterPercent),
-					Default: strconv.Itoa(runtimeconfig.DefaultStreamJitterPercent),
-					Current: pickInt("stream_jitter_percent", "stream-jitter-percent", cfg.StreamJitterPercent),
-				},
-				{
-					Key: "stream_stall_probability_percent", Label: "stream_stall_probability_percent", Kind: fieldInt,
-					Help:    "Per-segment chance of a partial stall, percent. 0 disables stalls.",
-					Min:     strconv.Itoa(runtimeconfig.MinStreamStallProbabilityPercent),
-					Max:     strconv.Itoa(runtimeconfig.MaxStreamStallProbabilityPercent),
-					Default: strconv.Itoa(runtimeconfig.DefaultStreamStallProbabilityPercent),
-					Current: pickInt("stream_stall_probability_percent", "stream-stall-probability-percent", cfg.StreamStallProbabilityPercent),
-				},
-				{
-					Key: "stream_stall_min_ms", Label: "stream_stall_min_ms", Kind: fieldInt,
-					Help:    "Minimum partial-stall duration, ms.",
-					Min:     strconv.Itoa(runtimeconfig.MinStreamStallMs),
-					Max:     strconv.Itoa(runtimeconfig.MaxStreamStallMs),
-					Default: strconv.Itoa(runtimeconfig.DefaultStreamStallMinMs),
-					Current: pickInt("stream_stall_min_ms", "stream-stall-min-ms", cfg.StreamStallMinMs),
-				},
-				{
-					Key: "stream_stall_max_ms", Label: "stream_stall_max_ms", Kind: fieldInt,
-					Help:    "Maximum partial-stall duration, ms. Must be \u2265 stream_stall_min_ms.",
-					Min:     strconv.Itoa(runtimeconfig.MinStreamStallMs),
-					Max:     strconv.Itoa(runtimeconfig.MaxStreamStallMs),
-					Default: strconv.Itoa(runtimeconfig.DefaultStreamStallMaxMs),
-					Current: pickInt("stream_stall_max_ms", "stream-stall-max-ms", cfg.StreamStallMaxMs),
-				},
-			},
-		},
+		// Throughput Limits, Prefill Simulation, and Stream Realism are
+		// managed per-node in configs/nodes.yaml (capacity, prefill_*,
+		// stream_* on Node/Class). The legacy global knobs they used to
+		// edit no longer bind in multi-node deployments — every routed
+		// node owns its own values — so they are hidden from /config to
+		// avoid the appearance of control. The underlying handler fields
+		// and CLI flags remain for the implicit single-node fallback.
 		{
 			Title: "DSL",
 			Fields: []configField{

@@ -10,6 +10,7 @@
 - `GET /ready` returns `ready`
 - `GET /version` returns the current application version as plain text with no surrounding whitespace
 - `GET /config` returns the live handler config and applies any supported query string updates before printing it. Browsers (`Accept: text/html`) get an HTML form: read-only by default, click **Edit** (or visit `/config?edit=1`) to make fields editable; submitting the form does a `POST /config` with form-encoded values that go through the same validation as the query-string API. Non-browser clients keep the legacy JSON contract.
+- `GET /nodes` lists the live node fleet; `GET /nodes/{id}` returns one node; `POST`/`PUT /nodes/{id}` creates or updates a node from JSON, form values, or query params; `DELETE /nodes/{id}` removes a node, except the last remaining node cannot be deleted
 - `GET /metrics` returns Prometheus metrics for HTTP traffic, queue state, cache activity, downstream latency, TTFTB, and job processing
 
 ## Run locally
@@ -72,7 +73,21 @@ You can inspect or update the live handler config at runtime:
 curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-in-flight=128000&max-waiting-requests=512&temperature=0.7'
 ```
 
-`/config` now returns `tokens_in_flight`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_in_flight`, `max_waiting_requests`, `prefill_rate_multiplier`, `prefill_base_overhead_ms`, `prefill_jitter_percent`, `prefill_max_ms`, `stream_variability_percent`, `stream_jitter_percent`, `stream_stall_probability_percent`, `stream_stall_min_ms`, and `stream_stall_max_ms`. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `max-tokens-in-flight`, `max-waiting-requests`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, `downstream-model`, `prefill-rate-multiplier`, `prefill-base-overhead-ms`, `prefill-jitter-percent`, `prefill-max-ms`, `stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, `stream-stall-min-ms`, and `stream-stall-max-ms`. Per-request decode pacing is owned by per-node `Capacity.PerRequestTPS` / `MaxConcurrency` / `DegradationThreshold` in `configs/nodes.yaml` (item 15, 0.13.0); the legacy global `--max-tokens-per-second` / `--max-degradation` flags were retired in 0.14.0 (item 16).
+`/config` now returns `tokens_in_flight`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_in_flight`, `max_waiting_requests`, and request defaults. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, `downstream-model`, and `dsl-profile`. Per-node admission, pacing, KV, bypass-cache, and realism knobs are live through `/nodes`; startup defaults still come from `configs/nodes.yaml` (or `CLLM_NODES_FILE`).
+
+Examples:
+
+```bash
+curl 'http://127.0.0.1:8080/nodes'
+curl 'http://127.0.0.1:8080/nodes/cllm'
+curl -X POST 'http://127.0.0.1:8080/nodes/cllm?per-request-tokens-per-second=96&max-concurrency=128'
+curl -X PUT -H 'Content-Type: application/json' \
+  -d '{"class":"cllm","max_tokens_in_flight":200000,"max_waiting_requests":32,"per_request_tokens_per_second":32,"degradation_threshold":10,"max_concurrency":128,"max_degradation":60}' \
+  'http://127.0.0.1:8080/nodes/cllm'
+curl -X DELETE 'http://127.0.0.1:8080/nodes/cllm'
+```
+
+`POST` and `PUT` preserve omitted values when updating an existing node. For a new node, omitted numeric fields default to zero. These runtime edits are not written back to `nodes.yaml`; update the ConfigMap when you want the same fleet after a restart. `DELETE` refuses to remove the final node so the router always has a valid target for subsequent requests. A node may set `bypass_cache: true` to force `:dsl no-cache` semantics on every request routed to it (used by the real-GPU `vllm` baseline lane so cache replays from peer lanes never contaminate the upstream measurement).
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
@@ -316,7 +331,7 @@ For `POST /v1/chat/completions`, structured lifecycle events are emitted as logs
 make build
 ```
 
-This builds the local container image `cllm:0.14.0`.
+This builds the local container image `cllm:0.15.0`.
 
 To build and import that image into the local k3s container runtime:
 
@@ -327,8 +342,8 @@ make deploy
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.14.0 .
-docker save cllm:0.14.0 | sudo k3s ctr images import -
+docker build -t cllm:0.15.0 .
+docker save cllm:0.15.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -340,8 +355,8 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.14.0 .
-docker run --rm -p 8080:8080 cllm:0.14.0
+docker build -t cllm:0.15.0 .
+docker run --rm -p 8080:8080 cllm:0.15.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
@@ -354,7 +369,7 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.14.0`
+- deploy `cllm:0.15.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
 - mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path

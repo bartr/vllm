@@ -154,6 +154,25 @@ curl -s -X POST -g "http://$PROM/api/v1/admin/tsdb/delete_series?match[]={node=\
 curl -s -X POST    "http://$PROM/api/v1/admin/tsdb/clean_tombstones"
 ```
 
+### 8. Update repo memory
+
+Repo memory (`/memories/repo/*.md`) is the agent's durable record of
+verified codebase facts and conventions. Anything new this cycle that
+future sessions should not have to re-derive belongs there. Audit and
+update before declaring the release done:
+
+* New invariants, conventions, or hard-won debugging lessons (mirror or
+  link to the matching addition in `.github/instructions/cllm.instructions.md`).
+* Build / deploy / smoke commands whose flags or defaults changed.
+* Newly-stable node IDs, class names, metric labels, or DSL directives
+  that other notes will reference by name.
+* Removals: delete or correct any entry that this release made wrong
+  (e.g., a renamed metric, a retired endpoint, a flipped default).
+
+Keep entries terse — one fact per bullet, no walls of prose. The goal
+is a high-signal lookup table, not a changelog. The release notes on
+the annotated tag remain the changelog.
+
 ## What if the cluster is on a different version than `main`?
 
 The release tag is the authoritative answer to "what is in production".

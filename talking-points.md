@@ -150,6 +150,31 @@ Run cLLM on a laptop against a committed cache snapshot. Same envelope
 reproduces. **"The calibration host is the only paid GPU hour. Experiments
 replay anywhere."**
 
+### 6.4 Verified two-lane baseline (z01, May 2026)
+
+Two nodes share one vLLM backend on the same GPU and route via the default
+`Chained{ClassPinned, LeastLoaded}` policy:
+
+* `cllm` — synthetic cache-replay lane (`per_request_tokens_per_second: 32`,
+  `degradation_threshold: 10`, `max_concurrency: 128`, `max_degradation: 60`,
+  `prefill_rate_multiplier: 10`).
+* `vllm` — real-GPU baseline lane (`bypass_cache: true` so every request
+  always hits the upstream regardless of inbound DSL).
+
+Result with `ask --bench N --loop --files prompts.yaml --max-tokens 100`
+under unpinned routing (least-loaded splits requests across both lanes):
+
+| concurrency | per-node split | TTFT cllm | TTFT vllm |
+|---:|:---|---:|---:|
+| 32  | 16 / 16 | ~130 ms | ~117 ms |
+| 64  | 32 / 32 | comparable | comparable |
+| 128 | 62-67 each | comparable | comparable |
+
+The synthetic envelope tracks the calibrated GPU lane at three concurrency
+levels, with the router automatically distributing load across both nodes.
+**"Same dashboard, two lanes, one GPU — the synthetic path is honest at the
+load levels the platform is meant to study."**
+
 ---
 
 ## 7. Anticipated Questions and Answers

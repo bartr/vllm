@@ -187,3 +187,69 @@ func TestMultiNodeClassPinSelectsClass(t *testing.T) {
 		t.Fatalf("A10 admissions sum = %v, want 1", gotA)
 	}
 }
+
+// TestNodeBypassCacheForcesUpstream verifies that a node configured
+// with Capacity.BypassCache=true forces `:dsl no-cache` semantics for
+// every request routed to it: identical back-to-back requests must
+// each call upstream (no cache replay), and requests routed to a
+// peer node without the bypass should hit the cache normally.
+func TestNodeBypassCacheForcesUpstream(t *testing.T) {
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"test-model"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+			upstreamCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`))
+		default:
+			t.Fatalf("unexpected upstream request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	handler := NewHandlerWithDependencies(upstream.URL, upstream.Client(),
+		100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
+	handler.SetRequestProcessingLimits(200000, 1024)
+	handler.SetPrefillSimulation(0, 0, 0, 1)
+	handler.SetStreamRealism(0, 0, 0, 0, 0)
+
+	bypass := makeTestNode("vllm", "vllm", 100000)
+	bypass.Capacity.BypassCache = true
+	cached := makeTestNode("cllm", "cllm", 100000)
+	handler.SetNodes([]*node.Node{bypass, cached}, "")
+	routes := handler.Routes()
+
+	send := func(t *testing.T, content string) int {
+		t.Helper()
+		body := `{"messages":[{"role":"user","content":"` + content + `"}],"max_tokens":4}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		routes.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d body = %q", rec.Code, rec.Body.String())
+		}
+		return rec.Code
+	}
+
+	// Two identical requests pinned to the bypass-cache node must each
+	// hit upstream — never cache-replay.
+	upstreamCalls = 0
+	send(t, "hello :dsl node=vllm")
+	send(t, "hello :dsl node=vllm")
+	if upstreamCalls != 2 {
+		t.Fatalf("bypass node upstream calls = %d, want 2 (no cache replay)", upstreamCalls)
+	}
+
+	// Same prompt routed to the cached peer must populate the cache on
+	// the first call and replay on the second (single upstream call).
+	upstreamCalls = 0
+	send(t, "world :dsl node=cllm")
+	send(t, "world :dsl node=cllm")
+	if upstreamCalls != 1 {
+		t.Fatalf("cached node upstream calls = %d, want 1 (second should replay)", upstreamCalls)
+	}
+}

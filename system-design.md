@@ -112,6 +112,7 @@ vLLM-like serving instance, not a bare GPU. Each node owns:
 * Its own completion-token estimator
 * Per-node or inherited class realism knobs (`f(c)` concurrency-degradation curve, prefill, jitter, variability, stalls)
 * Optional Chat Completions API upstream metadata for pass-through / calibration nodes
+* Optional `bypass_cache: true` flag that forces `:dsl no-cache` semantics for every request routed to the node — used for "real GPU baseline" passthrough lanes (e.g. the `vllm` node) so cache hits from peer lanes never contaminate upstream-only measurements
 
 Nodes are loaded from `configs/nodes.yaml` (or `CLLM_NODES_FILE`). If no node
 file is present, the handler synthesizes one `default` node from the existing
@@ -126,7 +127,7 @@ Routing is **per-request**, not a deployment-time mode switch. Each
 * The router honors explicit pins first, then uses least-loaded routing by default. Least-loaded routing compares each candidate node's in-flight/capacity ratio and skips nodes whose remaining budget cannot fit the request cost; ties break on lexical node ID for determinism.
 * The configured `router.policy` accepts `class-pinned`, `least-loaded`, or `chained`. `chained` and the empty/default value both expand to `Chained{ClassPinned, LeastLoaded}`; `class-pinned` runs only the pin stage and returns `400 no_node_match` when neither `node=` nor `node-class=` is present. Unknown values fall back to `least-loaded`.
 * **Cache hit** (and no `:dsl no-cache` / `:dsl re-cache` directive): the selected synthetic node replays the cached response under per-request TPS pacing, prefill simulation, inter-token jitter, and configurable stream stalls.
-* **Cache miss, or `:dsl no-cache`, or `:dsl re-cache`**: the request is forwarded to the configured Chat Completions API upstream (vLLM, Azure OpenAI, OpenAI, or any other implementation of the same wire format). On success, the response is written back to the cache unless `no-cache` was specified (`re-cache` writes back; `no-cache` does neither lookup nor write). The selected node still owns admission, queueing, and per-node metrics for that request.
+* **Cache miss, or `:dsl no-cache`, or `:dsl re-cache`**: the request is forwarded to the configured Chat Completions API upstream (vLLM, Azure OpenAI, OpenAI, or any other implementation of the same wire format). On success, the response is written back to the cache unless `no-cache` was specified (`re-cache` writes back; `no-cache` does neither lookup nor write). The selected node still owns admission, queueing, and per-node metrics for that request. A node configured with `bypass_cache: true` is treated as if `no-cache` were set on every request routed to it, regardless of incoming DSL.
 
 Execution-layer mechanics that shape observed latency and throughput:
 
@@ -662,7 +663,7 @@ The combination — a synthetic system instrumented identically to the real one,
 
 ## 9. Live Reconfiguration and Experimentation
 
-cLLM exposes the entire experiment surface as **live state**. Operators can change scheduling, admission, generation realism, downstream targeting, and cache contents at runtime, with **no restarts and no redeploys** — either programmatically (`GET /config?key=value`, `POST /config` with a form body) or interactively from a browser via the `/config` HTML page that reflects current values, valid ranges, and live-computed quantities.
+cLLM exposes the entire experiment surface as **live state**. Operators can change scheduling, admission, generation realism, downstream targeting, node fleet shape, and cache contents at runtime, with **no restarts and no redeploys** — programmatically through `/config`, `/nodes`, and `/cache`, or interactively from a browser via the `/config` HTML page that reflects current values, valid ranges, and live-computed quantities.
 
 The full set of live-tunable knobs (each validated against the bounds defined in `runtimeconfig`):
 
@@ -689,6 +690,12 @@ The full set of live-tunable knobs (each validated against the bounds defined in
 
 * `downstream_url`, `downstream_token`, `downstream_model`
 
+**Node fleet**
+
+* `GET /nodes` and `GET /nodes/{id}` inspect the active runtime fleet.
+* `POST`/`PUT /nodes/{id}` creates or updates a node from JSON, form values, or query parameters. Omitted fields preserve the existing value on update.
+* `DELETE /nodes/{id}` removes a node, but deleting the last remaining node is rejected so routing always has a target. Runtime node edits affect the live process and do not rewrite `nodes.yaml`.
+
 **DSL**
 
 * `dsl_profile` — the default DSL profile applied when a request omits its own directive (composes with per-request `:dsl …`)
@@ -706,7 +713,7 @@ Tenant rate/burst are loaded from `configs/tenants.yaml` at startup (overridable
 
 Combined with per-request DSL directives (§12), the platform supports a wide spectrum of experiment styles without redeployment:
 
-* **Global policy sweeps** — ramp `max_tokens_in_flight` or `max_degradation` while a steady benchmark runs and read the response off the three observability layers (§8.4).
+* **Global policy sweeps** — ramp node `max_tokens_in_flight`, `per_request_tokens_per_second`, or `max_degradation` while a steady benchmark runs and read the response off the three observability layers (§8.4).
 * **A/B comparisons** — split traffic across DSL families (`tps`, `prefill`, `stall`, `no-cache`, `re-cache`) in a single run; metrics are partitioned by family automatically (§8.2).
 * **Cache-state transitions** — `:dsl no-cache` measures the real backend, `:dsl re-cache` refreshes a stale entry, `action=save`/`load` snapshots and restores a known-good cache between experiments.
 * **Backend swaps** — retarget `downstream_url`/`downstream_model` mid-flight to compare the same workload against vLLM, Azure OpenAI, OpenAI, OpenRouter, or any other Chat Completions API upstream without redeploying the synthetic system.
@@ -1141,7 +1148,7 @@ The combined effect: experimentation is no longer rate-limited by GPU availabili
 3. **Adaptive scheduling driven by closed-loop metrics feedback** — adjust `max_tokens_in_flight`, `max_concurrency`, and `f(c)` automatically from observed `cllm_*` series instead of static configuration.
 4. **Live editing of tenant rate/burst via `/config`** — currently startup-only via `configs/tenants.yaml` or `Handler.SetTenants` (§9).
 5. **Weighted decode-time fairness** — tenant priority, request size, queue age layered on top of the FIFO active set (§7.2).
-6. **Operational polish on the multi-node fleet** — multi-node simulation is now part of the architecture (§5.2, §6.7), and `nodes.yaml` already accepts per-node `upstream`/`token`/`model` metadata plus a `router.fallback` field. The remaining work is wiring those last pieces into the request path and the live config surface: (a) dispatch real-backend calls through the routed node's `Upstream` block instead of the global `downstream_url`, so per-node calibration and concurrent multi-target benchmarking become a routing decision (§4 of [multi-node-design.md](multi-node-design.md)); (b) consume `router.fallback: any|none` so cross-class fallback is enforced rather than parsed-and-ignored; (c) add/remove/resize nodes via `/config`, mirroring the live-tenant-editing item above; (d) per-request node-parameter overrides such as `:dsl node-tps=` or `:dsl node-degradation=`, mirroring the existing `:dsl tps=` / `:dsl prefill=` shape.
+6. **Operational polish on the multi-node fleet** — multi-node simulation is now part of the architecture (§5.2, §6.7), and `nodes.yaml` already accepts per-node `upstream`/`token`/`model` metadata plus a `router.fallback` field. Runtime node inspection and create/update/delete now live under `/nodes`, including the guard that the final node cannot be deleted. The remaining work is wiring the last routing pieces into the request path: (a) dispatch real-backend calls through the routed node's `Upstream` block instead of the global `downstream_url`, so per-node calibration and concurrent multi-target benchmarking become a routing decision (§4 of [multi-node-design.md](multi-node-design.md)); (b) consume `router.fallback: any|none` so cross-class fallback is enforced rather than parsed-and-ignored; (c) per-request node-parameter overrides such as `:dsl node-tps=` or `:dsl node-degradation=`, mirroring the existing `:dsl tps=` / `:dsl prefill=` shape.
 7. **Failure injection** — upstream failures, partial connectivity, slow DNS, mid-stream upstream drops; complements the in-stream stall/jitter realism in §7.2.
 8. **Per-request backend selection by node upstream** — `:dsl node=ID` already pins routing per-request, and `nodes.yaml` already attaches per-node upstream metadata (§6.7). What is missing is the dispatch step: when a routed node has a non-nil `Upstream`, real-backend calls should use that node's URL, token, and model instead of the global `downstream_url`. With (6a) implemented, a single deployment routes traffic concurrently against multiple real backends purely via node configuration, extending the multi-target story (§10.2, §11.3) without a new directive class.
 9. **Streaming admission preemption** — cooperative cancel-and-requeue under sustained tenant overage; today admitted requests run to completion.

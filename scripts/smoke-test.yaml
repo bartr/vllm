@@ -4,70 +4,78 @@
 # or one-by-one with `ASK_URL=http://... ask "<prompt>"` calls. Each prompt
 # exercises a distinct admission, DSL, or routing path. Comments describe
 # the expected outcome on a 2-node fleet where `kv-node` has
-# `max_kv_tokens: 1024` and `default` has KV disabled (see
+# `max_kv_tokens: 1024` and `cllm` has KV disabled (see
 # clusters/z01/cllm/nodes-configmap.yaml).
 #
 # Expected outcomes assume a fresh fleet (no other concurrent traffic).
 # Use `:dsl no-cache` everywhere so cached replays don't mask admission.
 
 # ---- 1. Baseline: plain request, no DSL --------------------------------
-# Expect: 200, served by either node, no KV gauges move on `default`.
+# Expect: 200, served by either node, no KV gauges move on `cllm`.
 - prompt: "what is 2+2?"
   dsl: "no-cache"
 
 # ---- 2. KV-enabled node, small KV charge -------------------------------
 # Expect: 200, kv-node accepts; cllm_node_kv_tokens_in_flight{node=kv-node}
 # briefly rises to 128 then returns to 0 on completion.
-- prompt: "small kv charge"
-  dsl: "node=kv-node kv-cost=128 no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "small kv charge"
+#   dsl: "node=kv-node kv-cost=128 no-cache"
 
 # ---- 3. KV-enabled node, mid-band KV charge ----------------------------
 # Expect: 200; KV occupancy panel shows ~50% spike during the request.
-- prompt: "medium kv charge"
-  dsl: "node=kv-node kv-cost=512 no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "medium kv charge"
+#   dsl: "node=kv-node kv-cost=512 no-cache"
 
 # ---- 4. KV oversize on KV-enabled node ---------------------------------
 # Expect: 429 "kv oversize"; cllm_tenant_rejections_total{reason=kv_oversize}
 # increments. The single request alone exceeds max_kv_tokens (16384 in
 # the production-shape config; raise this if max_kv_tokens grows again).
-- prompt: "oversize attempt"
-  dsl: "node=kv-node kv-cost=20000 no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "oversize attempt"
+#   dsl: "node=kv-node kv-cost=20000 no-cache"
 
 # ---- 5. Same oversize charge on KV-disabled node -----------------------
 # Expect: 200. Backward-compat contract: KV directives are no-ops on
 # nodes with max_kv_tokens=0 (Node.KV == nil).
 - prompt: "kv-disabled node ignores kv-cost"
-  dsl: "node=default kv-cost=20000 no-cache"
+  dsl: "node=cllm kv-cost=20000 no-cache"
 
 # ---- 6. no-kv directive on KV-enabled node -----------------------------
 # Expect: 200; KV gate is skipped entirely (sentinel KVCost=-1). Useful
 # kill-switch when investigating why a request is being rejected.
-- prompt: "no-kv on kv-node"
-  dsl: "node=kv-node no-kv no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "no-kv on kv-node"
+#   dsl: "node=kv-node no-kv no-cache"
 
 # ---- 7. no-kv beats a later kv-cost (first-wins) -----------------------
 # Expect: 200. The directive class `kv-cost` is shared between no-kv and
 # kv-cost=N; first-wins means a later oversized kv-cost cannot overturn
 # the no-kv claim and the request is admitted on kv-node.
-- prompt: "first-wins precedence"
-  dsl: "node=kv-node no-kv kv-cost=20000 no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "first-wins precedence"
+#   dsl: "node=kv-node no-kv kv-cost=20000 no-cache"
 
 # ---- 8. KV-light profile -----------------------------------------------
 # Expect: 200; light KV pressure visible on the cllm-overview KV panel.
-- prompt: "kv-light profile sweep"
-  dsl: "node=kv-node profile=kv-light no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "kv-light profile sweep"
+#   dsl: "node=kv-node profile=kv-light no-cache"
 
 # ---- 9. KV-heavy profile -----------------------------------------------
 # Expect: 200; KV occupancy spikes (kv-cost=512 vs cap=16384 ≈ 3%).
-- prompt: "kv-heavy profile sweep"
-  dsl: "node=kv-node profile=kv-heavy no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "kv-heavy profile sweep"
+#   dsl: "node=kv-node profile=kv-heavy no-cache"
 
 # ---- 10. KV-stress profile (oversize via profile) ----------------------
 # Expect: 429 "kv oversize"; same outcome as test 4 but driven by a
 # named profile bundle to confirm profile expansion reaches the
 # admission path.
-- prompt: "kv-stress profile"
-  dsl: "node=kv-node profile=kv-stress no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "kv-stress profile"
+#   dsl: "node=kv-node profile=kv-stress no-cache"
 
 # ---- 11. Routing without pin: least-loaded fans both ways --------------
 # Expect: 200; router.policy=least-loaded picks whichever node has the
@@ -79,11 +87,11 @@
 # Expect: 200; cllm_tenant_admissions_total{class="interactive"}
 # increments. Class is purely a label in 14A — admission behavior is
 # unchanged. Unknown class names route to the "default" label. Pinned to
-# `node=default` so the post-prompt-14 inflated kv-node estimator does not
+# `node=cllm` so the post-prompt-14 inflated kv-node estimator does not
 # bounce the request with kv_oversize — that admission gate is exercised
 # explicitly by prompts 4 and 10.
 - prompt: "workload-class via DSL"
-  dsl: "node=default workload-class=interactive no-cache"
+  dsl: "node=cllm workload-class=interactive no-cache"
 
 # ---- 13. Workload class falls back to default when name not registered -
 # Expect: 200; cllm_tenant_admissions_total{class="default"} increments.
@@ -91,7 +99,7 @@
 # configs/classes.yaml resolve to the "default" class label so dashboard
 # cardinality stays bounded by config.
 - prompt: "workload-class fallback to default"
-  dsl: "node=default workload-class=does-not-exist no-cache"
+  dsl: "node=cllm workload-class=does-not-exist no-cache"
 
 # ---- 14. Class queue timeout via DSL override (Phase 14B) --------------
 # Expect: 200 in isolation (no contention to time out against). Under
@@ -101,7 +109,7 @@
 # increments. Useful for the noisy-neighbor demo: pin interactive
 # traffic to a tight deadline while a batch flood saturates the budget.
 - prompt: "max-queue-ms via DSL"
-  dsl: "node=default max-queue-ms=50 no-cache"
+  dsl: "node=cllm max-queue-ms=50 no-cache"
 
 # ---- 15. Phase-aware token allocation via DSL (Phase 13.4) -------------
 # Expect: 200; the stream emits ~20 tokens of phase A at ~200 tps then
@@ -110,7 +118,7 @@
 # `Phase · Token Mix By Class` panel shows both bands. `no-cache` pulls
 # fresh content so the replay path actually paces the response.
 - prompt: "phase-aware allocation via DSL"
-  dsl: "node=default initial-tokens=20 initial-tps=200 sustained-tps=20 no-cache"
+  dsl: "node=cllm initial-tokens=20 initial-tps=200 sustained-tps=20 no-cache"
 
 # ---- 16. Class-resolved phase envelope ---------------------------------
 # Expect: 200; uses the `interactive` class envelope (when configured in
@@ -120,24 +128,24 @@
 # classes.yaml (initial_tokens=100, initial_tps=32, sustained_tps=16),
 # a transition fires after 100 tokens.
 - prompt: "phase-aware via class"
-  dsl: "node=default workload-class=interactive no-cache"
+  dsl: "node=cllm workload-class=interactive no-cache"
 
 # ---- 17. Force single-rate with no-phase -------------------------------
 # Expect: 200; baseline comparison against prompt 15. Even if the
 # resolved class declares an envelope, `no-phase` zeros it out for this
 # request. cllm_phase_transitions_total stays unchanged.
 - prompt: "no-phase forces single-rate"
-  dsl: "node=default workload-class=interactive no-phase no-cache"
+  dsl: "node=cllm workload-class=interactive no-phase no-cache"
 
 # ---- 18. Priority override via DSL (Phase 14C) -------------------------
 # Expect: 200 in isolation. Under load this directive lifts the request
 # above same-cost requests at lower priority in the admission queue.
 # `cllm_admission_priority_skips_total{node,class}` increments whenever
 # the queue promotes a non-head waiter (i.e., priority actually bumped
-# something out of the way). Use against a saturated default node to see
+# something out of the way). Use against a saturated cllm node to see
 # the skip counter move.
 - prompt: "priority=high via DSL"
-  dsl: "node=default priority=high no-cache"
+  dsl: "node=cllm priority=high no-cache"
 
 # ---- 19. Low priority demonstrates aging ------------------------------
 # Expect: 200. With the default 1 s aging step, a low-priority waiter
@@ -147,7 +155,7 @@
 # `priority=high` traffic and still drains via aging without explicit
 # scheduler intervention.
 - prompt: "priority=low via DSL"
-  dsl: "node=default priority=low no-cache"
+  dsl: "node=cllm priority=low no-cache"
 
 # ---- 20. KV estimator decoupling (Phase 4) -----------------------------
 # Expect: 200 on kv-node. Long prompt + small max_tokens drives the
@@ -160,16 +168,17 @@
 # `gpu_cache_usage_perc` and `cllm_node_kv_estimator_p95` converge, then
 # tune `kv_completion_factor` in classes.yaml until the synthetic node
 # tracks the real one.
-- prompt: "Summarize the following short paragraph in one sentence: cLLM is a lightweight admission and routing layer in front of a Chat Completions API endpoint."
-  dsl: "node=kv-node max-tokens=16 no-cache"
+# Disabled: kv-node is commented out in nodes-configmap.yaml.
+# - prompt: "Summarize the following short paragraph in one sentence: cLLM is a lightweight admission and routing layer in front of a Chat Completions API endpoint."
+#   dsl: "node=kv-node max-tokens=16 no-cache"
 
 # ---- 21. Class TTFT budget passes (Phase 13 follow-on, 0.11.x) --------
-# Expect: 200. Pinned to the default node (no kv estimator). DSL sets a
+# Expect: 200. Pinned to the cllm node (no kv estimator). DSL sets a
 # generous TTFT budget that the cached-replay path will not exceed, so
 # the prompt completes normally. Used to exercise the admission-time
 # `predictTTFTms` helper without tripping the gate.
 - prompt: "Explain Azure briefly."
-  dsl: "node=default max-ttft-ms=5000"
+  dsl: "node=cllm max-ttft-ms=5000"
 
 # ---- 22. Class TTFT budget rejects ------------------------------------
 # Expect: 429 with reason=class_ttft_budget once a cache entry exists.
@@ -178,4 +187,4 @@
 # refunded; the rejection-reason panel of `cllm-overview` should pick
 # up the new label value.
 - prompt: "Explain Azure briefly."
-  dsl: "node=default max-ttft-ms=1 prefill=500"
+  dsl: "node=cllm max-ttft-ms=1 prefill=500"

@@ -21,30 +21,16 @@ spec:
       enableServiceLinks: false
       containers:
         - name: cllm
-          image: cllm:0.14.0
+          image: cllm:0.16.0
           imagePullPolicy: Never
-          # Per-node pacing/concurrency now lives in cllm-nodes ConfigMap
-          # (see nodes-configmap.yaml). The flags below only configure the
-          # global queue admission ceilings (total tokens-in-flight and
-          # waiting-request depth) used by the request scheduler.
-          args:
-            - --max-tokens-in-flight=6000
-            - --max-waiting-requests=600
+          # Per-node pacing/concurrency/realism are configured exclusively
+          # via cllm-nodes ConfigMap (see nodes-configmap.yaml). All global
+          # throughput/prefill/stream knobs were retired in 0.16.0.
           env:
             - name: CACHE_DOWNSTREAM_URL
               value: http://vllm.vllm.svc.cluster.local:8000
             - name: CLLM_NODES_FILE
               value: /etc/cllm/nodes.yaml
-            # Prefill simulation tuned to vLLM Qwen2.5-3B TTFT curve
-            # (40ms @ c=1, ~500ms @ c=128). Per-class
-            # prefill_rate_multiplier (in nodes-configmap classes block)
-            # scales prefill with effective decode rate.
-            - name: CACHE_PREFILL_BASE_OVERHEAD_MS
-              value: "30"
-            - name: CACHE_PREFILL_JITTER_PERCENT
-              value: "10"
-            - name: CACHE_PREFILL_MAX_MS
-              value: "800"
           ports:
             - containerPort: 8080
               name: http

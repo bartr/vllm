@@ -1,6 +1,6 @@
 # Long-running dashboard fixture for ask --bench.
 #
-# Goal: drive sustained, balanced traffic onto node=cllm-rtx and
+# Goal: drive sustained, balanced traffic onto node=cllm and
 # node=vllm so the per-node panels on cllm-overview
 # (Tokens/s By Node, TTFT By Node, Latency By Node) stay populated
 # with two parallel lines.
@@ -12,7 +12,7 @@
 #     therefore its in-flight concurrency) independent — without it,
 #     a single shared worker pool drifts toward the slower lane and
 #     the per-node fleet TPS rates equalize.
-#   - cllm-rtx worker omits `no-cache`, so after the first sweep its
+#   - cllm worker omits `no-cache`, so after the first sweep its
 #     requests become cache hits paced by per_request_tokens_per_second.
 #   - vllm worker pins `no-cache`, so every request goes through the
 #     real GPU at vLLM's natural rate.
