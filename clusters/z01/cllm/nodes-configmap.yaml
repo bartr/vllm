@@ -15,26 +15,29 @@ data:
     # then 429 (reason: node_concurrency).
     #
     # Numbers calibrated against observed vLLM (Qwen2.5-3B on this
-    # cluster):
-    #   1 req     -> ~32 tok/s/req      = 32 fleet TPS
-    #   10 req    -> ~31 tok/s/req      = 310 fleet TPS
-    #   20 req    -> ~31 tok/s/req      = 630 fleet TPS
-    #   32 req    -> degradation begins (~25 tok/s/req)
-    #   64 req    -> max_degradation (~25 tok/s/req at 20% degradation)
-    #   65+ req   -> queue (up to 64 waiters), then 429
+    # cluster, max-num-seqs=128):
+    #   1 req      -> 32.4 tok/s/req
+    #   10 req     -> 31.2 tok/s/req   (degradation begins ~here)
+    #   20 req     -> 29.1 tok/s/req
+    #   40 req     -> 25.5 tok/s/req
+    #   80 req     -> 18.5 tok/s/req
+    #   120 req    -> 14.0 tok/s/req
+    #   128+ req   -> saturation (vLLM internal queue, ~5 tok/s/req)
+    # Linear fit threshold=10, max=128, base=32 → max_degradation=60%.
+    # Predicted vs measured within 11% mid-curve, <7% at endpoints.
     nodes:
       # Modeled lane: vLLM-shaped per-request pacing.
       cllm-rtx:
         class: cllm-rtx
         # Legacy token-cost gate kept generous so the new request-slot
         # gate (max_concurrency) is the binding admission control.
-        max_tokens_per_second: 600
+        max_tokens_per_second: 4096
         max_tokens_in_flight: 1000000
-        max_waiting_requests: 64
+        max_waiting_requests: 32
         # vLLM-shaped per-request pacing (item 15, 0.13.0).
-        per_request_tokens_per_second: 40
-        degradation_threshold: 32
-        max_concurrency: 64
+        per_request_tokens_per_second: 32
+        degradation_threshold: 10
+        max_concurrency: 128
 
       # vLLM lane: every per-request knob disabled so cllm adds
       # no shaping to upstream traffic. Use as the "real vLLM" baseline.
@@ -50,21 +53,22 @@ data:
       # KV-pressure lane: same per-request shape as cllm-rtx, plus the
       # KV admission gate. Not used in the throughput A/B; kept for KV
       # demos.
-      kv-node:
-        class: kv-test
-        max_tokens_per_second: 600
-        max_tokens_in_flight: 1000000
-        max_waiting_requests: 64
-        per_request_tokens_per_second: 32
-        degradation_threshold: 32
-        max_concurrency: 64
-        max_kv_tokens: 16384
-        kv_weight: 1.0
+      # kv-node:
+      #   class: kv-test
+      #   max_tokens_per_second: 4096
+      #   max_tokens_in_flight: 1000000
+      #   max_waiting_requests: 32
+      #   per_request_tokens_per_second: 32
+      #   degradation_threshold: 10
+      #   max_concurrency: 128
+      #   max_kv_tokens: 16384
+      #   kv_weight: 1.0
     classes:
       cllm-rtx:
         f_load_shape: piecewise_linear
-        # vLLM degrades modestly past saturation, not catastrophically.
-        max_degradation: 20
+        # Calibrated from measured vLLM curve: 32 → 12.8 tok/s/req
+        # across c=10..128 ⇒ 60% degradation at saturation.
+        max_degradation: 60
         prefill_rate_multiplier: 4
       vllm:
         f_load_shape: piecewise_linear
@@ -72,7 +76,7 @@ data:
         prefill_rate_multiplier: 0
       kv-test:
         f_load_shape: piecewise_linear
-        max_degradation: 20
+        max_degradation: 60
         prefill_rate_multiplier: 4
     router:
       policy: least-loaded

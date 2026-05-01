@@ -241,7 +241,7 @@ func TestParseDSLClampsPercentDeltas(t *testing.T) {
 
 func TestComputePrefillDelayHonorsNoPrefill(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	if d := handler.computePrefillDelay(100, replayOverrides{noPrefill: true}); d != 0 {
 		t.Fatalf("delay = %s, want 0 with noPrefill", d)
 	}
@@ -249,7 +249,7 @@ func TestComputePrefillDelayHonorsNoPrefill(t *testing.T) {
 
 func TestCachedReplayDelayHonorsNoTPS(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	if d := handler.cachedReplayDelay(50, 0, replayOverrides{noTPS: true}); d != 0 {
 		t.Fatalf("delay = %s, want 0 with noTPS", d)
 	}
@@ -257,7 +257,7 @@ func TestCachedReplayDelayHonorsNoTPS(t *testing.T) {
 
 func TestCachedReplayDelayUsesTPSOverride(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	withDefault := handler.cachedReplayDelay(100, 0, replayOverrides{})
 	withOverride := handler.cachedReplayDelay(100, 0, replayOverrides{tpsOverride: 1000})
 	if !(withOverride < withDefault) {
@@ -267,7 +267,7 @@ func TestCachedReplayDelayUsesTPSOverride(t *testing.T) {
 
 func TestComputeStreamSegmentDelayAppliesDelayScale(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	handler.jitterSource = func() float64 { return 0 }
 
@@ -296,7 +296,7 @@ func TestParseDSLLeavesPromptCleanWhenStopped(t *testing.T) {
 
 func TestComputePrefillDelayAppliesScale(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetPrefillSimulation(2.5, 100, 0, 60000) // disable jitter for determinism
 	base := handler.computePrefillDelay(50, replayOverrides{})
 	doubled := handler.computePrefillDelay(50, replayOverrides{prefillDurationScale: 2.0})

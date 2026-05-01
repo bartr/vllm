@@ -39,20 +39,11 @@ func TestCombinedLoadDrivesDegradationWhenKVEnabled(t *testing.T) {
 		t.Fatalf("long combined_load = %v, want > 0.10 (KV pressure visible)", longLoad)
 	}
 
-	const baseTPS = 32
-	const maxDeg = 50
-	shortDeg, shortTPS := degradationFromLoad(shortLoad, baseTPS, maxDeg)
-	longDeg, longTPS := degradationFromLoad(longLoad, baseTPS, maxDeg)
-
-	if shortDeg != 0 {
-		t.Fatalf("short_deg = %v, want 0 (below threshold)", shortDeg)
-	}
-	if longDeg <= shortDeg {
-		t.Fatalf("long_deg (%v) should exceed short_deg (%v)", longDeg, shortDeg)
-	}
-	if longTPS >= shortTPS {
-		t.Fatalf("long_tps (%v) should be < short_tps (%v) once KV pressure binds", longTPS, shortTPS)
-	}
+	// Item 16 (0.14.0): legacy global degradationFromLoad helper retired.
+	// Per-node concurrency degradation is exercised by
+	// TestCachedReplayDelayPerNodeDegradesAtConcurrency in
+	// prefill_per_node_test.go; here we only verify that combinedLoadOf
+	// surfaces the KV pressure that would feed that curve.
 }
 
 // TestCombinedLoadFallsBackToCostWhenKVDisabled enforces the backward-

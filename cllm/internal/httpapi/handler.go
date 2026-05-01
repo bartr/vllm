@@ -37,21 +37,20 @@ const (
 	defaultSystemPrompt               = runtimeconfig.DefaultSystemPrompt
 	minMaxTokens                      = runtimeconfig.MinMaxTokens
 	maxMaxTokens                      = runtimeconfig.MaxMaxTokens
-	minMaxTokensPerSecond             = runtimeconfig.MinMaxTokensPerSecond
-	maxMaxTokensPerSecond             = runtimeconfig.MaxMaxTokensPerSecond
 	minMaxTokensInFlight              = runtimeconfig.MinMaxTokensInFlight
 	maxMaxTokensInFlight              = runtimeconfig.MaxMaxTokensInFlight
 	minMaxWaitingRequests             = runtimeconfig.MinMaxWaitingRequests
 	maxMaxWaitingRequests             = runtimeconfig.MaxMaxWaitingRequests
-	minMaxDegradation                 = runtimeconfig.MinMaxDegradation
-	maxMaxDegradation                 = runtimeconfig.MaxMaxDegradation
 	defaultMaxTokens                  = runtimeconfig.DefaultMaxTokens
 	defaultTemperature                = runtimeconfig.DefaultTemperature
 	defaultVLLMHTTPTimeout            = 120 * time.Second
-	defaultMaxTokensPerSecond         = runtimeconfig.DefaultMaxTokensPerSecond
+	// defaultPerRequestTPS seeds the implicit single-node fallback's
+	// Capacity.PerRequestTPS when no nodes.yaml is present, so cached
+	// replay still paces at the legacy 32 tok/s/req default. Removed
+	// global flag `--max-tokens-per-second` (item 16, 0.14.0).
+	defaultPerRequestTPS              = runtimeconfig.DefaultMaxTokensPerSecond
 	defaultMaxTokensInFlight          = runtimeconfig.DefaultMaxTokensInFlight
 	defaultMaxWaitingRequests         = runtimeconfig.DefaultMaxWaitingRequests
-	defaultMaxDegradation             = runtimeconfig.DefaultMaxDegradation
 	defaultPrefillRateMultiplier      = runtimeconfig.DefaultPrefillRateMultiplier
 	defaultPrefillBaseOverheadMs      = runtimeconfig.DefaultPrefillBaseOverheadMs
 	defaultPrefillJitterPercent       = runtimeconfig.DefaultPrefillJitterPercent
@@ -75,7 +74,6 @@ const (
 	maxStreamStallProbabilityPercent     = runtimeconfig.MaxStreamStallProbabilityPercent
 	minStreamStallMs                     = runtimeconfig.MinStreamStallMs
 	maxStreamStallMs                     = runtimeconfig.MaxStreamStallMs
-	degradationThreshold              = 0.10
 )
 
 type askOptions struct {
@@ -109,8 +107,6 @@ type Handler struct {
 	httpClient                                *http.Client
 	modelsMu                                  sync.RWMutex
 	modelsCache                               *cachedModelsResponse
-	maxTokensPerSecond                        int
-	maxDegradation                            int
 	prefillRateMultiplier                     float64
 	prefillBaseOverhead                       time.Duration
 	prefillJitterPercent                      int
@@ -129,7 +125,6 @@ type Handler struct {
 	dslDefaultProfile                         string
 	tenants                                   *tenantRegistry
 	classes                                   *classRegistry
-	lastLoggedComputedDegradationMilliPercent atomic.Int64
 }
 
 func NewHandler() *Handler {
@@ -140,8 +135,6 @@ func NewHandler() *Handler {
 	handler.defaults = askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}
 	handler.vllmURL = trimTrailingSlash(defaultVLLMURL)
 	handler.httpClient = &http.Client{Timeout: defaultVLLMHTTPTimeout}
-	handler.maxTokensPerSecond = defaultMaxTokensPerSecond
-	handler.maxDegradation = defaultMaxDegradation
 	handler.prefillRateMultiplier = defaultPrefillRateMultiplier
 	handler.prefillBaseOverhead = time.Duration(defaultPrefillBaseOverheadMs) * time.Millisecond
 	handler.prefillJitterPercent = defaultPrefillJitterPercent
@@ -159,32 +152,28 @@ func NewHandler() *Handler {
 	handler.dslProfiles = cloneDSLProfiles(DefaultDSLProfiles)
 	handler.tenants = newTenantRegistry(TenantConfig{}, 256, 50)
 	handler.classes = newClassRegistry()
-	handler.lastLoggedComputedDegradationMilliPercent.Store(-1)
 	handler.metrics = newHandlerMetrics(handler)
 	handler.scheduler.metrics = handler.metrics
 	return handler
 }
 
-func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxTokensInFlight, maxWaitingRequests, maxDegradation int) {
-	if maxTokensPerSecond < minMaxTokensPerSecond || maxTokensPerSecond > maxMaxTokensPerSecond {
-		maxTokensPerSecond = defaultMaxTokensPerSecond
-	}
+// SetRequestProcessingLimits resizes the implicit single-node fallback's
+// token-budget admission semaphore. Per-request pacing rate (legacy
+// `--max-tokens-per-second`) and degradation curve (legacy
+// `--max-degradation`) were retired in 0.14.0; they live on per-node
+// Capacity.PerRequestTPS / Degradation.MaxDegradation now (see
+// system-design.md §6.X). The implicit fallback Node continues to seed
+// PerRequestTPS at the historical 32 tok/s default so cached replay
+// still paces by default.
+func (h *Handler) SetRequestProcessingLimits(maxTokensInFlight, maxWaitingRequests int) {
 	if maxTokensInFlight < minMaxTokensInFlight || maxTokensInFlight > maxMaxTokensInFlight {
 		maxTokensInFlight = defaultMaxTokensInFlight
 	}
 	if maxWaitingRequests < minMaxWaitingRequests || maxWaitingRequests > maxMaxWaitingRequests {
 		maxWaitingRequests = defaultMaxWaitingRequests
 	}
-	if maxDegradation < minMaxDegradation {
-		maxDegradation = 0
-	}
-	if maxDegradation > maxMaxDegradation {
-		maxDegradation = maxMaxDegradation
-	}
 
 	h.configMu.Lock()
-	h.maxTokensPerSecond = maxTokensPerSecond
-	h.maxDegradation = maxDegradation
 	if h.scheduler == nil {
 		h.scheduler = newRequestScheduler(maxTokensInFlight, maxWaitingRequests)
 		h.scheduler.metrics = h.metrics
@@ -193,47 +182,31 @@ func (h *Handler) SetRequestProcessingLimits(maxTokensPerSecond, maxTokensInFlig
 		h.scheduler.Reconfigure(maxTokensInFlight, maxWaitingRequests)
 	}
 	h.configMu.Unlock()
-	h.logComputedDegradationIfChanged("limits_updated")
 }
 
 type ProcessingStats struct {
-	MaxTokensPerSecond            int
-	EffectiveTokensPerSecond      float64
-	MaxTokensInFlight             int64
-	TokensInFlight                int64
-	MaxWaitingRequests            int
-	WaitingRequests               int
-	MaxDegradation                int
-	ComputedDegradationPercentage float64
+	MaxTokensInFlight  int64
+	TokensInFlight     int64
+	MaxWaitingRequests int
+	WaitingRequests    int
 }
 
 func (h *Handler) RequestProcessingStats() ProcessingStats {
 	h.configMu.RLock()
-	baseTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
 
-	stats := ProcessingStats{
-		MaxTokensPerSecond:       baseTokensPerSecond,
-		EffectiveTokensPerSecond: roundMetric(calibratedTokensPerSecond(baseTokensPerSecond)),
-		MaxDegradation:           maxDegradation,
-	}
-	if baseTokensPerSecond == 0 {
-		stats.EffectiveTokensPerSecond = 0
-	}
 	if scheduler == nil {
-		return stats
+		return ProcessingStats{}
 	}
-
-	maxTokensInFlight, tokensInFlight, maxWaitingRequests, waitingRequests, computedDegradationPercentage, effectiveTokensPerSecond := scheduler.processingStats(baseTokensPerSecond, maxDegradation)
-	stats.MaxTokensInFlight = maxTokensInFlight
-	stats.TokensInFlight = tokensInFlight
-	stats.MaxWaitingRequests = maxWaitingRequests
-	stats.WaitingRequests = waitingRequests
-	stats.ComputedDegradationPercentage = roundMetric(computedDegradationPercentage)
-	stats.EffectiveTokensPerSecond = roundMetric(effectiveTokensPerSecond)
-	return stats
+	capacity, inFlight, _, _ := scheduler.node.Budget.Stats()
+	_, _, maxWaiting, waiting := scheduler.Stats()
+	return ProcessingStats{
+		MaxTokensInFlight:  capacity,
+		TokensInFlight:     inFlight,
+		MaxWaitingRequests: maxWaiting,
+		WaitingRequests:    waiting,
+	}
 }
 
 func (h *Handler) RequestQueueStats() (int64, int64, int, int) {
@@ -400,12 +373,8 @@ type runtimeConfig struct {
 	DownstreamModel               string  `json:"downstream_model"`
 	SystemPrompt                  string  `json:"system_prompt"`
 	MaxTokens                     int     `json:"max_tokens"`
-	MaxTokensPerSecond            int     `json:"max_tokens_per_second"`
-	EffectiveTokensPerSecond      float64 `json:"effective_tokens_per_second"`
 	MaxTokensInFlight             int64   `json:"max_tokens_in_flight"`
 	MaxWaitingRequests            int     `json:"max_waiting_requests"`
-	MaxDegradation                int     `json:"max_degradation"`
-	ComputedDegradationPercentage float64 `json:"computed_degradation_percentage"`
 	Temperature                   float64 `json:"temperature"`
 	PrefillRateMultiplier         float64 `json:"prefill_rate_multiplier"`
 	PrefillBaseOverheadMs         int     `json:"prefill_base_overhead_ms"`
@@ -1244,12 +1213,8 @@ func (h *Handler) currentConfig() runtimeConfig {
 		DownstreamModel:               downstreamModel,
 		SystemPrompt:                  defaults.systemPrompt,
 		MaxTokens:                     defaults.maxTokens,
-		MaxTokensPerSecond:            processingStats.MaxTokensPerSecond,
-		EffectiveTokensPerSecond:      processingStats.EffectiveTokensPerSecond,
 		MaxTokensInFlight:             processingStats.MaxTokensInFlight,
 		MaxWaitingRequests:            processingStats.MaxWaitingRequests,
-		MaxDegradation:                processingStats.MaxDegradation,
-		ComputedDegradationPercentage: processingStats.ComputedDegradationPercentage,
 		Temperature:                   defaults.temperature,
 		PrefillRateMultiplier:         prefillRateMultiplier,
 		PrefillBaseOverheadMs:         int(prefillBaseOverhead / time.Millisecond),
@@ -1397,8 +1362,6 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	}
 
 	h.configMu.RLock()
-	maxTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
 	scheduler := h.scheduler
 	h.configMu.RUnlock()
 	var maxTokensInFlight int64
@@ -1410,17 +1373,6 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	}
 	previousMaxTokensInFlight := maxTokensInFlight
 	previousMaxWaitingRequests := maxWaitingRequests
-
-	if maxTokensPerSecondRaw := configQueryValue(queryValues, "max-tokens-per-second", "max_tokens_per_second"); maxTokensPerSecondRaw != "" {
-		parsed, err := strconv.Atoi(maxTokensPerSecondRaw)
-		if err != nil {
-			return false, fmt.Errorf("invalid max-tokens-per-second %q", maxTokensPerSecondRaw)
-		}
-		if parsed < minMaxTokensPerSecond || parsed > maxMaxTokensPerSecond {
-			return false, fmt.Errorf("max-tokens-per-second must be between %d and %d", minMaxTokensPerSecond, maxMaxTokensPerSecond)
-		}
-		maxTokensPerSecond = parsed
-	}
 
 	if maxTokensInFlightRaw := configQueryValue(queryValues, "max-tokens-in-flight", "max_tokens_in_flight"); maxTokensInFlightRaw != "" {
 		parsed, err := strconv.ParseInt(maxTokensInFlightRaw, 10, 64)
@@ -1442,17 +1394,6 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 			return false, fmt.Errorf("max-waiting-requests must be between %d and %d", minMaxWaitingRequests, maxMaxWaitingRequests)
 		}
 		maxWaitingRequests = parsed
-	}
-
-	if maxDegradationRaw := configQueryValue(queryValues, "max-degradation", "max_degradation"); maxDegradationRaw != "" {
-		parsed, err := strconv.Atoi(maxDegradationRaw)
-		if err != nil {
-			return false, fmt.Errorf("invalid max-degradation %q", maxDegradationRaw)
-		}
-		if parsed < minMaxDegradation || parsed > maxMaxDegradation {
-			return false, fmt.Errorf("max-degradation must be between %d and %d", minMaxDegradation, maxMaxDegradation)
-		}
-		maxDegradation = parsed
 	}
 
 	if temperatureRaw := configQueryValue(queryValues, "temperature"); temperatureRaw != "" {
@@ -1633,7 +1574,7 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 	h.SetDownstreamURL(downstreamURL)
 	h.SetDownstreamToken(downstreamToken)
 	h.SetDownstreamModel(downstreamModel)
-	h.SetRequestProcessingLimits(maxTokensPerSecond, int(maxTokensInFlight), maxWaitingRequests, maxDegradation)
+	h.SetRequestProcessingLimits(int(maxTokensInFlight), maxWaitingRequests)
 	if prefillChanged {
 		h.SetPrefillSimulation(prefillRateMultiplier, prefillBaseOverheadMs, prefillJitterPercent, prefillMaxMs)
 	}
@@ -1656,7 +1597,6 @@ func (h *Handler) applyConfigValues(queryValues url.Values) (bool, error) {
 			"waiting_requests", updatedWaitingRequests,
 		)
 	}
-	h.logComputedDegradationIfChanged("config_updated")
 
 	return true, nil
 }
@@ -2462,10 +2402,8 @@ func (h *Handler) acquireRequestSlot(ctx context.Context, cost node.RequestCost,
 	if !ok {
 		return nil, 0, false
 	}
-	h.logComputedDegradationIfChanged("request_admitted")
 	return func() {
 		release()
-		h.logComputedDegradationIfChanged("request_completed")
 	}, queueWait, true
 }
 
@@ -2498,10 +2436,8 @@ func (h *Handler) acquireRequestSlotOnNode(ctx context.Context, cost node.Reques
 	if !ok {
 		return nil, 0, false, reason
 	}
-	h.logComputedDegradationIfChanged("request_admitted")
 	return func() {
 		release()
-		h.logComputedDegradationIfChanged("request_completed")
 	}, queueWait, true, ""
 }
 
@@ -2688,6 +2624,24 @@ func (h *Handler) throttleStreamSegment(ctx context.Context, tokenCount, tokensS
 // Precedence: a per-request `:dsl tps=N` (overrides.tpsOverride > 0)
 // always wins — it explicitly says "single rate." The phase envelope
 // only fires when no DSL tps override is in effect.
+// cachedReplayDelay returns the simulated decode duration for one
+// segment of a cached replay stream.
+//
+// tokensSoFar is the count of tokens already emitted by the request
+// before this segment. It selects the active rate when the resolved
+// phaseEnvelope is two-phase (item 13): tokens whose index is below
+// `phase.InitialTokens` are paced at `phase.InitialTPS`; later tokens
+// are paced at `phase.SustainedTPS`.
+//
+// Pacing rate (precedence, item 16, 0.14.0):
+//
+//  1. `:dsl no-tps` → 0 delay (no pacing).
+//  2. `:dsl tps=N` → flat per-request rate N.
+//  3. phase envelope active → InitialTPS / SustainedTPS by tokensSoFar.
+//  4. routed node `Capacity.PerRequestTPS > 0` →
+//     `routedNode.PerRequestRate(ConcurrentRequests())` (three-regime curve).
+//  5. otherwise → 0 (no pacing). Legacy global `--max-tokens-per-second`
+//     and `--max-degradation` were retired; pacing is per-node only now.
 func (h *Handler) cachedReplayDelay(tokenCount, tokensSoFar int, overrides replayOverrides) time.Duration {
 	if tokenCount < 1 {
 		return 0
@@ -2696,64 +2650,42 @@ func (h *Handler) cachedReplayDelay(tokenCount, tokensSoFar int, overrides repla
 		return 0
 	}
 
-	// vLLM-shaped per-request pacing (item 15, 0.13.0). When the
-	// routed node has PerRequestTPS > 0, every request paces at the
-	// node's per-request rate regardless of fleet capacity. The rate
-	// itself depends on the node's live concurrency (three-regime
-	// curve in node.PerRequestRate). DSL `tps=N` and the phase
-	// envelope still win — they explicitly set a per-request rate,
-	// which is what the new model is doing in any case.
-	if n := overrides.routedNode; n != nil && n.Capacity.PerRequestTPS > 0 {
-		base := n.PerRequestRate(n.ConcurrentRequests())
-		switch {
-		case overrides.tpsOverride > 0:
-			base = float64(overrides.tpsOverride)
-		case overrides.phase.active():
-			rate := overrides.phase.SustainedTPS
-			if tokensSoFar < overrides.phase.InitialTokens {
-				rate = overrides.phase.InitialTPS
-			}
-			if rate > 0 {
-				base = float64(rate)
-			}
-		}
-		if base <= 0 {
-			return 0
-		}
-		return time.Duration(float64(tokenCount) * float64(time.Second) / base)
-	}
-
-	h.configMu.RLock()
-	baseTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
-	scheduler := h.scheduler
-	h.configMu.RUnlock()
-
+	var base float64
 	switch {
 	case overrides.tpsOverride > 0:
-		baseTokensPerSecond = overrides.tpsOverride
+		base = float64(overrides.tpsOverride)
 	case overrides.phase.active():
 		rate := overrides.phase.SustainedTPS
 		if tokensSoFar < overrides.phase.InitialTokens {
 			rate = overrides.phase.InitialTPS
 		}
 		if rate > 0 {
-			baseTokensPerSecond = rate
+			base = float64(rate)
 		}
 	}
-
-	effectiveTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
-	if baseTokensPerSecond == 0 {
+	if base <= 0 {
+		if n := overrides.routedNode; n != nil && n.Capacity.PerRequestTPS > 0 {
+			base = n.PerRequestRate(n.ConcurrentRequests())
+		}
+	}
+	if base <= 0 {
+		// Item 16 (0.14.0): when no routed node is supplied (e.g.
+		// direct replay paths and unit tests that don't pass through
+		// the router), fall back to the implicit fallback Node owned
+		// by the scheduler. That Node is seeded with
+		// `Capacity.PerRequestTPS = defaultPerRequestTPS` so default
+		// pacing is preserved without any global flag.
+		h.configMu.RLock()
+		sched := h.scheduler
+		h.configMu.RUnlock()
+		if sched != nil && sched.node != nil && sched.node.Capacity.PerRequestTPS > 0 {
+			base = sched.node.PerRequestRate(sched.node.ConcurrentRequests())
+		}
+	}
+	if base <= 0 {
 		return 0
 	}
-	if scheduler != nil {
-		effectiveTokensPerSecond = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
-	}
-	if effectiveTokensPerSecond <= 0 {
-		effectiveTokensPerSecond = 1
-	}
-
-	return time.Duration(float64(tokenCount) * float64(time.Second) / effectiveTokensPerSecond)
+	return time.Duration(float64(tokenCount) * float64(time.Second) / base)
 }
 
 func sleepWithContext(ctx context.Context, duration time.Duration) error {
@@ -2811,6 +2743,23 @@ func (h *Handler) SetPrefillSimulation(rateMultiplier float64, baseOverheadMs, j
 
 // computePrefillDelay returns the simulated prefill latency for the given
 // prompt token count. A return of 0 means prefill simulation is disabled.
+//
+// Per-node prefill (item 16, 0.14.0): when the routed node carries
+// `Capacity.PerRequestTPS > 0`, both the decode-rate basis and the
+// prefill realism knobs (`Realism.Prefill*`) come from the node. The
+// effective decode rate is `routedNode.PerRequestRate(ConcurrentRequests())`,
+// mirroring `cachedReplayDelay`'s 0.13.0 path so prefill TTFT tracks
+// the same per-node concurrency curve as decode pacing. Per-node
+// realism knobs that are zero fall back to the handler globals so
+// operators can leave a class default in nodes.yaml and still tune
+// jitter/cap centrally.
+//
+// Legacy single-node fallback path (routedNode == nil OR
+// PerRequestTPS == 0): handler globals (`h.maxTokensPerSecond`,
+// `h.maxDegradation`, scheduler degradation curve) drive the rate.
+// Passthrough nodes that opt out of per-request pacing therefore
+// continue to follow the global pacing rate today; row 2 of 0.14.0
+// retires that fallback in a follow-on commit.
 func (h *Handler) computePrefillDelay(promptTokens int, overrides replayOverrides) time.Duration {
 	if promptTokens < 0 {
 		promptTokens = 0
@@ -2819,33 +2768,18 @@ func (h *Handler) computePrefillDelay(promptTokens int, overrides replayOverride
 		return 0
 	}
 
-	h.configMu.RLock()
-	rateMultiplier := h.prefillRateMultiplier
-	base := h.prefillBaseOverhead
-	jitterPercent := h.prefillJitterPercent
-	maxDuration := h.prefillMaxDuration
-	baseTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
-	scheduler := h.scheduler
-	jitterSource := h.jitterSource
-	h.configMu.RUnlock()
-
-	if overrides.tpsOverride > 0 {
-		baseTokensPerSecond = overrides.tpsOverride
-	}
-
-	if rateMultiplier <= 0 || baseTokensPerSecond <= 0 {
+	rateMultiplier, base, jitterPercent, maxDuration, effectiveDecodeRate, ok := h.resolvePrefillParams(overrides)
+	if !ok {
 		return 0
-	}
-
-	effectiveDecodeRate := calibratedTokensPerSecond(baseTokensPerSecond)
-	if scheduler != nil {
-		effectiveDecodeRate = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
 	}
 	prefillRate := effectiveDecodeRate * rateMultiplier
 	if prefillRate <= 0 {
 		return 0
 	}
+
+	h.configMu.RLock()
+	jitterSource := h.jitterSource
+	h.configMu.RUnlock()
 
 	delay := base + time.Duration(float64(promptTokens)/prefillRate*float64(time.Second))
 	if jitterPercent > 0 && jitterSource != nil {
@@ -2862,6 +2796,68 @@ func (h *Handler) computePrefillDelay(promptTokens int, overrides replayOverride
 		delay = maxDuration
 	}
 	return delay
+}
+
+// resolvePrefillParams resolves the prefill rate, base overhead, jitter
+// percent, max-duration cap, and effective decode rate for one prefill
+// computation. Returns ok=false when prefill simulation is effectively
+// disabled (zero rate multiplier or zero decode rate). Shared by
+// computePrefillDelay, computePrefillDelayDeterministic, and predictTTFTms.
+func (h *Handler) resolvePrefillParams(overrides replayOverrides) (rateMultiplier float64, base time.Duration, jitterPercent int, maxDuration time.Duration, effectiveDecodeRate float64, ok bool) {
+	h.configMu.RLock()
+	rateMultiplier = h.prefillRateMultiplier
+	base = h.prefillBaseOverhead
+	jitterPercent = h.prefillJitterPercent
+	maxDuration = h.prefillMaxDuration
+	h.configMu.RUnlock()
+
+	// Per-node Realism overrides (zero falls back to global).
+	if n := overrides.routedNode; n != nil {
+		if n.Realism.PrefillRateMultiplier > 0 {
+			rateMultiplier = n.Realism.PrefillRateMultiplier
+		}
+		if n.Realism.PrefillBaseOverheadMs > 0 {
+			base = time.Duration(n.Realism.PrefillBaseOverheadMs) * time.Millisecond
+		}
+		if n.Realism.PrefillJitterPercent > 0 {
+			jitterPercent = n.Realism.PrefillJitterPercent
+		}
+		if n.Realism.PrefillMaxMs > 0 {
+			maxDuration = time.Duration(n.Realism.PrefillMaxMs) * time.Millisecond
+		}
+	}
+	if rateMultiplier <= 0 {
+		return
+	}
+
+	// Decode-rate basis (item 16, 0.14.0): per-node PerRequestRate
+	// curve only. Legacy global scheduler degradation curve was retired
+	// alongside `--max-tokens-per-second` / `--max-degradation`. DSL
+	// `tps=N` always wins (per-request explicit pin). Passthrough nodes
+	// (PerRequestTPS == 0) intentionally produce zero prefill so a
+	// real-GPU baseline lane has no simulated prefill on top of vLLM.
+	switch {
+	case overrides.tpsOverride > 0:
+		effectiveDecodeRate = float64(overrides.tpsOverride)
+	case overrides.routedNode != nil && overrides.routedNode.Capacity.PerRequestTPS > 0:
+		effectiveDecodeRate = overrides.routedNode.PerRequestRate(overrides.routedNode.ConcurrentRequests())
+	default:
+		// Item 16 (0.14.0): when no routed node is supplied, fall
+		// back to the implicit fallback Node owned by the
+		// scheduler so prefill simulation still has a decode-rate
+		// basis in single-node default deployments.
+		h.configMu.RLock()
+		sched := h.scheduler
+		h.configMu.RUnlock()
+		if sched != nil && sched.node != nil && sched.node.Capacity.PerRequestTPS > 0 {
+			effectiveDecodeRate = sched.node.PerRequestRate(sched.node.ConcurrentRequests())
+		}
+	}
+	if effectiveDecodeRate <= 0 {
+		return
+	}
+	ok = true
+	return
 }
 
 func (h *Handler) simulatePrefillDelay(ctx context.Context, promptTokens int, overrides replayOverrides) (time.Duration, error) {
@@ -2883,49 +2879,46 @@ func (h *Handler) simulatePrefillDelay(ctx context.Context, promptTokens int, ov
 //	prefill_ms     — same shape as computePrefillDelay but without the
 //	                 random ±jitterPercent term, so successive calls
 //	                 with identical inputs return the same number.
-//	first_token_ms — ceil(1000 / first_token_tps), where first_token_tps
-//	                 is the rate the request will start at:
-//	                   * `:dsl tps=N` if set,
-//	                   * phase.InitialTPS if the resolved phase is
-//	                     active and InitialTokens > 0,
-//	                   * else h.maxTokensPerSecond.
-//	                 Degradation is applied via the same scheduler hook
-//	                 used by computePrefillDelay so the prediction
-//	                 tracks current node load.
+//	first_token_ms — ceil(1000 / first_token_tps). Per-node since 0.14.0
+//	                 (item 16): rate is `:dsl tps=N`, else phase
+//	                 envelope's InitialTPS when active, else the routed
+//	                 node's `PerRequestRate(ConcurrentRequests())`.
+//	                 Passthrough nodes (PerRequestTPS == 0) report a
+//	                 zero first-token component, matching pure proxy
+//	                 semantics.
 //
 // Queue-wait is intentionally NOT included; that axis is owned by
 // `class_queue_timeout` (Phase 14B). Returns total milliseconds.
 func (h *Handler) predictTTFTms(promptTokens int, overrides replayOverrides) int {
 	prefillMs := h.computePrefillDelayDeterministic(promptTokens, overrides)
 
-	h.configMu.RLock()
-	baseTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
-	scheduler := h.scheduler
-	h.configMu.RUnlock()
-
-	switch {
-	case overrides.noTPS:
+	if overrides.noTPS {
 		// No pacing — first token emits as fast as the writer can
 		// flush. Use 0 ms for the first-token component.
 		return int(prefillMs / time.Millisecond)
+	}
+
+	var effective float64
+	switch {
 	case overrides.tpsOverride > 0:
-		baseTokensPerSecond = overrides.tpsOverride
+		effective = float64(overrides.tpsOverride)
 	case overrides.phase.active() && overrides.phase.InitialTPS > 0:
-		baseTokensPerSecond = overrides.phase.InitialTPS
+		effective = float64(overrides.phase.InitialTPS)
+	case overrides.routedNode != nil && overrides.routedNode.Capacity.PerRequestTPS > 0:
+		effective = overrides.routedNode.PerRequestRate(overrides.routedNode.ConcurrentRequests())
+	default:
+		// Item 16 (0.14.0): fall back to the scheduler's implicit
+		// fallback Node when no routed node is supplied.
+		h.configMu.RLock()
+		sched := h.scheduler
+		h.configMu.RUnlock()
+		if sched != nil && sched.node != nil && sched.node.Capacity.PerRequestTPS > 0 {
+			effective = sched.node.PerRequestRate(sched.node.ConcurrentRequests())
+		}
 	}
 
-	if baseTokensPerSecond <= 0 {
-		// Pacing disabled at the handler level; same as no-tps.
-		return int(prefillMs / time.Millisecond)
-	}
-
-	effective := calibratedTokensPerSecond(baseTokensPerSecond)
-	if scheduler != nil {
-		effective = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
-	}
 	if effective <= 0 {
-		effective = 1
+		return int(prefillMs / time.Millisecond)
 	}
 	firstTokenMs := int(1000.0/effective + 0.999) // ceil
 	return int(prefillMs/time.Millisecond) + firstTokenMs
@@ -2935,7 +2928,9 @@ func (h *Handler) predictTTFTms(promptTokens int, overrides replayOverrides) int
 // omits the random jitter draw, so repeated calls with the same inputs
 // return the same value. Used by predictTTFTms; the actual streaming
 // path continues to call computePrefillDelay (with jitter) so observed
-// TTFT still varies as configured.
+// TTFT still varies as configured. Resolves rate + caps via the same
+// resolvePrefillParams helper so per-node prefill (item 16, 0.14.0)
+// also drives the admission-time TTFT prediction.
 func (h *Handler) computePrefillDelayDeterministic(promptTokens int, overrides replayOverrides) time.Duration {
 	if promptTokens < 0 {
 		promptTokens = 0
@@ -2944,25 +2939,9 @@ func (h *Handler) computePrefillDelayDeterministic(promptTokens int, overrides r
 		return 0
 	}
 
-	h.configMu.RLock()
-	rateMultiplier := h.prefillRateMultiplier
-	base := h.prefillBaseOverhead
-	maxDuration := h.prefillMaxDuration
-	baseTokensPerSecond := h.maxTokensPerSecond
-	maxDegradation := h.maxDegradation
-	scheduler := h.scheduler
-	h.configMu.RUnlock()
-
-	if overrides.tpsOverride > 0 {
-		baseTokensPerSecond = overrides.tpsOverride
-	}
-	if rateMultiplier <= 0 || baseTokensPerSecond <= 0 {
+	rateMultiplier, base, _, maxDuration, effectiveDecodeRate, ok := h.resolvePrefillParams(overrides)
+	if !ok {
 		return 0
-	}
-
-	effectiveDecodeRate := calibratedTokensPerSecond(baseTokensPerSecond)
-	if scheduler != nil {
-		effectiveDecodeRate = scheduler.effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation)
 	}
 	prefillRate := effectiveDecodeRate * rateMultiplier
 	if prefillRate <= 0 {
@@ -3089,26 +3068,6 @@ func estimatePromptTokensFromRequest(payload chatCompletionRequest) int {
 	return estimateTextTokens(strings.Join(parts, " "))
 }
 
-func (h *Handler) logComputedDegradationIfChanged(source string) {
-	stats := h.RequestProcessingStats()
-	currentMilliPercent := int64(math.Round(stats.ComputedDegradationPercentage * 1000))
-	if h.lastLoggedComputedDegradationMilliPercent.Load() == currentMilliPercent {
-		return
-	}
-	h.lastLoggedComputedDegradationMilliPercent.Store(currentMilliPercent)
-	slog.Info(
-		"computed degradation updated",
-		"source", source,
-		"computed_degradation_percentage", stats.ComputedDegradationPercentage,
-		"effective_tokens_per_second", stats.EffectiveTokensPerSecond,
-		"max_tokens_per_second", stats.MaxTokensPerSecond,
-		"tokens_in_flight", stats.TokensInFlight,
-		"max_tokens_in_flight", stats.MaxTokensInFlight,
-		"waiting_requests", stats.WaitingRequests,
-		"max_waiting_requests", stats.MaxWaitingRequests,
-	)
-}
-
 func roundMetric(value float64) float64 {
 	return math.Round(value*1000) / 1000
 }
@@ -3166,6 +3125,13 @@ func newRequestScheduler(maxTokensInFlight, maxWaitingRequests int) *requestSche
 		Capacity: node.Capacity{
 			MaxTokensInFlight:  int64(maxTokensInFlight),
 			MaxWaitingRequests: maxWaitingRequests,
+			// Item 16 (0.14.0): seed the implicit fallback Node with
+			// the historical default per-request decode rate so cached
+			// replay still paces by default when no nodes.yaml is
+			// loaded. Per-node `PerRequestRate(c)` curves now own all
+			// pacing; the legacy global `--max-tokens-per-second` /
+			// `--max-degradation` flags were retired.
+			PerRequestTPS: defaultPerRequestTPS,
 		},
 	}
 	return &requestScheduler{
@@ -3373,81 +3339,10 @@ func (s *requestScheduler) releaseFuncWithKV(n *node.Node, cost, kvCost int64, c
 	}
 }
 
-func (s *requestScheduler) effectiveTokensPerSecond(baseTokensPerSecond, maxDegradation int) float64 {
-	_, effectiveTokensPerSecond := s.degradationMetrics(baseTokensPerSecond, maxDegradation)
-	return effectiveTokensPerSecond
-}
-
-// processingStats returns the snapshot used for metrics and the /config
-// endpoint: (maxTokensInFlight, tokensInFlight, maxWaiting, waiting,
-// computedDegradationPercentage, effectiveTokensPerSecond).
-func (s *requestScheduler) processingStats(baseTokensPerSecond, maxDegradation int) (int64, int64, int, int, float64, float64) {
-	capacity, inFlight, waiting, maxWaiting := s.node.Budget.Stats()
-	computedDegradationPercentage, effectiveTokensPerSecond := s.degradationFromNode(s.node, capacity, inFlight, baseTokensPerSecond, maxDegradation)
-	return capacity, inFlight, maxWaiting, waiting, computedDegradationPercentage, effectiveTokensPerSecond
-}
-
-func (s *requestScheduler) degradationMetrics(baseTokensPerSecond, maxDegradation int) (float64, float64) {
-	capacity, inFlight, _, _ := s.node.Budget.Stats()
-	return s.degradationFromNode(s.node, capacity, inFlight, baseTokensPerSecond, maxDegradation)
-}
-
-// degradationFromNode picks the right f(load) path for a node. When KV
-// modeling is disabled (n.KV == nil) it delegates to the integer-
-// arithmetic cost-only formula in degradationMetricsFor so byte-for-byte
-// behavior is preserved for single-node default deployments. When KV
-// modeling is enabled it computes combined_load = max(cost_load, kv_load
-// * kv_weight) and feeds that into the float-arithmetic curve.
-func (s *requestScheduler) degradationFromNode(n *node.Node, capacity, inFlight int64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
-	if n == nil || n.KV == nil {
-		return s.degradationMetricsFor(capacity, inFlight, baseTokensPerSecond, maxDegradation)
-	}
-	return degradationFromLoad(combinedLoadOf(n), baseTokensPerSecond, maxDegradation)
-}
-
-// degradationMetricsFor computes (computedDegradationPercentage,
-// effectiveTokensPerSecond) using the cost-based fill ratio
-// inFlight/capacity. Below the 10% threshold there is no degradation; above
-// it, degradation scales linearly to maxDegradation at full capacity.
-//
-// This is the cost-only path; KV-aware callers should use
-// degradationFromNode (which falls through to here when KV is disabled).
-func (s *requestScheduler) degradationMetricsFor(capacity, inFlight int64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
-	if baseTokensPerSecond < 1 {
-		return 0, 0
-	}
-	calibratedBaseTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
-	if maxDegradation == 0 || capacity <= 0 {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	thresholdCost := int64(math.Floor(float64(capacity) * degradationThreshold))
-	if inFlight <= thresholdCost {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	degradationWindow := capacity - thresholdCost
-	if degradationWindow <= 0 {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	progress := float64(inFlight-thresholdCost) / float64(degradationWindow)
-	if progress < 0 {
-		progress = 0
-	}
-	if progress > 1 {
-		progress = 1
-	}
-	computedDegradationPercentage := float64(maxDegradation) * progress
-	effectiveTokensPerSecond := calibratedBaseTokensPerSecond * (1 - computedDegradationPercentage/100)
-	if effectiveTokensPerSecond < 1 {
-		effectiveTokensPerSecond = 1
-	}
-	return computedDegradationPercentage, effectiveTokensPerSecond
-}
-
 // combinedLoadOf returns max(cost_load, kv_load * kv_weight) for the
-// given node, where each load is the budget's in-flight / capacity. A
-// node with KV modeling disabled (n.KV == nil or capacity == 0) falls
-// back to cost_load alone, keeping single-node default deployments
-// byte-for-byte identical to pre-KV behavior.
+// given node. Used by the per-node `cllm_node_combined_load` metric to
+// expose the same load fraction the (now per-node) admission path
+// reasons about.
 func combinedLoadOf(n *node.Node) float64 {
 	if n == nil || n.Budget == nil {
 		return 0
@@ -3475,41 +3370,6 @@ func costLoad(capacity, inFlight int64) float64 {
 		return 0
 	}
 	return float64(inFlight) / float64(capacity)
-}
-
-// degradationFromLoad applies the piecewise-linear f(load) curve to a
-// normalized load fraction in [0, +inf). Below the 10% deadband there is
-// no degradation; above it, degradation ramps linearly to maxDegradation
-// percent as load reaches 1.0. Loads above 1.0 are clamped (matching the
-// pre-KV inFlight==capacity behavior).
-func degradationFromLoad(load float64, baseTokensPerSecond, maxDegradation int) (float64, float64) {
-	if baseTokensPerSecond < 1 {
-		return 0, 0
-	}
-	calibratedBaseTokensPerSecond := calibratedTokensPerSecond(baseTokensPerSecond)
-	if maxDegradation == 0 {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	if load <= degradationThreshold {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	window := 1.0 - degradationThreshold
-	if window <= 0 {
-		return 0, calibratedBaseTokensPerSecond
-	}
-	progress := (load - degradationThreshold) / window
-	if progress < 0 {
-		progress = 0
-	}
-	if progress > 1 {
-		progress = 1
-	}
-	computedDegradationPercentage := float64(maxDegradation) * progress
-	effectiveTokensPerSecond := calibratedBaseTokensPerSecond * (1 - computedDegradationPercentage/100)
-	if effectiveTokensPerSecond < 1 {
-		effectiveTokensPerSecond = 1
-	}
-	return computedDegradationPercentage, effectiveTokensPerSecond
 }
 
 type replayStreamSegment struct {

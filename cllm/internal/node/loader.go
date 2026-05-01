@@ -15,7 +15,6 @@ import (
 //	  rtx-2000-0:
 //	    class: rtx-2000
 //	    upstream: http://vllm:8000/v1
-//	    max_tokens_per_second: 30
 //	    max_tokens_in_flight: 8192
 //	    max_waiting_requests: 100
 //	classes:
@@ -45,7 +44,6 @@ type NodeSpec struct {
 	Model    string `yaml:"model"`
 
 	MaxTokensInFlight  int64 `yaml:"max_tokens_in_flight"`
-	MaxTokensPerSecond int   `yaml:"max_tokens_per_second"`
 	MaxWaitingRequests int   `yaml:"max_waiting_requests"`
 
 	// vLLM-style per-request pacing knobs (item 15, 0.13.0). All three
@@ -192,9 +190,6 @@ func (s *FileSpec) Validate() error {
 		if n.MaxTokensInFlight < 0 {
 			return fmt.Errorf("node %q: max_tokens_in_flight must be >= 0", id)
 		}
-		if n.MaxTokensPerSecond < 0 {
-			return fmt.Errorf("node %q: max_tokens_per_second must be >= 0", id)
-		}
 		if n.MaxWaitingRequests < 0 {
 			return fmt.Errorf("node %q: max_waiting_requests must be >= 0", id)
 		}
@@ -247,7 +242,6 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 
 		cap := Capacity{
 			MaxTokensInFlight:  pickInt64(spec.MaxTokensInFlight, fallback.MaxTokensInFlight),
-			MaxTokensPerSecond: pickInt(spec.MaxTokensPerSecond, fallback.MaxTokensPerSecond),
 			MaxWaitingRequests: pickInt(spec.MaxWaitingRequests, fallback.MaxWaitingRequests),
 			MaxKVTokens:        pickInt64(spec.MaxKVTokens, class.MaxKVTokens),
 			KVWeight:           derefFloat64(spec.KVWeight, class.KVWeight),

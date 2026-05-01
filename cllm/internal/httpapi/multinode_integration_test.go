@@ -36,7 +36,7 @@ func TestMultiNodeRoutingEndToEnd(t *testing.T) {
 
 	handler := NewHandlerWithDependencies(upstream.URL, upstream.Client(),
 		100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.SetRequestProcessingLimits(32, 200000, 1024, 0)
+	handler.SetRequestProcessingLimits(200000, 1024)
 	handler.SetPrefillSimulation(0, 0, 0, 1)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 
@@ -95,7 +95,7 @@ func TestMultiNodeLeastLoadedSpreadsLoad(t *testing.T) {
 
 	handler := NewHandlerWithDependencies(upstream.URL, upstream.Client(),
 		100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.SetRequestProcessingLimits(32, 200000, 1024, 0)
+	handler.SetRequestProcessingLimits(200000, 1024)
 	handler.SetPrefillSimulation(0, 0, 0, 1)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 
@@ -155,7 +155,7 @@ func TestMultiNodeClassPinSelectsClass(t *testing.T) {
 
 	handler := NewHandlerWithDependencies(upstream.URL, upstream.Client(),
 		100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	handler.SetRequestProcessingLimits(32, 200000, 1024, 0)
+	handler.SetRequestProcessingLimits(200000, 1024)
 	handler.SetPrefillSimulation(0, 0, 0, 1)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 

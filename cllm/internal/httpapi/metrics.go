@@ -272,27 +272,6 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 			return float64(stats.MaxWaitingRequests)
 		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "cllm_tokens_per_second_configured",
-			Help: "Configured cached replay tokens per second.",
-		}, func() float64 {
-			stats := handler.RequestProcessingStats()
-			return float64(stats.MaxTokensPerSecond)
-		}),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "cllm_tokens_per_second_effective",
-			Help: "Effective cached replay tokens per second after degradation.",
-		}, func() float64 {
-			stats := handler.RequestProcessingStats()
-			return stats.EffectiveTokensPerSecond
-		}),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "cllm_queue_computed_degradation_percentage",
-			Help: "Current computed replay degradation percentage.",
-		}, func() float64 {
-			stats := handler.RequestProcessingStats()
-			return stats.ComputedDegradationPercentage
-		}),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cllm_cache_entries",
 			Help: "Current number of cache entries.",
 		}, func() float64 {

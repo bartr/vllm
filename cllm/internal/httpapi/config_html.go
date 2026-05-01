@@ -103,8 +103,6 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 		{Key: "tokens_in_flight", Label: "Tokens In Flight", Current: strconv.FormatInt(cfg.TokensInFlight, 10)},
 		{Key: "waiting_requests", Label: "Waiting Requests", Current: strconv.Itoa(cfg.WaitingRequests)},
 		{Key: "cache_entries", Label: "Cache Entries", Current: strconv.Itoa(cfg.CacheEntries)},
-		{Key: "effective_tokens_per_second", Label: "Effective Tokens/sec", Current: strconv.FormatFloat(cfg.EffectiveTokensPerSecond, 'f', 2, 64)},
-		{Key: "computed_degradation_percentage", Label: "Computed Degradation %", Current: strconv.FormatFloat(cfg.ComputedDegradationPercentage, 'f', 2, 64)},
 	}
 
 	sections := []configSection{
@@ -172,14 +170,6 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 			Title: "Throughput Limits",
 			Fields: []configField{
 				{
-					Key: "max_tokens_per_second", Label: "max_tokens_per_second", Kind: fieldInt,
-					Help:    "Cached replay token rate per request. 0 disables replay delay.",
-					Min:     strconv.Itoa(runtimeconfig.MinMaxTokensPerSecond),
-					Max:     strconv.Itoa(runtimeconfig.MaxMaxTokensPerSecond),
-					Default: strconv.Itoa(runtimeconfig.DefaultMaxTokensPerSecond),
-					Current: pickInt("max_tokens_per_second", "max-tokens-per-second", cfg.MaxTokensPerSecond),
-				},
-				{
 					Key: "max_tokens_in_flight", Label: "max_tokens_in_flight", Kind: fieldInt,
 					Help:    "Maximum admitted token cost in flight.",
 					Min:     strconv.Itoa(runtimeconfig.MinMaxTokensInFlight),
@@ -194,14 +184,6 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 					Max:     strconv.Itoa(runtimeconfig.MaxMaxWaitingRequests),
 					Default: strconv.Itoa(runtimeconfig.DefaultMaxWaitingRequests),
 					Current: pickInt("max_waiting_requests", "max-waiting-requests", cfg.MaxWaitingRequests),
-				},
-				{
-					Key: "max_degradation", Label: "max_degradation", Kind: fieldInt,
-					Help:    "Percent throughput reduction once token-budget rises above 10%. 0 disables.",
-					Min:     strconv.Itoa(runtimeconfig.MinMaxDegradation),
-					Max:     strconv.Itoa(runtimeconfig.MaxMaxDegradation),
-					Default: strconv.Itoa(runtimeconfig.DefaultMaxDegradation),
-					Current: pickInt("max_degradation", "max-degradation", cfg.MaxDegradation),
 				},
 			},
 		},

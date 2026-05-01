@@ -36,7 +36,7 @@ func phaseReplayCachedSSE(n int) cachedVLLMResponse {
 // rate kicks in.
 func TestCachedReplayDelayPicksPhaseRate(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(64, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 
 	overrides := replayOverrides{phase: phaseEnvelope{
 		InitialTokens: 10,
@@ -65,7 +65,7 @@ func TestCachedReplayDelayPicksPhaseRate(t *testing.T) {
 // semantics, per design §4.2).
 func TestCachedReplayDelayDSLTpsBeatsPhase(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(64, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 
 	overrides := replayOverrides{
 		tpsOverride: 500,
@@ -90,7 +90,7 @@ func TestCachedReplayDelayDSLTpsBeatsPhase(t *testing.T) {
 // promised in classes.go validation).
 func TestCachedReplayDelayInheritsBaseTPSWhenPhaseRateZero(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(64, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 
 	overrides := replayOverrides{phase: phaseEnvelope{
 		InitialTokens: 10,
@@ -112,7 +112,7 @@ func TestCachedReplayDelayInheritsBaseTPSWhenPhaseRateZero(t *testing.T) {
 func TestReplayCachedStreamEmitsPhaseTransition(t *testing.T) {
 	h := NewHandler()
 	// Base TPS is irrelevant; the envelope rates dominate.
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	cached := phaseReplayCachedSSE(20)
@@ -149,7 +149,7 @@ func TestReplayCachedStreamEmitsPhaseTransition(t *testing.T) {
 // request was a short ack").
 func TestReplayCachedStreamNoTransitionForShortStream(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	cached := phaseReplayCachedSSE(3)
@@ -178,7 +178,7 @@ func TestReplayCachedStreamNoTransitionForShortStream(t *testing.T) {
 // activity at all — back-compat guarantee for Phase 13.2.
 func TestReplayCachedStreamLegacyRequestUnchanged(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	cached := phaseReplayCachedSSE(50)
@@ -204,7 +204,7 @@ func TestReplayCachedStreamLegacyRequestUnchanged(t *testing.T) {
 // per-segment delays so the assertion is deterministic.
 func TestReplayCachedStreamPhaseATimingFasterThanPhaseB(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	var sleeps []time.Duration
@@ -257,7 +257,7 @@ func TestReplayCachedStreamPhaseATimingFasterThanPhaseB(t *testing.T) {
 // boundary and a short stream that stays in phase A.
 func TestReplayCachedStreamRecordsPhaseTokenCounts(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	// Long stream: 20 tokens, boundary at 5 -> 5 phase A, 15 phase B.
@@ -302,7 +302,7 @@ func TestReplayCachedStreamRecordsPhaseTokenCounts(t *testing.T) {
 // when the envelope yields capacity, and stays zero when it does not.
 func TestReplayCachedStreamRecordsPhaseReclaim(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 	h.sleep = func(_ context.Context, _ time.Duration) error { return nil }
 
@@ -343,7 +343,7 @@ func TestReplayCachedStreamRecordsPhaseReclaim(t *testing.T) {
 // effective-TPS gauges follow the resolved envelope rates.
 func TestReplayCachedStreamSetsEffectiveTPSGauges(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	cached := phaseReplayCachedSSE(20)
@@ -370,7 +370,7 @@ func TestReplayCachedStreamSetsEffectiveTPSGauges(t *testing.T) {
 // with no envelope contributes nothing to any phase counter or gauge.
 func TestReplayCachedStreamLegacyDoesNotTouchPhaseMetrics(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(1000, 10, 10, 0)
+	h.SetRequestProcessingLimits(10, 10)
 	h.SetStreamRealism(0, 0, 0, 0, 0)
 
 	cached := phaseReplayCachedSSE(50)

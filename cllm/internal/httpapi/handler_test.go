@@ -34,7 +34,7 @@ func TestRoutes(t *testing.T) {
 		{name: "health", method: http.MethodGet, path: "/health", statusCode: http.StatusOK, body: "ok\n"},
 		{name: "ready", method: http.MethodGet, path: "/ready", statusCode: http.StatusOK, body: "ready\n"},
 		{name: "version", method: http.MethodGet, path: "/version", statusCode: http.StatusOK, body: "9.9.9"},
-		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"tokens_in_flight":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_per_second":32`, `"effective_tokens_per_second":32`, `"max_tokens_in_flight":200000`, `"max_waiting_requests":1024`, `"max_degradation":10`, `"computed_degradation_percentage":0`, `"temperature":0.2`, `"dsl_default_profile":""`}},
+		{name: "config", method: http.MethodGet, path: "/config", statusCode: http.StatusOK, bodyContains: []string{`{"tokens_in_flight":0,"waiting_requests":0,"version":"9.9.9"`, `"cache_size":100`, `"cache_entries":0`, `"downstream_url":"` + vllmServer.URL + `"`, `"downstream_model":""`, `"system_prompt":"You are a detailed assistant."`, `"max_tokens":2500`, `"max_tokens_in_flight":200000`, `"max_waiting_requests":1024`, `"temperature":0.2`, `"dsl_default_profile":""`}},
 		{name: "cache", method: http.MethodGet, path: "/cache", statusCode: http.StatusOK, bodyContains: []string{`"enabled":true`, `"cache_size":100`, `"cache_entries":0`, `"cache_file_path":"/var/lib/cllm/cache.json"`}},
 		{name: "metrics", method: http.MethodGet, path: "/metrics", statusCode: http.StatusOK, bodyContains: []string{"# HELP cllm_http_requests_total", "cllm_http_inflight_requests", "cllm_queue_waiting_requests"}},
 		{name: "models", method: http.MethodGet, path: "/v1/models", statusCode: http.StatusOK, body: `{"data":[{"id":"test-model"}]}`},
@@ -511,7 +511,7 @@ func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
 	// Cost-based admission: each request charges prompt_tokens + max_tokens
 	// (~705 here). Use a 2000-token budget so two requests fit.
-	handler.SetRequestProcessingLimits(2, 2000, 10, 0)
+	handler.SetRequestProcessingLimits(2000, 10)
 	handler.SetPrefillSimulation(0, 0, 0, 1)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	var sleeps []time.Duration
@@ -540,74 +540,21 @@ func TestChatCompletionsCachedReplayThrottlesStreamResponses(t *testing.T) {
 	if len(sleeps) != 1 {
 		t.Fatalf("sleep calls = %d, want 1", len(sleeps))
 	}
-	expected := time.Duration(float64(4) * float64(time.Second) / calibratedTokensPerSecond(2))
+	// Item 16 (0.14.0): the implicit fallback Node now paces at
+	// defaultPerRequestTPS = 32 tok/s/req (was the legacy global
+	// --max-tokens-per-second=2 in 0.13).
+	expected := time.Duration(float64(4) * float64(time.Second) / calibratedTokensPerSecond(32))
 	if sleeps[0] != expected {
 		t.Fatalf("sleep duration = %s, want %s", sleeps[0], expected)
 	}
 }
 
 func TestCachedReplayDelayDegradesAfterConcurrencyThreshold(t *testing.T) {
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(20, 10, 10, 50)
-
-	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/one")
-	if !ok {
-		t.Fatal("failed to acquire first request slot")
-	}
-	defer releaseOne()
-
-	expected := time.Duration(float64(2) * float64(time.Second) / calibratedTokensPerSecond(20))
-	if got := handler.cachedReplayDelay(2, 0, replayOverrides{}); got != expected {
-		t.Fatalf("delay below threshold = %s, want %s", got, expected)
-	}
-
-	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/two")
-	if !ok {
-		t.Fatal("failed to acquire second request slot")
-	}
-	defer releaseTwo()
-
-	expectedTokensPerSecond := calibratedTokensPerSecond(20) * (1 - ((50.0 / 100.0) * ((0.2 - degradationThreshold) / (1 - degradationThreshold))))
-	expected = time.Duration(float64(2) * float64(time.Second) / expectedTokensPerSecond)
-	if got := handler.cachedReplayDelay(2, 0, replayOverrides{}); got != expected {
-		t.Fatalf("delay above threshold = %s, want %s", got, expected)
-	}
+	t.Skip("item 16 (0.14.0): legacy global degradation curve retired; per-node concurrency degradation is covered by TestCachedReplayDelayPerNodeDegradesAtConcurrency in prefill_per_node_test.go")
 }
 
 func TestCachedReplayDelayUsesWholeRequestThreshold(t *testing.T) {
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 512, 128, 10)
-
-	releases := make([]func(), 0, 52)
-	for i := 0; i < 51; i++ {
-		release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/threshold")
-		if !ok {
-			t.Fatalf("failed to acquire slot %d", i+1)
-		}
-		releases = append(releases, release)
-	}
-	defer func() {
-		for _, release := range releases {
-			release()
-		}
-	}()
-
-	expected := time.Duration(float64(10) * float64(time.Second) / calibratedTokensPerSecond(100))
-	if got := handler.cachedReplayDelay(10, 0, replayOverrides{}); got != expected {
-		t.Fatalf("delay at threshold = %s, want %s", got, expected)
-	}
-
-	release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/threshold-plus-one")
-	if !ok {
-		t.Fatal("failed to acquire threshold+1 slot")
-	}
-	releases = append(releases, release)
-
-	expectedTokensPerSecond := calibratedTokensPerSecond(100) * (1 - ((10.0 / 100.0) * (1.0 / float64(512-51))))
-	expected = time.Duration(float64(10) * float64(time.Second) / expectedTokensPerSecond)
-	if got := handler.cachedReplayDelay(10, 0, replayOverrides{}); got != expected {
-		t.Fatalf("delay above whole-request threshold = %s, want %s", got, expected)
-	}
+	t.Skip("item 16 (0.14.0): legacy whole-request threshold retired; per-node MaxConcurrency now governs the regime boundary")
 }
 
 func TestRoutesNotFoundLogging(t *testing.T) {
@@ -640,7 +587,7 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	vllmServer := newTestVLLMServer(t)
 	handler := NewHandlerWithDependencies(vllmServer.URL, vllmServer.Client(), 100, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature}).Routes()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_per_second=48&max_tokens_in_flight=64&max_waiting_requests=96&max_degradation=25&downstream_token=secret-token", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config?cache_size=7&downstream_url="+url.QueryEscape(vllmServer.URL)+"&downstream_model=gpt-4.1&system_prompt=Be%20precise&max_tokens=700&max_tokens_in_flight=64&max_waiting_requests=96&downstream_token=secret-token", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
@@ -668,17 +615,11 @@ func TestConfigEndpointAcceptsSnakeCaseQueryNames(t *testing.T) {
 	if got.MaxTokens != 700 {
 		t.Fatalf("max tokens = %d, want %d", got.MaxTokens, 700)
 	}
-	if got.MaxTokensPerSecond != 48 {
-		t.Fatalf("max tokens per second = %d, want %d", got.MaxTokensPerSecond, 48)
-	}
 	if got.MaxTokensInFlight != 64 {
 		t.Fatalf("max tokens in flight = %d, want %d", got.MaxTokensInFlight, 64)
 	}
 	if got.MaxWaitingRequests != 96 {
 		t.Fatalf("max waiting requests = %d, want %d", got.MaxWaitingRequests, 96)
-	}
-	if got.MaxDegradation != 25 {
-		t.Fatalf("max degradation = %d, want %d", got.MaxDegradation, 25)
 	}
 }
 
@@ -762,8 +703,6 @@ func TestConfigEndpointRejectsInvalidQueueValues(t *testing.T) {
 		{name: "tokens-in-flight above max", path: "/config?max-tokens-in-flight=2000001", want: `max-tokens-in-flight must be between 1 and 2000000`},
 		{name: "waiting below min", path: "/config?max-waiting-requests=-1", want: `max-waiting-requests must be between 0 and 1024`},
 		{name: "waiting above max", path: "/config?max-waiting-requests=1025", want: `max-waiting-requests must be between 0 and 1024`},
-		{name: "tokens per second above max", path: "/config?max-tokens-per-second=1001", want: `max-tokens-per-second must be between 0 and 1000`},
-		{name: "degradation above max", path: "/config?max-tokens-in-flight=64&max-waiting-requests=96&max-degradation=96", want: `max-degradation must be between 0 and 95`},
 		{name: "unknown dsl-profile", path: "/config?dsl-profile=does-not-exist", want: `unknown dsl-profile "does-not-exist"`},
 	}
 
@@ -941,71 +880,15 @@ func TestConfigEndpointLogsQueueLimitChanges(t *testing.T) {
 }
 
 func TestRequestAdmissionLogsComputedDegradationChanges(t *testing.T) {
-	var logBuffer bytes.Buffer
-	originalLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
-	defer slog.SetDefault(originalLogger)
-
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(20, 10, 10, 50)
-
-	releaseOne, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/one")
-	if !ok {
-		t.Fatal("failed to acquire first request slot")
-	}
-	releaseTwo, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/two")
-	if !ok {
-		t.Fatal("failed to acquire second request slot")
-	}
-	releaseTwo()
-	releaseOne()
-
-	logOutput := logBuffer.String()
-	for _, want := range []string{
-		`msg="computed degradation updated" source=limits_updated computed_degradation_percentage=0`,
-		`msg="computed degradation updated" source=request_admitted computed_degradation_percentage=5.556`,
-		`effective_tokens_per_second=18.889`,
-		`msg="computed degradation updated" source=request_completed computed_degradation_percentage=0`,
-	} {
-		if !strings.Contains(logOutput, want) {
-			t.Fatalf("log output %q does not contain %q", logOutput, want)
-		}
-	}
+	t.Skip("item 16 (0.14.0): global computed_degradation_percentage log line retired; per-node degradation is observable via cllm_node_per_request_tps_effective")
 }
 
 func TestCurrentConfigIncludesComputedDegradation(t *testing.T) {
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 512, 128, 10)
-
-	releases := make([]func(), 0, 52)
-	for i := 0; i < 52; i++ {
-		release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/load")
-		if !ok {
-			t.Fatalf("failed to acquire slot %d", i+1)
-		}
-		releases = append(releases, release)
-	}
-	defer func() {
-		for _, release := range releases {
-			release()
-		}
-	}()
-
-	got := handler.currentConfig()
-	if got.ComputedDegradationPercentage != 0.022 {
-		t.Fatalf("computed degradation percentage = %v, want 0.022", got.ComputedDegradationPercentage)
-	}
-	if got.EffectiveTokensPerSecond != 99.978 {
-		t.Fatalf("effective tokens per second = %v, want 99.978", got.EffectiveTokensPerSecond)
-	}
+	t.Skip("item 16 (0.14.0): runtimeConfig.ComputedDegradationPercentage / EffectiveTokensPerSecond fields retired")
 }
 
 func TestCachedReplayDelayDisabledWhenTokensPerSecondZero(t *testing.T) {
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(0, 10, 10, 10)
-	if got := handler.cachedReplayDelay(20, 0, replayOverrides{}); got != 0 {
-		t.Fatalf("cached replay delay = %s, want 0", got)
-	}
+	t.Skip("item 16 (0.14.0): legacy global --max-tokens-per-second retired; cachedReplayDelay disabling is now governed by per-node Capacity.PerRequestTPS == 0 (covered by passthrough tests)")
 }
 
 func TestLoadConfigCacheSize(t *testing.T) {
@@ -1126,10 +1009,8 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
-	t.Setenv("CACHE_MAX_TOKENS_PER_SECOND", "0")
 	t.Setenv("CACHE_MAX_TOKENS_IN_FLIGHT", "64")
 	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
-	t.Setenv("CACHE_MAX_DEGRADATION", "25")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
 	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
 	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "secret-token")
@@ -1145,17 +1026,11 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 	if cfg.MaxTokens != 700 {
 		t.Fatalf("MaxTokens = %d, want 700", cfg.MaxTokens)
 	}
-	if cfg.MaxTokensPerSecond != 0 {
-		t.Fatalf("MaxTokensPerSecond = %d, want 0", cfg.MaxTokensPerSecond)
-	}
 	if cfg.MaxTokensInFlight != 64 {
 		t.Fatalf("MaxTokensInFlight = %d, want 64", cfg.MaxTokensInFlight)
 	}
 	if cfg.MaxWaitingRequests != 95 {
 		t.Fatalf("MaxWaitingRequests = %d, want 95", cfg.MaxWaitingRequests)
-	}
-	if cfg.MaxDegradation != 25 {
-		t.Fatalf("MaxDegradation = %d, want 25", cfg.MaxDegradation)
 	}
 	if cfg.Temperature != 0.7 {
 		t.Fatalf("Temperature = %v, want 0.7", cfg.Temperature)
@@ -1174,16 +1049,14 @@ func TestLoadConfigAskDefaultsFromEnv(t *testing.T) {
 func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	originalArgs := os.Args
 	defer func() { os.Args = originalArgs }()
-	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--max-tokens-per-second", "64", "--max-tokens-in-flight", "16", "--max-waiting-requests", "31", "--max-degradation", "15", "--temperature", "0.9"}
+	os.Args = []string{"cllm", "--downstream-url", "https://example.test", "--downstream-token", "flag-token", "--downstream-model", "flag-model", "--system-prompt", "Be precise", "--max-tokens", "900", "--max-tokens-in-flight", "16", "--max-waiting-requests", "31", "--temperature", "0.9"}
 
 	t.Setenv("CACHE_PORT", "8080")
 	t.Setenv("CACHE_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("CACHE_SYSTEM_PROMPT", "Be concise")
 	t.Setenv("CACHE_MAX_TOKENS", "700")
-	t.Setenv("CACHE_MAX_TOKENS_PER_SECOND", "0")
 	t.Setenv("CACHE_MAX_TOKENS_IN_FLIGHT", "64")
 	t.Setenv("CACHE_MAX_WAITING_REQUESTS", "95")
-	t.Setenv("CACHE_MAX_DEGRADATION", "25")
 	t.Setenv("CACHE_TEMPERATURE", "0.7")
 	t.Setenv("CACHE_DOWNSTREAM_URL", "https://api.openai.com")
 	t.Setenv("CACHE_DOWNSTREAM_TOKEN", "env-token")
@@ -1199,17 +1072,11 @@ func TestLoadConfigAskDefaultFlagsPrecedence(t *testing.T) {
 	if cfg.MaxTokens != 900 {
 		t.Fatalf("MaxTokens = %d, want 900", cfg.MaxTokens)
 	}
-	if cfg.MaxTokensPerSecond != 64 {
-		t.Fatalf("MaxTokensPerSecond = %d, want 64", cfg.MaxTokensPerSecond)
-	}
 	if cfg.MaxTokensInFlight != 16 {
 		t.Fatalf("MaxTokensInFlight = %d, want 16", cfg.MaxTokensInFlight)
 	}
 	if cfg.MaxWaitingRequests != 31 {
 		t.Fatalf("MaxWaitingRequests = %d, want 31", cfg.MaxWaitingRequests)
-	}
-	if cfg.MaxDegradation != 15 {
-		t.Fatalf("MaxDegradation = %d, want 15", cfg.MaxDegradation)
 	}
 	if cfg.Temperature != 0.9 {
 		t.Fatalf("Temperature = %v, want 0.9", cfg.Temperature)
@@ -1235,13 +1102,10 @@ func TestLoadConfigInvalidAskDefaults(t *testing.T) {
 	}{
 		{name: "invalid env max tokens", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS "nope"`},
 		{name: "env max tokens out of range", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS", envVal: "99", wantErr: "CACHE_MAX_TOKENS must be between 100 and 4000"},
-		{name: "invalid env max tokens per second", args: []string{"cllm"}, envKey: "CACHE_MAX_TOKENS_PER_SECOND", envVal: "nope", wantErr: `invalid CACHE_MAX_TOKENS_PER_SECOND "nope"`},
-		{name: "flag max tokens per second above max", args: []string{"cllm", "--max-tokens-per-second", "1001"}, wantErr: "max-tokens-per-second must be between 0 and 1000"},
 		{name: "flag max tokens in flight too low", args: []string{"cllm", "--max-tokens-in-flight", "0"}, wantErr: "max-tokens-in-flight must be between 1 and 2000000"},
 		{name: "flag max tokens in flight too high", args: []string{"cllm", "--max-tokens-in-flight", "2000001"}, wantErr: "max-tokens-in-flight must be between 1 and 2000000"},
 		{name: "flag max waiting requests negative", args: []string{"cllm", "--max-waiting-requests", "-1"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
 		{name: "flag max waiting requests too high", args: []string{"cllm", "--max-waiting-requests", "1025"}, wantErr: "max-waiting-requests must be between 0 and 1024"},
-		{name: "flag max degradation too high", args: []string{"cllm", "--max-degradation", "96"}, wantErr: "max-degradation must be between 0 and 95"},
 		{name: "invalid env temperature", args: []string{"cllm"}, envKey: "CACHE_TEMPERATURE", envVal: "nope", wantErr: `invalid CACHE_TEMPERATURE "nope"`},
 		{name: "flag max tokens out of range", args: []string{"cllm", "--max-tokens", "10001"}, wantErr: "max-tokens must be between 100 and 4000"},
 		{name: "invalid flag temperature", args: []string{"cllm", "--temperature", "nope"}, wantErr: "invalid runtime flag"},
@@ -1573,7 +1437,7 @@ func TestChatCompletionsRejectedOverCapacityEmitsLifecycleEvent(t *testing.T) {
 	defer slog.SetDefault(originalLogger)
 
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(32, 1, 0, 0)
+	handler.SetRequestProcessingLimits(1, 0)
 	release, _, ok := handler.acquireRequestSlot(context.Background(), node.RequestCost{TotalCost: 1}, "/v1/chat/completions")
 	if !ok {
 		t.Fatal("failed to acquire baseline slot")
@@ -1695,7 +1559,7 @@ func TestReplayCachedStreamTruncatesAtMaxTokens(t *testing.T) {
 			"data: [DONE]\n\n"),
 	}
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	recorder := httptest.NewRecorder()
 	handler.replayCachedStream(context.Background(), recorder, cached, replayOptions{maxTokens: 2, includeUsage: true, stream: true})
 	body := recorder.Body.String()
@@ -1722,7 +1586,7 @@ func TestReplayCachedStreamFromJSONCache(t *testing.T) {
 		body:        []byte(`{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`),
 	}
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	recorder := httptest.NewRecorder()
 	handler.replayCachedStream(context.Background(), recorder, cached, replayOptions{maxTokens: 0, includeUsage: true, stream: true})
 	body := recorder.Body.String()
@@ -1757,7 +1621,7 @@ func TestReplayCachedResponseFromSSECache(t *testing.T) {
 			"data: [DONE]\n\n"),
 	}
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(0, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	recorder := httptest.NewRecorder()
 	handler.replayCachedResponse(context.Background(), recorder, cached, replayOptions{maxTokens: 0, stream: false})
 	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
@@ -1786,7 +1650,7 @@ func TestReplayCachedResponseCapsPacingAtMaxTokens(t *testing.T) {
 		body:        []byte(`{"choices":[{"message":{"role":"assistant","content":"abc"}}],"usage":{"completion_tokens":100}}`),
 	}
 	handler := NewHandlerWithDependencies("", nil, 1, askOptions{})
-	handler.SetRequestProcessingLimits(50, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	var sleeps []time.Duration
 	handler.sleep = func(_ context.Context, d time.Duration) error {
 		sleeps = append(sleeps, d)
@@ -1797,7 +1661,8 @@ func TestReplayCachedResponseCapsPacingAtMaxTokens(t *testing.T) {
 	if len(sleeps) != 1 {
 		t.Fatalf("expected 1 sleep, got %d", len(sleeps))
 	}
-	expected := time.Duration(float64(5) * float64(time.Second) / calibratedTokensPerSecond(50))
+	// Item 16 (0.14.0): default fallback paces at 32 tok/s/req.
+	expected := time.Duration(float64(5) * float64(time.Second) / calibratedTokensPerSecond(32))
 	if sleeps[0] != expected {
 		t.Fatalf("sleep = %s, want %s", sleeps[0], expected)
 	}
@@ -1849,13 +1714,15 @@ func TestCacheKeyDistinguishesDifferentPrompts(t *testing.T) {
 
 func TestComputePrefillDelayScalesWithPromptTokens(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetPrefillSimulation(2.0, 50, 0, 60000)
 	handler.jitterSource = func() float64 { return 0 }
 
 	d10 := handler.computePrefillDelay(10, replayOverrides{})
 	d100 := handler.computePrefillDelay(100, replayOverrides{})
-	rate := calibratedTokensPerSecond(100) * 2.0
+	// Item 16 (0.14.0): the implicit fallback Node paces at
+	// defaultPerRequestTPS = 32; prefill rate is that x multiplier.
+	rate := calibratedTokensPerSecond(32) * 2.0
 	want10 := 50*time.Millisecond + time.Duration(float64(10)/rate*float64(time.Second))
 	want100 := 50*time.Millisecond + time.Duration(float64(100)/rate*float64(time.Second))
 	if d10 != want10 {
@@ -1868,7 +1735,7 @@ func TestComputePrefillDelayScalesWithPromptTokens(t *testing.T) {
 
 func TestComputePrefillDelayDisabledWhenMultiplierZero(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetPrefillSimulation(0, 100, 0, 60000)
 	if d := handler.computePrefillDelay(500, replayOverrides{}); d != 0 {
 		t.Fatalf("delay = %s, want 0 when multiplier=0", d)
@@ -1876,17 +1743,12 @@ func TestComputePrefillDelayDisabledWhenMultiplierZero(t *testing.T) {
 }
 
 func TestComputePrefillDelayDisabledWhenDecodeRateZero(t *testing.T) {
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(0, 10, 10, 0)
-	handler.SetPrefillSimulation(2.0, 100, 0, 60000)
-	if d := handler.computePrefillDelay(500, replayOverrides{}); d != 0 {
-		t.Fatalf("delay = %s, want 0 when decode rate=0", d)
-	}
+	t.Skip("item 16 (0.14.0): legacy global --max-tokens-per-second retired; the implicit fallback Node always has PerRequestTPS=32. Passthrough nodes (PerRequestTPS=0) are exercised in prefill_per_node_test.go.")
 }
 
 func TestComputePrefillDelayCappedAtMax(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(1, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetPrefillSimulation(0.5, 0, 0, 200)
 	handler.jitterSource = func() float64 { return 0 }
 	if d := handler.computePrefillDelay(1000000, replayOverrides{}); d != 200*time.Millisecond {
@@ -1896,7 +1758,7 @@ func TestComputePrefillDelayCappedAtMax(t *testing.T) {
 
 func TestSimulatePrefillDelayHonorsContextCancel(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetPrefillSimulation(1.0, 1000, 0, 60000)
 	handler.jitterSource = func() float64 { return 0 }
 	handler.sleep = func(_ context.Context, _ time.Duration) error {
@@ -1913,7 +1775,7 @@ func TestSimulatePrefillDelayHonorsContextCancel(t *testing.T) {
 
 func TestComputePrefillDelayAppliesJitter(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetPrefillSimulation(1.0, 100, 50, 60000)
 	handler.jitterSource = func() float64 { return 1.0 } // +50%
 	dHigh := handler.computePrefillDelay(0, replayOverrides{})
@@ -1926,7 +1788,7 @@ func TestComputePrefillDelayAppliesJitter(t *testing.T) {
 
 func TestComputeStreamSegmentDelayBaseline(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetStreamRealism(0, 0, 0, 0, 0)
 	handler.jitterSource = func() float64 { return 0 }
 	delay, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
@@ -1940,19 +1802,12 @@ func TestComputeStreamSegmentDelayBaseline(t *testing.T) {
 }
 
 func TestComputeStreamSegmentDelayDisabledWhenRateZero(t *testing.T) {
-	handler := NewHandler()
-	handler.SetRequestProcessingLimits(0, 10, 10, 0)
-	handler.SetStreamRealism(50, 50, 100, 100, 200)
-	handler.jitterSource = func() float64 { return 1 }
-	delay, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
-	if delay != 0 || stall != 0 {
-		t.Fatalf("delay=%s stall=%s, want 0,0 when rate=0", delay, stall)
-	}
+	t.Skip("item 16 (0.14.0): legacy global rate=0 disable retired; the implicit fallback Node always has PerRequestTPS=32. Passthrough nodes are exercised in prefill_per_node_test.go.")
 }
 
 func TestComputeStreamSegmentDelayVariabilitySigns(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetStreamRealism(50, 0, 0, 0, 0)
 	base := handler.cachedReplayDelay(10, 0, replayOverrides{})
 
@@ -1969,7 +1824,7 @@ func TestComputeStreamSegmentDelayVariabilitySigns(t *testing.T) {
 
 func TestComputeStreamSegmentDelayStallAlwaysFires(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetStreamRealism(0, 0, 100, 100, 100)
 	// Variability/jitter zero so first two draws are no-ops; stall draws use 3rd & 4th.
 	calls := 0
@@ -1992,7 +1847,7 @@ func TestComputeStreamSegmentDelayStallAlwaysFires(t *testing.T) {
 
 func TestComputeStreamSegmentDelayStallNeverFires(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetStreamRealism(0, 0, 0, 100, 200)
 	handler.jitterSource = func() float64 { return 1 }
 	_, stall := handler.computeStreamSegmentDelay(10, 0, replayOverrides{})
@@ -2003,7 +1858,7 @@ func TestComputeStreamSegmentDelayStallNeverFires(t *testing.T) {
 
 func TestThrottleStreamSegmentRecordsStallMetric(t *testing.T) {
 	handler := NewHandler()
-	handler.SetRequestProcessingLimits(100, 10, 10, 0)
+	handler.SetRequestProcessingLimits(10, 10)
 	handler.SetStreamRealism(0, 0, 100, 50, 50)
 	handler.jitterSource = func() float64 { return 0 }
 	handler.sleep = func(_ context.Context, _ time.Duration) error { return nil }

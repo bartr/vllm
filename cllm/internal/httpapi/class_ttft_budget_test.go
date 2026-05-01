@@ -65,13 +65,15 @@ func TestParseDSLMaxTTFTMsRejectsNegative(t *testing.T) {
 func TestPredictTTFTmsAddsPrefillAndFirstToken(t *testing.T) {
 	t.Parallel()
 	h := NewHandler()
-	h.SetRequestProcessingLimits(100, 10000, 10, 0)
+	h.SetRequestProcessingLimits(10000, 10)
 	h.SetPrefillSimulation(0, 0, 0, 1) // prefill off
 
 	got := h.predictTTFTms(0, replayOverrides{})
-	// 1000 / 100 = 10 ms (calibrated factor is 1.0 for default).
-	if got < 9 || got > 12 {
-		t.Fatalf("predictTTFTms (no prefill, tps=100) = %d; want ~10", got)
+	// Item 16 (0.14.0): default fallback Node paces at
+	// defaultPerRequestTPS = 32; 1000/32 ~= 32 ms. The legacy global
+	// of 100 tps was retired alongside `--max-tokens-per-second`.
+	if got < 30 || got > 34 {
+		t.Fatalf("predictTTFTms (no prefill, default tps=32) = %d; want ~32", got)
 	}
 
 	// tps override uses the override rate as first-token rate.
@@ -94,7 +96,7 @@ func TestPredictTTFTmsAddsPrefillAndFirstToken(t *testing.T) {
 func TestPredictTTFTmsIncludesPrefill(t *testing.T) {
 	t.Parallel()
 	h := NewHandler()
-	h.SetRequestProcessingLimits(100, 10000, 10, 0)
+	h.SetRequestProcessingLimits(10000, 10)
 	// rateMultiplier=1, baseOverhead=200ms, jitter=0, max=60000ms
 	h.SetPrefillSimulation(1.0, 200, 0, 60000)
 
@@ -117,7 +119,7 @@ func ttftHandlerWithCache(t *testing.T, prompt string) *Handler {
 	vllm := newTestVLLMServer(t)
 	h := NewHandlerWithDependencies(vllm.URL, vllm.Client(), 10, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
 	// Generous capacity so admission never gates these tests.
-	h.SetRequestProcessingLimits(100, 100000, 100, 0)
+	h.SetRequestProcessingLimits(100000, 100)
 	key, err := buildChatCompletionCacheKey(chatCompletionRequest{
 		Messages: []chatCompletionMessage{{Role: "user", Content: prompt}},
 	})
@@ -220,7 +222,7 @@ func TestClassTTFTBudgetDSLZeroDisablesClass(t *testing.T) {
 func TestClassTTFTBudgetCacheMissBypass(t *testing.T) {
 	vllm := newTestVLLMServer(t)
 	h := NewHandlerWithDependencies(vllm.URL, vllm.Client(), 10, askOptions{systemPrompt: defaultSystemPrompt, maxTokens: defaultMaxTokens, temperature: defaultTemperature})
-	h.SetRequestProcessingLimits(100, 100000, 100, 0)
+	h.SetRequestProcessingLimits(100000, 100)
 	h.SetPrefillSimulation(1.0, 500, 0, 60000)
 	h.SetClasses(map[string]ClassConfig{
 		"interactive": {Priority: "high", MaxTTFTMs: 1},

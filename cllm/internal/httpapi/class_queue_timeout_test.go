@@ -154,7 +154,7 @@ func TestClassQueueTimeoutNotAppliedWhenZero(t *testing.T) {
 // select loop.
 func TestOverCapacityNotMisclassifiedAsClassTimeout(t *testing.T) {
 	h := NewHandler()
-	h.SetRequestProcessingLimits(32, 5, 0, 0) // capacity=5, no waiting room
+	h.SetRequestProcessingLimits(5, 0) // capacity=5, no waiting room
 
 	cost := node.RequestCost{TotalCost: 9999} // bigger than capacity
 	release, _, ok, reason := h.acquireRequestSlotOnNode(context.Background(), cost, "/x", nil)

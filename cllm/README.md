@@ -42,12 +42,10 @@ The server supports these runtime settings:
 - `CACHE_DOWNSTREAM_MODEL` or `--downstream-model`: default downstream model when incoming requests omit `model`
 - `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for chat completions
 - `CACHE_MAX_TOKENS` or `--max-tokens`: default max tokens for chat completions, `100` to `4000`, default `1024`
-- `CACHE_MAX_TOKENS_PER_SECOND` or `--max-tokens-per-second`: cached replay token rate per request, `0` to `1000`, default `32`; `0` disables cached replay delay
 - `CACHE_MAX_TOKENS_IN_FLIGHT` or `--max-tokens-in-flight`: max admitted token cost in flight (cost-based admission), `1` to `2000000`, default `200000`. Each request is charged `prompt_tokens + min(max_tokens, p95_completion_tokens)` against this budget; oversized single requests are rejected immediately.
 - `CACHE_MAX_WAITING_REQUESTS` or `--max-waiting-requests`: max queued waiting requests when the budget is full, `0` to `1024`, default `1024`
-- `CACHE_MAX_DEGRADATION` or `--max-degradation`: percent reduction applied to cached replay throughput once the in-flight token budget rises above `10%`, `0` to `95`, default `10`; `0` disables degradation
 - `CACHE_TEMPERATURE` or `--temperature`: default temperature for chat completions
-- `CACHE_PREFILL_RATE_MULTIPLIER` or `--prefill-rate-multiplier`: simulated prefill rate as a multiple of `max-tokens-per-second`, `0` to `20`, default `0` (prefill simulation disabled; set non-zero to enable)
+- `CACHE_PREFILL_RATE_MULTIPLIER` or `--prefill-rate-multiplier`: simulated prefill rate as a multiple of the routed node's per-request decode rate (`Capacity.PerRequestTPS` from `nodes.yaml`, default `32`), `0` to `20`, default `0` (prefill simulation disabled; set non-zero to enable)
 - `CACHE_PREFILL_BASE_OVERHEAD_MS` or `--prefill-base-overhead-ms`: fixed simulated prefill startup overhead in ms, `0` to `60000`, default `0`
 - `CACHE_PREFILL_JITTER_PERCENT` or `--prefill-jitter-percent`: ± jitter applied to simulated prefill latency, percent, `0` to `100`, default `0`
 - `CACHE_PREFILL_MAX_MS` or `--prefill-max-ms`: safety cap on simulated prefill latency in ms, default `3000`
@@ -63,7 +61,7 @@ The server supports these runtime settings:
 Example:
 
 ```bash
-CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_DOWNSTREAM_URL=https://api.openai.com CACHE_DOWNSTREAM_TOKEN=your-token CACHE_DOWNSTREAM_MODEL=gpt-4.1 CACHE_MAX_TOKENS_PER_SECOND=48 CACHE_MAX_TOKENS_IN_FLIGHT=128000 CACHE_MAX_WAITING_REQUESTS=512 CACHE_MAX_DEGRADATION=15 go run ./cmd/cllm --cache-size 200
+CACHE_PORT=8081 CACHE_SHUTDOWN_TIMEOUT=15s CACHE_DOWNSTREAM_URL=https://api.openai.com CACHE_DOWNSTREAM_TOKEN=your-token CACHE_DOWNSTREAM_MODEL=gpt-4.1 CACHE_MAX_TOKENS_IN_FLIGHT=128000 CACHE_MAX_WAITING_REQUESTS=512 go run ./cmd/cllm --cache-size 200
 ```
 
 For a local vLLM source, omit the downstream token and model settings and keep the default downstream URL of `http://localhost:8000`.
@@ -71,10 +69,10 @@ For a local vLLM source, omit the downstream token and model settings and keep t
 You can inspect or update the live handler config at runtime:
 
 ```bash
-curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-per-second=48&max-tokens-in-flight=128000&max-waiting-requests=512&max-degradation=15&temperature=0.7'
+curl 'http://127.0.0.1:8080/config?cache-size=200&system-prompt=Be%20precise&max-tokens=700&max-tokens-in-flight=128000&max-waiting-requests=512&temperature=0.7'
 ```
 
-`/config` now returns `tokens_in_flight`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_per_second`, `effective_tokens_per_second`, `max_tokens_in_flight`, `max_waiting_requests`, `max_degradation`, `computed_degradation_percentage`, `prefill_rate_multiplier`, `prefill_base_overhead_ms`, `prefill_jitter_percent`, `prefill_max_ms`, `stream_variability_percent`, `stream_jitter_percent`, `stream_stall_probability_percent`, `stream_stall_min_ms`, and `stream_stall_max_ms`. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `max-tokens-per-second`, `max-tokens-in-flight`, `max-waiting-requests`, `max-degradation`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, `downstream-model`, `prefill-rate-multiplier`, `prefill-base-overhead-ms`, `prefill-jitter-percent`, `prefill-max-ms`, `stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, `stream-stall-min-ms`, and `stream-stall-max-ms`.
+`/config` now returns `tokens_in_flight`, `waiting_requests`, and `version` first, then `cache_size` and `cache_entries`, followed by `downstream_url`, `downstream_model`, `max_tokens_in_flight`, `max_waiting_requests`, `prefill_rate_multiplier`, `prefill_base_overhead_ms`, `prefill_jitter_percent`, `prefill_max_ms`, `stream_variability_percent`, `stream_jitter_percent`, `stream_stall_probability_percent`, `stream_stall_min_ms`, and `stream_stall_max_ms`. You can update the configurable values live with either hyphenated or snake_case query params where supported. Live updates currently support `system-prompt`, `max-tokens`, `max-tokens-in-flight`, `max-waiting-requests`, `temperature`, `cache-size`, `downstream-url`, `downstream-token`, `downstream-model`, `prefill-rate-multiplier`, `prefill-base-overhead-ms`, `prefill-jitter-percent`, `prefill-max-ms`, `stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, `stream-stall-min-ms`, and `stream-stall-max-ms`. Per-request decode pacing is owned by per-node `Capacity.PerRequestTPS` / `MaxConcurrency` / `DegradationThreshold` in `configs/nodes.yaml` (item 15, 0.13.0); the legacy global `--max-tokens-per-second` / `--max-degradation` flags were retired in 0.14.0 (item 16).
 
 The upstream `/v1/models` response is cached for the lifetime of the process. If the downstream server starts serving a different model, restart `cllm` to pick it up.
 
@@ -134,9 +132,9 @@ Names are matched case-insensitively, validated against `[a-z0-9_-]{1,32}`; unkn
 
 Cached responses are replayed at the configured token rate. Once the in-flight token budget rises above `10%` of capacity, cached replay throughput degrades gradually up to the configured maximum. The live computed degradation percentage and effective token rate are exposed through `/config`, logged whenever they change, and included in the periodic queue-depth logs. Live downstream responses still stream through once admitted.
 
-On a cache hit, `cllm` simulates **prefill latency** before emitting the first byte to mimic a CPU-based LLM. The delay is `prefill_base_overhead_ms + (prompt_tokens / prefill_rate) * 1000`, with `±prefill_jitter_percent` random jitter and a safety cap of `prefill_max_ms`. The prefill rate is `prefill_rate_multiplier * effective_tokens_per_second`, so adjusting `max-tokens-per-second` (or scheduler degradation) automatically scales prefill too. Setting `prefill-rate-multiplier=0` (or `max-tokens-per-second=0`) disables prefill simulation. The simulated delay is reported as a `prefill` lifecycle event (`prompt_tokens`, `prefill_ms`) and as the `cllm_prefill_duration_seconds{source}` histogram. Live downstream requests are unaffected.
+On a cache hit, `cllm` simulates **prefill latency** before emitting the first byte to mimic a CPU-based LLM. The delay is `prefill_base_overhead_ms + (prompt_tokens / prefill_rate) * 1000`, with `±prefill_jitter_percent` random jitter and a safety cap of `prefill_max_ms`. The prefill rate is `prefill_rate_multiplier * routed_node.PerRequestRate(c)`, so adjusting per-node `Capacity.PerRequestTPS` (or its concurrency-degradation curve in `nodes.yaml`) automatically scales prefill too. Setting `prefill-rate-multiplier=0` (or routing to a passthrough node with `per_request_tokens_per_second: 0`) disables prefill simulation. The simulated delay is reported as a `prefill` lifecycle event (`prompt_tokens`, `prefill_ms`) and as the `cllm_prefill_duration_seconds{source}` histogram. Live downstream requests are unaffected.
 
-During cached stream replay, `cllm` also adds **streaming realism** to the per-segment pacing delay so token emission is not perfectly uniform. For each content segment the base delay (`tokens / effective_tokens_per_second`) is multiplied by `(1 + v · stream_variability_percent/100)` to oscillate the rate, then by `(1 + j · stream_jitter_percent/100)` for per-segment jitter, where `v, j ∈ [-1, 1)` are random draws. With probability `stream_stall_probability_percent/100`, a uniform random partial stall in `[stream_stall_min_ms, stream_stall_max_ms]` is added on top to mimic GC, attention bottlenecks, or KV-cache pressure. Stalls are reported via `cllm_stream_stalls_total{source}` and `cllm_stream_stall_duration_seconds{source}`. Setting all four stream knobs (`stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, and `max-tokens-per-second=0` or any one of the first three) tunes or disables this behavior. The non-stream cache path and live downstream requests are unaffected.
+During cached stream replay, `cllm` also adds **streaming realism** to the per-segment pacing delay so token emission is not perfectly uniform. For each content segment the base delay (`tokens / routed_node.PerRequestRate(c)`) is multiplied by `(1 + v · stream_variability_percent/100)` to oscillate the rate, then by `(1 + j · stream_jitter_percent/100)` for per-segment jitter, where `v, j ∈ [-1, 1)` are random draws. With probability `stream_stall_probability_percent/100`, a uniform random partial stall in `[stream_stall_min_ms, stream_stall_max_ms]` is added on top to mimic GC, attention bottlenecks, or KV-cache pressure. Stalls are reported via `cllm_stream_stalls_total{source}` and `cllm_stream_stall_duration_seconds{source}`. Setting all four stream knobs (`stream-variability-percent`, `stream-jitter-percent`, `stream-stall-probability-percent`, plus a passthrough node with `per_request_tokens_per_second: 0`) tunes or disables this behavior. The non-stream cache path and live downstream requests are unaffected.
 
 ### Replay DSL
 
@@ -318,7 +316,7 @@ For `POST /v1/chat/completions`, structured lifecycle events are emitted as logs
 make build
 ```
 
-This builds the local container image `cllm:0.13.0`.
+This builds the local container image `cllm:0.14.0`.
 
 To build and import that image into the local k3s container runtime:
 
@@ -329,8 +327,8 @@ make deploy
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.13.0 .
-docker save cllm:0.13.0 | sudo k3s ctr images import -
+docker build -t cllm:0.14.0 .
+docker save cllm:0.14.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -342,8 +340,8 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.13.0 .
-docker run --rm -p 8080:8080 cllm:0.13.0
+docker build -t cllm:0.14.0 .
+docker run --rm -p 8080:8080 cllm:0.14.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
@@ -356,7 +354,7 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.13.0`
+- deploy `cllm:0.14.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
 - mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path

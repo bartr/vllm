@@ -3,7 +3,6 @@ package node
 // Capacity holds the per-node admission and streaming limits.
 type Capacity struct {
 	MaxTokensInFlight  int64
-	MaxTokensPerSecond int
 	MaxWaitingRequests int
 
 	// PerRequestTPS is the per-request decode rate (tokens/second) the

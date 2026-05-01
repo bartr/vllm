@@ -400,13 +400,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (node, le) (rate(cllm_time_to_first_byte_seconds_bucket{exported_endpoint=\"chat_completions\"}[$__rate_interval]))) and on (node) (sum by (node) (rate(cllm_time_to_first_byte_seconds_count{exported_endpoint=\"chat_completions\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (node) (rate(cllm_time_to_first_byte_seconds_sum{exported_endpoint=\"chat_completions\"}[$__rate_interval])) / sum by (node) (rate(cllm_time_to_first_byte_seconds_count{exported_endpoint=\"chat_completions\"}[$__rate_interval])) > 0",
           "legendFormat": "{{node}}",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Fleet · Time to First Token By Node (p95)",
+      "title": "Fleet · Time to First Token By Node (mean)",
       "type": "timeseries"
     },
     {
@@ -476,13 +476,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (node, le) (rate(cllm_job_duration_seconds_bucket{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval]))) and on (node) (sum by (node) (rate(cllm_job_duration_seconds_count{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (node) (rate(cllm_job_duration_seconds_sum{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval])) / sum by (node) (rate(cllm_job_duration_seconds_count{exported_endpoint=\"chat_completions\",result=\"completed\"}[$__rate_interval])) > 0",
           "legendFormat": "{{node}}",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Fleet · Latency By Node (p95)",
+      "title": "Fleet · Latency By Node (mean)",
       "type": "timeseries"
     },
     {

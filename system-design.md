@@ -31,7 +31,7 @@ The system speaks the Chat Completions API (the OpenAI-defined `/v1/chat/complet
 
 1. **LLM serving is dominated by scheduling and queueing, not raw compute.** Throughput plateaus and tail-latency growth come from admission contention, queue dynamics, and per-tenant fairness — not from how fast a single token is generated. This is why cLLM models *system* behavior with high fidelity while abstracting micro-architectural GPU effects.
 2. **Tokens are the correct unit of resource modeling.** Cost-based admission (`prompt + min(max_tokens, p95)`) reflects how KV-cache and prefill compute actually scale, so one large request can correctly displace many small ones — a property that count-based limits cannot express (§6.1, §6.3).
-3. **Latency is primarily driven by queueing under contention.** The per-request rate curve under `f(load)` is linear past the activation threshold; it is the queue/admission interaction on top of that curve that produces the soft-saturation, non-linear TTFT growth observed on real systems (§6.2, §6.4).
+3. **Latency is primarily driven by queueing under contention.** The per-request rate curve under `f(c)` is linear past the activation threshold; it is the queue/admission interaction on top of that curve that produces the soft-saturation, non-linear TTFT growth observed on real systems (§6.2, §6.4).
 4. **Small scheduling changes can significantly impact fairness and tail latency.** Per-tenant token buckets gate eligibility before routing, isolating noisy tenants without a stateful weighted scheduler in the active set. Tenant refunds on capacity rejection preserve work conservation (§6.5).
 5. **A single physical GPU is enough to model an N-node deployment.** Calibrating the synthetic envelope against a real backend lets cLLM instantiate many in-process nodes with per-node capacity, queues, and routing policy. A node models a vLLM instance, not a GPU, so sticky routing and per-node saturation are part of the experiment rather than hidden behind one global queue (§6.6, §6.7).
 6. **Per-request reconfiguration is more powerful than global reconfiguration.** The Replay DSL composes with `/config` so a single deployment runs mixed workloads, A/B comparisons, and targeted fault injection in the same time window — turning the control plane into a per-request experiment surface (§9.1, §12).
@@ -107,10 +107,10 @@ cLLM consists of four primary components:
 cLLM models a fleet as a list of in-process **nodes**. A node models a
 vLLM-like serving instance, not a bare GPU. Each node owns:
 
-* A calibrated capacity envelope (`max_tokens_in_flight`, `max_tokens_per_second`, `max_waiting_requests`)
+* A calibrated capacity envelope (`max_tokens_in_flight`, `per_request_tokens_per_second`, `max_concurrency`, `degradation_threshold`, `max_waiting_requests`)
 * Its own token-cost admission stock and FIFO waiting queue
 * Its own completion-token estimator
-* Per-node or inherited class realism knobs (`f(load)`, prefill, jitter, variability, stalls)
+* Per-node or inherited class realism knobs (`f(c)` concurrency-degradation curve, prefill, jitter, variability, stalls)
 * Optional Chat Completions API upstream metadata for pass-through / calibration nodes
 
 Nodes are loaded from `configs/nodes.yaml` (or `CLLM_NODES_FILE`). If no node
@@ -161,16 +161,16 @@ The system is deployed alongside a real vLLM instance in Kubernetes, allowing **
 cLLM models inference capacity along **two independent axes per node**: a *stock* of token-cost that may be in flight on that node at any instant, and a *flow* of tokens generated per second by that node. Each axis has its own knob and binds in different regimes; together with a load-dependent degradation function they reproduce the soft-saturation behavior of real GPU-backed inference.
 
 * **`max_tokens_in_flight`** — the admission stock. The total estimated token cost (prompt + projected completion) the system will admit concurrently. Bound by the cost-based admission gate; binds first when many requests overlap.
-* **`max_tokens_per_second`** — the replay flow. The ideal token *generation* rate of an isolated request on the synthetic execution path; binds during streaming.
-* **`f(load)`** — a saturation curve that scales the *effective* per-request flow downward as the in-flight stock approaches saturation. In the current implementation this is a single scalar knob, `max_degradation` (percent, default `10`, range `0`–`95`): zero degradation until in-flight cost exceeds 10% of `max_tokens_in_flight`, then a linear ramp to `max_degradation`% at full budget. The shape is fixed; the magnitude is configurable.
+* **`per_request_tokens_per_second`** — the per-request decode flow. The ideal token *generation* rate of an isolated request on the synthetic execution path; binds during streaming. Each node carries its own value (item 15, 0.13.0).
+* **`f(c)`** — a vLLM-shaped three-regime curve over per-node concurrency `c = ConcurrentRequests()`: full rate at `c ≤ degradation_threshold`, linear ramp to `base × (1 − max_degradation/100)` between `degradation_threshold` and `max_concurrency`, and queueing past `max_concurrency` (admitted via the per-node concurrency gate). Each node has its own `max_concurrency`, `degradation_threshold`, and `max_degradation` (inherited from class template, overridable per-node in `configs/nodes.yaml`).
 
 The effective per-request streaming rate is therefore:
 
 ```text
-effective_tokens_per_second = max_tokens_per_second × f(load)
+effective_tokens_per_second = per_request_tokens_per_second × f(c)
 ```
 
-while the admission ceiling is independently bounded by the selected node's `max_tokens_in_flight`. The two compose: a workload can be either admission-bound (lots of small requests filling the stock) or rate-bound (a few large requests serialized through the per-request flow), and `f(load)` couples them by slowing the flow as the node's stock fills.
+where `c` is the live count of admitted requests on the routed node. The admission ceiling is independently bounded by that node's `max_tokens_in_flight` and `max_concurrency`. The two compose: a workload can be either admission-bound (lots of small requests filling the cost budget) or rate-bound (a few large requests serialized through the per-request flow), and `f(c)` couples them by slowing the flow as the node's batch slots fill.
 
 This formulation captures three key properties of real GPU-backed inference systems:
 
@@ -214,7 +214,7 @@ flowchart LR
 
     H[Per-request token rate] --> I[Effective capacity model]
     J[Max tokens in flight] --> I
-    K["f(load) degradation curve"] --> I
+    K["f(c) concurrency-degradation curve"] --> I
 
     I --> G
     G --> L[Streaming response]
@@ -240,10 +240,10 @@ cLLM treats inference capacity as a function of **parallelism plus contention**,
 Admitted requests are then handled along the two capacity axes from §6.1: the selected node's admission stock (`max_tokens_in_flight`) bounds how much work runs concurrently on that node, while the per-request flow
 
 ```text
-effective_tokens_per_second = max_tokens_per_second \u00d7 f(load)
+effective_tokens_per_second = per_request_tokens_per_second × f(c)
 ```
 
-bounds how fast each one streams. As load increases, `f(load)` reduces the per-request flow to simulate GPU contention. This creates realistic behavior: throughput rises at first, then plateaus, while TTFT and latency increase as a node becomes queue-bound — with noisy tenants absorbed by their own buckets rather than degrading neighbors. Because queues are per-node, cLLM also reproduces the production failure mode where a bad routing decision can leave one node saturated while another is idle.
+bounds how fast each one streams. As per-node concurrency rises, `f(c)` reduces the per-request flow to simulate GPU batch contention. This creates realistic behavior: throughput rises at first, then plateaus, while TTFT and latency increase as a node becomes queue-bound — with noisy tenants absorbed by their own buckets rather than degrading neighbors. Because queues are per-node, cLLM also reproduces the production failure mode where a bad routing decision can leave one node saturated while another is idle.
 
 ---
 
@@ -280,22 +280,22 @@ Backpressure is therefore enforced on three independent dimensions — per-tenan
 
 ### 6.4 Throughput Degradation
 
-As in-flight cost rises toward a node's admission ceiling, cLLM scales each cached-replay request's streaming rate down to simulate GPU contention:
+As per-node concurrency rises toward `max_concurrency`, cLLM scales each cached-replay request's streaming rate down to simulate GPU batch contention (item 15, 0.13.0):
 
 ```text
-effective_tokens_per_second = max_tokens_per_second × (1 − d(load))
+effective_tokens_per_second = per_request_tokens_per_second × (1 − d(c))
 ```
 
-where `d(load)` is a piecewise-linear curve driven by the single `max_degradation` knob (equivalently, `f(load) = 1 − d(load)` from §6.1):
+where `d(c)` is a piecewise-linear curve over the routed node's live `c = ConcurrentRequests()`:
 
-* **`load = node_in_flight_cost / node_max_tokens_in_flight`**
-* **`load ≤ 0.10`** → `d = 0` (no degradation while the budget is mostly free)
-* **`load > 0.10`** → `d` ramps linearly from `0` to `max_degradation`% as `load` goes from `0.10` to `1.0`
-* **`max_degradation = 0`** disables degradation entirely
+* **`c ≤ degradation_threshold`** → `d = 0` (full per-request rate while batch slots are mostly free)
+* **`degradation_threshold < c ≤ max_concurrency`** → `d` ramps linearly from `0` to `max_degradation`% as `c` goes from `degradation_threshold` to `max_concurrency`
+* **`c > max_concurrency`** → the per-node concurrency gate queues the request rather than admitting it, so the curve never extrapolates past saturation
+* **`max_degradation = 0`** disables degradation entirely; **`per_request_tokens_per_second = 0`** disables pacing entirely (passthrough / real-GPU-baseline lane)
 
-Defaults: `max_degradation = 10` (percent), range `0`–`95`. The shape is fixed in code; only the magnitude and on/off are operator-tunable. In multi-node mode, `max_degradation` may be inherited from the node's class template and overridden per node in `configs/nodes.yaml`. The current value is exposed live as `computed_degradation_percentage` on `GET /config` and the config HTML page for the single-node/default path, while fleet panels expose per-node saturation directly.
+Defaults (cluster reference): `per_request_tokens_per_second = 32`, `degradation_threshold = 32`, `max_concurrency = 64`, `max_degradation = 20`. All four are inherited from the node's class template and overridable per-node in `configs/nodes.yaml`. Live values are exposed via `cllm_node_per_request_tps_effective{node,class}` and `cllm_node_max_concurrency{node,class}`; the implicit single-node fallback (no `nodes.yaml`) seeds `per_request_tokens_per_second = 32` so default deployments still pace at the historical rate without any global flag.
 
-Degradation applies on the **cached-replay path only** — the upstream (vLLM/OpenAI) path is paced by the real backend, not by `f(load)`. Together with the queue/admission gates, this produces the system-level non-linear latency growth described in §6.2: the per-request rate curve itself is linear past the 10% threshold, but the queue-bound regime amplifies it into the soft-saturation behavior real GPU schedulers exhibit.
+Degradation applies on the **cached-replay path only** — the upstream (vLLM/OpenAI) path is paced by the real backend, not by `f(c)`. Together with the queue/admission gates, this produces the system-level non-linear latency growth described in §6.2: the per-request rate curve itself is linear past `degradation_threshold`, but the queue-bound regime amplifies it into the soft-saturation behavior real GPU schedulers exhibit.
 
 This avoids unrealistic “hard cliff” capacity limits while staying honest about what the simulation actually models: a calibrated throughput envelope with a tunable contention slope, not a learned GPU scheduler.
 
@@ -331,11 +331,11 @@ The result is a realistic simulation of fairness in shared inference systems wit
 
 A single physical GPU acts as the system's first calibration baseline. Running the benchmark suite through the configured real backend (for example via `:dsl no-cache`, optionally pinned to the calibration node for admission accounting) routes requests through vLLM and produces a measured throughput envelope on the reference hardware. Synthetic nodes then reuse calibrated class envelopes: the same cached responses are replayed under per-request TPS pacing, prefill simulation, and node-local cost-based admission, reproducing that envelope at the same scale on the same machine.
 
-Increasing the configured per-request rate — `:dsl tps=96` on the prompt, the `tps-*` profiles, a runtime `POST /config` update, or a per-node `max_tokens_per_second` in `configs/nodes.yaml` — multiplies the simulated capacity proportionally, modeling additional GPUs or stronger GPU classes without provisioning them. A measured baseline of 32 tps/request becomes a 3-GPU-class node at `tps=96`, an 8-GPU-class node at `tps=256`, and so on. Latency curves, queue dynamics, routing decisions, and tenant fairness can be evaluated across 2×, 4×, or 16× capacity classes on a single physical machine, and the calibration anchor remains available at any time — re-running the real-backend node re-measures the baseline so the synthetic envelope can be revalidated after model, prompt, or vLLM-version changes.
+Increasing the configured per-request rate — `:dsl tps=96` on the prompt, the `tps-*` profiles, or a per-node `per_request_tokens_per_second` in `configs/nodes.yaml` — multiplies the simulated capacity proportionally, modeling additional GPUs or stronger GPU classes without provisioning them. A measured baseline of 32 tps/request becomes a 3-GPU-class node at `tps=96`, an 8-GPU-class node at `tps=256`, and so on. Latency curves, queue dynamics, routing decisions, and tenant fairness can be evaluated across 2×, 4×, or 16× capacity classes on a single physical machine, and the calibration anchor remains available at any time — re-running the real-backend node re-measures the baseline so the synthetic envelope can be revalidated after model, prompt, or vLLM-version changes.
 
 The mechanism turns the platform into a **capacity-scaling sandbox**: experiments that would otherwise require buying, deploying, and tuning N×GPUs reduce to a node config change against a calibrated baseline. The same workflow supports the inverse direction — running `:dsl re-cache` refreshes a stale cached response with a fresh real-backend call so the cached library tracks the real model over time without dropping the synthetic path.
 
-**Scope and limits.** This calibration models *system-level* dynamics — queueing, admission, tenant fairness, tail latency, throughput degradation under load — and reproduces them with high fidelity at scaled-up GPU counts. It does **not** model micro-architectural GPU effects: KV-cache pressure spikes, batch-scheduler interleaving inside vLLM, or content-dependent decode-time variance. Synthetic capacity scales the throughput *envelope*, not the underlying compute, so power, thermal, and per-token cost comparisons against real N-GPU deployments require separate calibration. Real GPU clusters also scale sublinearly past some point due to interconnect, KV-cache contention, and batching limits; cLLM expresses that explicitly through the `f(load)` degradation curve (§6.4), so the linear `tps ≈ k × GPU_count` mapping is a starting point that operators tune against measured multi-GPU runs, not a permanent assumption.
+**Scope and limits.** This calibration models *system-level* dynamics — queueing, admission, tenant fairness, tail latency, throughput degradation under load — and reproduces them with high fidelity at scaled-up GPU counts. It does **not** model micro-architectural GPU effects: KV-cache pressure spikes, batch-scheduler interleaving inside vLLM, or content-dependent decode-time variance. Synthetic capacity scales the throughput *envelope*, not the underlying compute, so power, thermal, and per-token cost comparisons against real N-GPU deployments require separate calibration. Real GPU clusters also scale sublinearly past some point due to interconnect, KV-cache contention, and batching limits; cLLM expresses that explicitly through the `f(c)` concurrency-degradation curve (§6.4), so the linear `tps ≈ k × GPU_count` mapping is a starting point that operators tune against measured multi-GPU runs, not a permanent assumption.
 
 ---
 
@@ -349,19 +349,25 @@ nodes:
   rtx-2000-0:
     class: rtx-2000
     upstream: http://vllm:8000/v1
-    max_tokens_per_second: 30
+    per_request_tokens_per_second: 30
+    max_concurrency: 64
+    degradation_threshold: 32
     max_tokens_in_flight: 8192
     max_waiting_requests: 100
 
   h100-0:
     class: H100
-    max_tokens_per_second: 96
+    per_request_tokens_per_second: 96
+    max_concurrency: 256
+    degradation_threshold: 128
     max_tokens_in_flight: 65536
     max_waiting_requests: 200
 
   a10-0:
     class: A10
-    max_tokens_per_second: 32
+    per_request_tokens_per_second: 32
+    max_concurrency: 64
+    degradation_threshold: 32
     max_tokens_in_flight: 16384
     max_waiting_requests: 100
 
@@ -427,7 +433,7 @@ back to the client is `kv_pressure` (transient: try again later) or
 entire KV ceiling and will never fit). Both join the existing
 `over_capacity` reason on `cllm_tenant_rejections_total{reason}`.
 
-`f(load)` then consumes a single combined signal:
+`f(c)` then consumes a single combined signal:
 
 > **`combined_load = max(cost_load, kv_load × kv_weight)`**
 
@@ -475,13 +481,13 @@ prefill_time = base_overhead
 
 Where:
 
-* **`effective_decode_rate = max_tokens_per_second × (1 − d(load))`** — the same rate used by streaming (§6.4), so prefill and decode share one capacity model.
+* **`effective_decode_rate = per_request_tokens_per_second × (1 − d(c))`** — the same rate used by streaming (§6.4), so prefill and decode share one capacity model.
 * **`prefill_rate_multiplier`** — how much faster prefill is than decode on the simulated GPU. Default `0` (prefill **disabled**); range `0`–`20`. Operators set this to a non-zero value to enable prefill simulation.
 * **`prefill_base_overhead_ms`** — a flat additive term per request to model fixed setup cost (default `0`, max `60000`).
 * **`prefill_jitter_percent`** — stochastic variation around the computed delay (default `0`, max `100`).
 * **`prefill_max_ms`** — hard ceiling on prefill duration (default `3000`) so a pathologically large prompt cannot block a worker indefinitely.
 
-Because `effective_decode_rate` is what `f(load)` already shapes, prefill latency rises automatically as the in-flight token budget fills — reflecting contention for compute, memory bandwidth, and attention setup without a separate degradation curve.
+Because `effective_decode_rate` is what `f(c)` already shapes, prefill latency rises automatically as the routed node's batch slots fill — reflecting contention for compute, memory bandwidth, and attention setup without a separate degradation curve.
 
 ---
 
@@ -492,7 +498,7 @@ After prefill, requests enter the decode phase, where tokens are emitted from th
 Per-request streaming rate is the same `effective_tokens_per_second` from §6.4:
 
 ```text
-effective_tokens_per_second = max_tokens_per_second × (1 − d(load))
+effective_tokens_per_second = per_request_tokens_per_second × (1 − d(c))
 ```
 
 Layered on top of that base pacing are four opt-in realism knobs that perturb individual content segments during cache replay:
@@ -502,7 +508,7 @@ Layered on top of that base pacing are four opt-in realism knobs that perturb in
 * **`stream_stall_probability_percent`** — chance that a segment is followed by a partial stall (default `0`, max `100`).
 * **`stream_stall_min_ms` / `stream_stall_max_ms`** — stall duration range when triggered (defaults `100`/`800`, max `60000`).
 
-Stalls simulate attention bottlenecks, KV-cache pressure, and scheduling delays observed in real GPU-backed inference. With all four knobs at their defaults, decode emits tokens at a strict per-request TPS cadence under `f(load)` only — the predictable baseline described in §7.5.
+Stalls simulate attention bottlenecks, KV-cache pressure, and scheduling delays observed in real GPU-backed inference. With all four knobs at their defaults, decode emits tokens at a strict per-request TPS cadence under `f(c)` only — the predictable baseline described in §7.5.
 
 ---
 
@@ -557,7 +563,7 @@ This decomposition allows precise attribution of latency to specific system beha
 
 ### 7.5 Realism Is Opt-In by Default
 
-The realism mechanisms described above (prefill simulation, jitter, rate variability, partial stalls) are **disabled by default**. Out of the box the system replays cached responses at a strict per-request TPS cadence with global degradation `f(load)` still applied; nothing else perturbs the schedule. This is intentional:
+The realism mechanisms described above (prefill simulation, jitter, rate variability, partial stalls) are **disabled by default**. Out of the box the system replays cached responses at a strict per-request TPS cadence with per-node degradation `f(c)` still applied; nothing else perturbs the schedule. This is intentional:
 
 * **Predictable baseline.** A fresh deployment behaves like a clean rate-limited replay, which makes throughput sweeps and scheduling experiments trivially reproducible.
 * **Additive composition.** Realism is then layered on by enabling individual classes (prefill rate multiplier, jitter percent, stall probability, etc.) via flags, environment variables, or `/config` updates, or by selecting a DSL profile that bundles them.
@@ -663,7 +669,7 @@ The full set of live-tunable knobs (each validated against the bounds defined in
 **Capacity and admission**
 
 * `max_tokens_in_flight` — default cost budget (single-node admission stock; multi-node deployments can override per node)
-* `max_tokens_per_second` — per-request streaming rate
+* `per_request_tokens_per_second` — per-request streaming rate
 * `max_waiting_requests` — bounded FIFO depth
 * `max_degradation` — throughput-degradation magnitude (§6.4)
 
@@ -918,7 +924,7 @@ Overrides affect:
 * Jitter, variability, and stall behavior (per-class deltas on top of handler defaults, clamped 0–100)
 * Per-request `max_tokens` shaping for both cached and live paths
 
-Global degradation (`f(load)`) is still applied on top of per-request overrides, so per-request adjustments compose with system-wide contention modeling rather than replacing it.
+Per-node degradation (`f(c)`) is still applied on top of per-request overrides, so per-request adjustments compose with system-wide contention modeling rather than replacing it.
 
 ---
 
@@ -1130,9 +1136,9 @@ The combined effect: experimentation is no longer rate-limited by GPU availabili
 
 ## 14. Future Work
 
-1. **KV cache and memory pressure modeling — phases 1+2+3+4 shipped (cllm 0.10.x).** Each node now carries an optional `max_kv_tokens` budget separate from its compute budget, and admission gates on both axes (`kv_pressure` / `kv_oversize` rejection reasons join `over_capacity`). The `f(load)` curve consumes `combined_load = max(cost_load, kv_load × kv_weight)` so memory-bound regimes degrade independently of compute fill. New `:dsl kv-cost=N` / `:dsl no-kv` directives, three new profiles (`kv-light`, `kv-heavy`, `kv-stress`), four `cllm-overview` panels (KV occupancy, combined load, rejection reasons, cost-vs-KV crossover), and per-class inheritance of `max_kv_tokens` / `kv_weight` in `nodes.yaml` close the §6.6 caveat. **Phase 4 (cllm 0.10.x):** *shipped.* Each KV-modeled node now carries an independent `KVEstimator` p95 stream (separate from the compute estimator) so `KVCost` can decouple from `TotalCost`. A new per-class / per-node `kv_completion_factor` (default 1.0) scales the KV p95 prediction so operators model amortization (prefix cache, mid-stream KV release) on hardware where peak KV residency is below prompt+completion, without code changes. New gauge `cllm_node_kv_estimator_p95{node, class}` (warm only) anchors the calibration loop against vLLM's `gpu_cache_usage_perc`. Remaining work: preemption-on-pressure is owned by §14 item 9 (streaming admission preemption), not item 1.
-2. **Sublinear / pluggable `f(load)` shapes** — replace the fixed-shape, single-knob `max_degradation` curve (§6.4) with operator-pluggable curves so the linear `tps ≈ k × GPU_count` capacity-scaling assumption (§6.6) can be tuned against measured multi-GPU runs.
-3. **Adaptive scheduling driven by closed-loop metrics feedback** — adjust `max_tokens_in_flight` and `f(load)` automatically from observed `cllm_*` series instead of static configuration.
+1. **KV cache and memory pressure modeling — phases 1+2+3+4 shipped (cllm 0.10.x).** Each node now carries an optional `max_kv_tokens` budget separate from its compute budget, and admission gates on both axes (`kv_pressure` / `kv_oversize` rejection reasons join `over_capacity`). The `f(c)` curve consumes `combined_load = max(cost_load, kv_load × kv_weight)` so memory-bound regimes degrade independently of compute fill. New `:dsl kv-cost=N` / `:dsl no-kv` directives, three new profiles (`kv-light`, `kv-heavy`, `kv-stress`), four `cllm-overview` panels (KV occupancy, combined load, rejection reasons, cost-vs-KV crossover), and per-class inheritance of `max_kv_tokens` / `kv_weight` in `nodes.yaml` close the §6.6 caveat. **Phase 4 (cllm 0.10.x):** *shipped.* Each KV-modeled node now carries an independent `KVEstimator` p95 stream (separate from the compute estimator) so `KVCost` can decouple from `TotalCost`. A new per-class / per-node `kv_completion_factor` (default 1.0) scales the KV p95 prediction so operators model amortization (prefix cache, mid-stream KV release) on hardware where peak KV residency is below prompt+completion, without code changes. New gauge `cllm_node_kv_estimator_p95{node, class}` (warm only) anchors the calibration loop against vLLM's `gpu_cache_usage_perc`. Remaining work: preemption-on-pressure is owned by §14 item 9 (streaming admission preemption), not item 1.
+2. **Sublinear / pluggable `f(c)` shapes** — replace the fixed three-regime curve (§6.4) with operator-pluggable shapes so the linear `tps ≈ k × GPU_count` capacity-scaling assumption (§6.6) can be tuned against measured multi-GPU runs.
+3. **Adaptive scheduling driven by closed-loop metrics feedback** — adjust `max_tokens_in_flight`, `max_concurrency`, and `f(c)` automatically from observed `cllm_*` series instead of static configuration.
 4. **Live editing of tenant rate/burst via `/config`** — currently startup-only via `configs/tenants.yaml` or `Handler.SetTenants` (§9).
 5. **Weighted decode-time fairness** — tenant priority, request size, queue age layered on top of the FIFO active set (§7.2).
 6. **Operational polish on the multi-node fleet** — multi-node simulation is now part of the architecture (§5.2, §6.7), and `nodes.yaml` already accepts per-node `upstream`/`token`/`model` metadata plus a `router.fallback` field. The remaining work is wiring those last pieces into the request path and the live config surface: (a) dispatch real-backend calls through the routed node's `Upstream` block instead of the global `downstream_url`, so per-node calibration and concurrent multi-target benchmarking become a routing decision (§4 of [multi-node-design.md](multi-node-design.md)); (b) consume `router.fallback: any|none` so cross-class fallback is enforced rather than parsed-and-ignored; (c) add/remove/resize nodes via `/config`, mirroring the live-tenant-editing item above; (d) per-request node-parameter overrides such as `:dsl node-tps=` or `:dsl node-degradation=`, mirroring the existing `:dsl tps=` / `:dsl prefill=` shape.
@@ -1161,7 +1167,7 @@ The combined effect: experimentation is no longer rate-limited by GPU availabili
 
     **Phase 13 status (cllm 0.9.x):** *shipped.* The class config struct (§14, item 14) now carries `initial_tokens`, `initial_tps`, and `sustained_tps`; the cached-replay path runs a two-rate token loop that paces the first `initial_tokens` at `initial_tps` and the tail at `sustained_tps`, emitting `cllm_phase_transitions_total{class,from,to}`, `cllm_phase_tokens_total{class,phase}`, `cllm_phase_active_streams{class,phase}`, and `cllm_phase_envelope_source_total{class,source}` for the four dashboard panels (Phase Token Mix By Class, Phase Transitions Rate, Active Streams By Phase, Envelope Source). Per-request DSL surface: `:dsl initial-tokens=N`, `:dsl initial-tps=N`, `:dsl sustained-tps=N` (each `1..2048` for rates; `0` is valid for `initial-tokens` to skip phase A explicitly), and a single-token macro `:dsl no-phase` that claims all three classes at once and forces single-rate replay. Precedence: `no-phase` > per-field DSL overrides > class envelope > legacy single-rate fallback; `:dsl tps=N` continues to win when both `tps` and the phase fields are present. Smoke fixtures 15/16/17 in `scripts/smoke-test.yaml` exercise the DSL-only, class-resolved, and `no-phase` paths. **Unblocks Phase 14C:** with the class envelope in place, `priority` can finally drive queue ordering (priority-weighted dequeue) without losing the phase-aware pacing on whichever request wins the slot.
 
-    **Phase 13 follow-on (cllm 0.11.x):** *shipped.* `max_ttft_ms` now exists as an optional per-class field. The cached-replay path predicts TTFT at admission as `simulated_prefill_ms (jitter-free) + ceil(1000 / first_token_tps)` — where `first_token_tps` is `:dsl tps=N`, then `phase.InitialTPS` when the resolved phase is active, else `max_tokens_per_second` — and rejects requests whose prediction exceeds the cap with new reason `class_ttft_budget` (joining `over_capacity` / `kv_pressure` / `kv_oversize` / `class_queue_timeout` on `cllm_tenant_rejections_total{reason}`). The tenant bucket is refunded; `no-cache` / `re-cache` / cache-miss bypass the gate; per-request override is `:dsl max-ttft-ms=N` (0 disables for that request). Smoke fixtures 21/22 cover the pass and reject paths; the `cllm-overview` rejection-reason panel adds the new label value. Queue-wait is intentionally *not* included in the prediction — that axis stays owned by `class_queue_timeout` (Phase 14B).
+    **Phase 13 follow-on (cllm 0.11.x):** *shipped.* `max_ttft_ms` now exists as an optional per-class field. The cached-replay path predicts TTFT at admission as `simulated_prefill_ms (jitter-free) + ceil(1000 / first_token_tps)` — where `first_token_tps` is `:dsl tps=N`, then `phase.InitialTPS` when the resolved phase is active, else the routed node's `PerRequestRate(c)` — and rejects requests whose prediction exceeds the cap with new reason `class_ttft_budget` (joining `over_capacity` / `kv_pressure` / `kv_oversize` / `class_queue_timeout` on `cllm_tenant_rejections_total{reason}`). The tenant bucket is refunded; `no-cache` / `re-cache` / cache-miss bypass the gate; per-request override is `:dsl max-ttft-ms=N` (0 disables for that request). Smoke fixtures 21/22 cover the pass and reject paths; the `cllm-overview` rejection-reason panel adds the new label value. Queue-wait is intentionally *not* included in the prediction — that axis stays owned by `class_queue_timeout` (Phase 14B).
 
 14. **Workload class as a dimension orthogonal to tenant *and* to node class — Phase 14A shipped (cllm 0.9.x).** A new `workload_class` dimension separates *who* (tenant), *what hardware* (node class), and *what kind of work* (workload class). Phase 14A surfaces the dimension as a Prometheus label and a new `class` field on every admission and lifecycle event, without changing admission behavior. Class is selected first-wins by `:dsl workload-class=NAME` then by the `X-Workload-Class` header, then `"default"`; unknown / malformed names route to `"default"` so label cardinality stays bounded by `configs/classes.yaml`. Today, "interactive" and "batch" live as DSL profiles (§12.5), and `nodes.yaml` already defines a *node* class (`H100`, `A10`, …) used by the router. Per-tenant token buckets continue to enforce quota and isolation (§6.5); node class continues to drive routing and capacity (§6.7); workload class controls priority, queue policy, and phase-aware allocation (§14, item 13). The `tenant × workload-class` matrix unlocks the canonical platform demonstration: *"customer-b runs a batch flood, but customer-a's interactive TTFT stays protected."* Sketch:
 
@@ -1205,7 +1211,7 @@ cLLM is not a simulator. It is a **controllable, instrumented, validated GPU exp
 
 The design choices reinforce each other:
 
-* **Tokens are the resource.** Cost-based admission and a soft-saturation `f(load)` curve reproduce the queueing-dominated behavior real serving systems exhibit — without pretending to model individual GPU kernels.
+* **Tokens are the resource.** Cost-based admission and a soft-saturation `f(c)` curve reproduce the queueing-dominated behavior real serving systems exhibit — without pretending to model individual GPU kernels.
 * **One GPU is enough.** A single physical GPU calibrates the synthetic envelope; `tps=N` and `configs/nodes.yaml` then scale that envelope to model 2×, 4×, 16×, or heterogeneous-class deployments on the same machine. Capacity-scaling experiments stop being a budget item.
 * **Nodes make routing visible.** A cLLM node models a vLLM instance with its own queue, capacity, and optional upstream metadata. Per-node FIFOs and least-loaded routing reproduce the production reality that routing decisions are sticky and local saturation matters.
 * **The DSL turns the control plane into an experiment surface.** Per-request directives compose with global `/config`, so mixed workloads, A/B comparisons, node pins, and targeted fault injection run inside a single deployment, in a single time window, against a single dashboard stack.

@@ -118,7 +118,6 @@ func TestBuildAppliesClassDefaultsAndOverrides(t *testing.T) {
 
 	fallback := Capacity{
 		MaxTokensInFlight:  4096,
-		MaxTokensPerSecond: 50,
 		MaxWaitingRequests: 50,
 	}
 	nodes := spec.Build(fallback)
@@ -174,7 +173,7 @@ nodes:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	fallback := Capacity{MaxTokensInFlight: 1024, MaxTokensPerSecond: 25, MaxWaitingRequests: 10}
+	fallback := Capacity{MaxTokensInFlight: 1024, MaxWaitingRequests: 10}
 	nodes := spec.Build(fallback)
 	if len(nodes) != 1 {
 		t.Fatalf("got %d nodes", len(nodes))
@@ -215,7 +214,7 @@ classes:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	fallback := Capacity{MaxTokensInFlight: 4096, MaxTokensPerSecond: 50, MaxWaitingRequests: 50}
+	fallback := Capacity{MaxTokensInFlight: 4096, MaxWaitingRequests: 50}
 	nodes := spec.Build(fallback)
 	if len(nodes) != 3 {
 		t.Fatalf("got %d nodes, want 3", len(nodes))

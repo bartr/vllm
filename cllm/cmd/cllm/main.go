@@ -58,7 +58,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	handler := httpapi.NewHandlerWithDependencies(cfg.DownstreamURL, nil, cfg.CacheSize, httpapi.NewAskOptions(cfg.SystemPrompt, cfg.MaxTokens, cfg.Temperature))
 	handler.SetDownstreamToken(cfg.DownstreamToken)
 	handler.SetDownstreamModel(cfg.DownstreamModel)
-	handler.SetRequestProcessingLimits(cfg.MaxTokensPerSecond, cfg.MaxTokensInFlight, cfg.MaxWaitingRequests, cfg.MaxDegradation)
+	handler.SetRequestProcessingLimits(cfg.MaxTokensInFlight, cfg.MaxWaitingRequests)
 	handler.SetPrefillSimulation(cfg.PrefillRateMultiplier, cfg.PrefillBaseOverheadMs, cfg.PrefillJitterPercent, cfg.PrefillMaxMs)
 	handler.SetStreamRealism(cfg.StreamVariabilityPercent, cfg.StreamJitterPercent, cfg.StreamStallProbabilityPercent, cfg.StreamStallMinMs, cfg.StreamStallMaxMs)
 	if cfg.DSLProfiles != nil {
@@ -103,7 +103,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	} else if spec != nil {
 		fallback := node.Capacity{
 			MaxTokensInFlight:  int64(cfg.MaxTokensInFlight),
-			MaxTokensPerSecond: cfg.MaxTokensPerSecond,
 			MaxWaitingRequests: cfg.MaxWaitingRequests,
 		}
 		nodes := spec.Build(fallback)
@@ -130,14 +129,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"downstream_model", cfg.DownstreamModel,
 			"system_prompt", cfg.SystemPrompt,
 			"max_tokens", cfg.MaxTokens,
-			"max_tokens_per_second", cfg.MaxTokensPerSecond,
-			"effective_tokens_per_second", processingStats.EffectiveTokensPerSecond,
 			"max_tokens_in_flight", processingStats.MaxTokensInFlight,
 			"tokens_in_flight", processingStats.TokensInFlight,
 			"max_waiting_requests", processingStats.MaxWaitingRequests,
 			"waiting_requests", processingStats.WaitingRequests,
-			"max_degradation", cfg.MaxDegradation,
-			"computed_degradation_percentage", processingStats.ComputedDegradationPercentage,
 			"temperature", cfg.Temperature,
 			"prefill_rate_multiplier", cfg.PrefillRateMultiplier,
 			"prefill_base_overhead_ms", cfg.PrefillBaseOverheadMs,
@@ -220,8 +215,6 @@ func startQueueDepthLogger(ctx context.Context, logger *slog.Logger, handler *ht
 				"max_tokens_in_flight", processingStats.MaxTokensInFlight,
 				"waiting_requests", processingStats.WaitingRequests,
 				"max_waiting_requests", processingStats.MaxWaitingRequests,
-				"effective_tokens_per_second", processingStats.EffectiveTokensPerSecond,
-				"computed_degradation_percentage", processingStats.ComputedDegradationPercentage,
 			)
 		}
 	}

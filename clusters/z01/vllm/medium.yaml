@@ -39,7 +39,7 @@ spec:
             - --performance-mode
             - throughput
             - --max-num-seqs
-            - "256"
+            - "128"
             - --max-num-batched-tokens
             - "2048"
             - --max-model-len
@@ -68,19 +68,17 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 15
+            failureThreshold: 6
+          # liveness intentionally omitted: vLLM /health shares the asyncio loop
+          # with inference and stalls under high concurrency, causing kubelet to
+          # kill an otherwise-healthy pod. Readiness is sufficient to gate traffic.
           resources:
             requests:
               cpu: "4"
-              memory: 12Gi
+              memory: 16Gi
             limits:
               cpu: "8"
-              memory: 16Gi
+              memory: 24Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - mountPath: /cache

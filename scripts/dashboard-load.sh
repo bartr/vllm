@@ -18,10 +18,10 @@
 
 set -uo pipefail
 
-BENCH="${BENCH:-10}"
+BENCH="${BENCH:-32}"
 MAX_TOKENS="${MAX_TOKENS:-100}"
 URL="${CLLM_URL:-http://localhost:8088}"
-FILES="${FILES:-$(dirname "$0")/prompts-dashboard.yaml}"
+FILES="${FILES:-$(dirname "$0")/prompts.yaml}"
 ASK="${ASK:-$HOME/go/bin/ask}"
 
 trap 'echo; echo "dashboard-load: stopping"; kill 0 2>/dev/null; exit 0' INT TERM

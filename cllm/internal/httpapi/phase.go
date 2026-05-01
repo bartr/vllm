@@ -170,26 +170,16 @@ func (h *Handler) recordPhaseSummary(opts replayOptions, contentEmitted int) {
 	}
 }
 
-// effectiveClassRate returns the post-degradation tokens-per-second
-// the streamer would actually use for `rate`. Mirrors the rate-pick
-// logic in cachedReplayDelay so the reported gauge matches the live
-// pacing decision. A zero `rate` inherits the handler base TPS.
+// effectiveClassRate returns the configured per-class tokens-per-second
+// the streamer would actually use for `rate`. Used by the
+// `cllm_class_initial_tps_effective` / `cllm_class_sustained_tps_effective`
+// gauges. Item 16 (0.14.0) retired the global degradation curve, so this
+// is now just `calibratedTokensPerSecond(rate)`; per-node concurrency
+// degradation is reflected via `cllm_node_per_request_tps_effective`.
+// Returns 0 when `rate` is non-positive.
 func (h *Handler) effectiveClassRate(rate int) float64 {
-	h.configMu.RLock()
-	base := h.maxTokensPerSecond
-	maxDeg := h.maxDegradation
-	sched := h.scheduler
-	h.configMu.RUnlock()
-
-	effRate := rate
-	if effRate <= 0 {
-		effRate = base
-	}
-	if effRate <= 0 {
+	if rate <= 0 {
 		return 0
 	}
-	if sched != nil {
-		return sched.effectiveTokensPerSecond(effRate, maxDeg)
-	}
-	return calibratedTokensPerSecond(effRate)
+	return calibratedTokensPerSecond(rate)
 }
