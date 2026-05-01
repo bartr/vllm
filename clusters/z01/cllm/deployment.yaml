@@ -21,7 +21,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: cllm
-          image: cllm:0.16.0
+          image: cllm:0.17.0
           imagePullPolicy: Never
           # Per-node pacing/concurrency/realism are configured exclusively
           # via cllm-nodes ConfigMap (see nodes-configmap.yaml). All global
