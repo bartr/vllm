@@ -21,6 +21,7 @@ spec:
   scrapeInterval: 30s
   retention: 15d
   retentionSize: 18GB
+  enableAdminAPI: true
   externalLabels:
     cluster: z01
   resources:
