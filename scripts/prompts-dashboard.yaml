@@ -1,0 +1,46 @@
+# Long-running dashboard fixture for ask --bench.
+#
+# Goal: drive sustained, balanced traffic onto node=cllm-rtx and
+# node=vllm so the per-node panels on cllm-overview
+# (Tokens/s By Node, TTFT By Node, Latency By Node) stay populated
+# with two parallel lines.
+#
+# Strategy:
+#   - This file has NO :dsl directives. The dashboard-load.sh script
+#     launches two parallel `ask` workers, one per lane, each adding
+#     its own --dsl pin. That keeps each lane's worker pool (and
+#     therefore its in-flight concurrency) independent — without it,
+#     a single shared worker pool drifts toward the slower lane and
+#     the per-node fleet TPS rates equalize.
+#   - cllm-rtx worker omits `no-cache`, so after the first sweep its
+#     requests become cache hits paced by per_request_tokens_per_second.
+#   - vllm worker pins `no-cache`, so every request goes through the
+#     real GPU at vLLM's natural rate.
+#   - kv-node is intentionally excluded (different cap behaviour).
+#
+# Recommended invocation: scripts/dashboard-load.sh
+
+- prompt: "Explain how DNS resolution works in detail."
+- prompt: "Explain how a DHCP lease is negotiated."
+- prompt: "Walk through the OSI model layer by layer."
+- prompt: "Walk through how an HTTP request is processed end to end."
+- prompt: "Describe how a TCP three-way handshake works."
+- prompt: "Describe how TLS 1.3 establishes a session."
+- prompt: "Explain CAP theorem with examples."
+- prompt: "Explain eventual consistency with examples."
+- prompt: "Compare relational and document databases."
+- prompt: "Compare row stores and column stores."
+- prompt: "Describe how garbage collection works in Go."
+- prompt: "Describe how Java garbage collection generations work."
+- prompt: "Explain how HTTPS protects data in transit."
+- prompt: "Explain how mTLS authenticates both client and server."
+- prompt: "Describe the role of a reverse proxy."
+- prompt: "Describe the role of an API gateway."
+- prompt: "Explain how a B-tree index speeds up queries."
+- prompt: "Explain how a hash index differs from a B-tree index."
+- prompt: "Describe how OAuth 2.0 authorization code flow works."
+- prompt: "Describe how OIDC layers identity onto OAuth 2.0."
+- prompt: "Explain the difference between TCP and UDP."
+- prompt: "Explain the difference between QUIC and TCP."
+- prompt: "Describe how a write-ahead log provides durability."
+- prompt: "Describe how a redo log provides crash recovery."

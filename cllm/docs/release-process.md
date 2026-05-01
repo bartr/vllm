@@ -54,6 +54,22 @@ curl -s http://localhost:8088/version           # 3. confirm what we tested
 If any of those three steps fails, **stop**. Fix the failure on `bartr`,
 re-deploy, re-smoke. Do not tag a release on top of a known regression.
 
+The smoke fixture intentionally drives `node=kv-node` and other
+ephemeral targets that should not bleed into long-lived dashboards.
+Tombstone any test-only series before continuing so the post-release
+dashboards are clean:
+
+```sh
+PROM=$(kubectl -n monitoring get svc prometheus -o jsonpath='{.spec.clusterIP}'):9090
+curl -s -X POST -g "http://$PROM/api/v1/admin/tsdb/delete_series?match[]={node=\"kv-node\"}"
+curl -s -X POST    "http://$PROM/api/v1/admin/tsdb/clean_tombstones"
+```
+
+Add additional `match[]=...` selectors for any other smoke-only labels
+(experimental node names, throwaway tenants, etc.) introduced this
+cycle. Prometheus must have `enableAdminAPI: true` set on its CR — this
+is already the case on z01.
+
 ### 1. Push the dev branch
 
 ```sh
@@ -128,6 +144,15 @@ ask --files scripts/smoke-test.yaml --bench 1
 This is the same smoke test from step 0, but now validating the
 post-bump dev branch on the cluster. If it fails, the bump introduced a
 regression — fix on `bartr` before doing any further work.
+
+When it passes, repeat the dashboard tombstone from step 0 — the
+post-bump smoke also writes `kv-node` (and any other smoke-only) series.
+
+```sh
+PROM=$(kubectl -n monitoring get svc prometheus -o jsonpath='{.spec.clusterIP}'):9090
+curl -s -X POST -g "http://$PROM/api/v1/admin/tsdb/delete_series?match[]={node=\"kv-node\"}"
+curl -s -X POST    "http://$PROM/api/v1/admin/tsdb/clean_tombstones"
+```
 
 ## What if the cluster is on a different version than `main`?
 

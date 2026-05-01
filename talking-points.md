@@ -10,7 +10,7 @@ specification.
 ## 1. The 30-Second Pitch
 
 > I built cLLM, a **GPU-calibrated experimentation platform for LLM inference**.
-> It exposes an OpenAI-compatible API, runs next to a real vLLM deployment, and
+> It exposes the Chat Completions API (the OpenAI-defined `/v1/chat/completions` wire format also spoken by vLLM, Azure OpenAI, OpenRouter, etc.), runs next to a real vLLM deployment, and
 > uses one physical GPU to calibrate a synthetic cache-replay path. After that,
 > I can test admission, fairness, backpressure, routing, and capacity-scaling
 > policies without provisioning more GPUs.

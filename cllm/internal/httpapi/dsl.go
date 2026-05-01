@@ -3,6 +3,8 @@ package httpapi
 import (
 	"strconv"
 	"strings"
+
+	"cllm/internal/node"
 )
 
 // dslMarker is the literal token that, when present in a message's content,
@@ -87,6 +89,14 @@ type replayOverrides struct {
 	// handler maps this onto a numeric priority via priorityScore. ""
 	// means inherit from the resolved class.
 	priorityOverride string
+
+	// routedNode carries the node selected by the router so the cache
+	// replay pacer can consult per-node capacity (item 15, 0.13.0).
+	// Set by the handler after pickRoutedNode; left nil on paths that
+	// have no routing decision (legacy single-node default). The
+	// pacer falls back to the global handler rate when nil so existing
+	// tests stay byte-for-byte compatible.
+	routedNode *node.Node
 
 	directives []string
 }

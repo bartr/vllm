@@ -28,15 +28,16 @@
 
 # ---- 4. KV oversize on KV-enabled node ---------------------------------
 # Expect: 429 "kv oversize"; cllm_tenant_rejections_total{reason=kv_oversize}
-# increments. The single request alone exceeds max_kv_tokens=1024.
+# increments. The single request alone exceeds max_kv_tokens (16384 in
+# the production-shape config; raise this if max_kv_tokens grows again).
 - prompt: "oversize attempt"
-  dsl: "node=kv-node kv-cost=2000 no-cache"
+  dsl: "node=kv-node kv-cost=20000 no-cache"
 
 # ---- 5. Same oversize charge on KV-disabled node -----------------------
 # Expect: 200. Backward-compat contract: KV directives are no-ops on
 # nodes with max_kv_tokens=0 (Node.KV == nil).
 - prompt: "kv-disabled node ignores kv-cost"
-  dsl: "node=default kv-cost=2000 no-cache"
+  dsl: "node=default kv-cost=20000 no-cache"
 
 # ---- 6. no-kv directive on KV-enabled node -----------------------------
 # Expect: 200; KV gate is skipped entirely (sentinel KVCost=-1). Useful
@@ -46,10 +47,10 @@
 
 # ---- 7. no-kv beats a later kv-cost (first-wins) -----------------------
 # Expect: 200. The directive class `kv-cost` is shared between no-kv and
-# kv-cost=N; first-wins means a later kv-cost=2000 cannot overturn the
-# no-kv claim and the request is admitted on kv-node.
+# kv-cost=N; first-wins means a later oversized kv-cost cannot overturn
+# the no-kv claim and the request is admitted on kv-node.
 - prompt: "first-wins precedence"
-  dsl: "node=kv-node no-kv kv-cost=2000 no-cache"
+  dsl: "node=kv-node no-kv kv-cost=20000 no-cache"
 
 # ---- 8. KV-light profile -----------------------------------------------
 # Expect: 200; light KV pressure visible on the cllm-overview KV panel.
@@ -57,7 +58,7 @@
   dsl: "node=kv-node profile=kv-light no-cache"
 
 # ---- 9. KV-heavy profile -----------------------------------------------
-# Expect: 200; KV occupancy spikes to ~50% (kv-cost=512 vs cap=1024).
+# Expect: 200; KV occupancy spikes (kv-cost=512 vs cap=16384 ≈ 3%).
 - prompt: "kv-heavy profile sweep"
   dsl: "node=kv-node profile=kv-heavy no-cache"
 
@@ -159,7 +160,7 @@
 # `gpu_cache_usage_perc` and `cllm_node_kv_estimator_p95` converge, then
 # tune `kv_completion_factor` in classes.yaml until the synthetic node
 # tracks the real one.
-- prompt: "Summarize the following short paragraph in one sentence: cLLM is a lightweight admission and routing layer in front of an OpenAI-compatible LLM endpoint."
+- prompt: "Summarize the following short paragraph in one sentence: cLLM is a lightweight admission and routing layer in front of a Chat Completions API endpoint."
   dsl: "node=kv-node max-tokens=16 no-cache"
 
 # ---- 21. Class TTFT budget passes (Phase 13 follow-on, 0.11.x) --------

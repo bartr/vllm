@@ -126,7 +126,7 @@ func (h *Handler) renderConfigHTML(w http.ResponseWriter, r *http.Request, state
 			Fields: []configField{
 				{
 					Key: "downstream_url", Label: "downstream_url", Kind: fieldString,
-					Help:    "Downstream OpenAI-compatible base URL.",
+					Help:    "Downstream Chat Completions API base URL.",
 					Default: runtimeconfig.DefaultDownstreamURL,
 					Current: pickStr("downstream_url", "downstream-url", cfg.DownstreamURL),
 				},

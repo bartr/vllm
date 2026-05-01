@@ -52,6 +52,21 @@ var (
 		"Per-node KV estimator p95 of recent completion tokens (Phase 4 of design-memory-pressure.md). Emitted only when the node has KV modeling enabled and the estimator has reached its warm-up sample count; otherwise the series is omitted.",
 		[]string{"node", "class"}, nil,
 	)
+	nodeConcurrentRequestsDesc = prometheus.NewDesc(
+		"cllm_node_concurrent_requests",
+		"Per-node concurrent admitted requests (item 15, 0.13.0). Emitted only when the node has the concurrency gate enabled (max_concurrency > 0).",
+		[]string{"node", "class"}, nil,
+	)
+	nodeMaxConcurrencyDesc = prometheus.NewDesc(
+		"cllm_node_max_concurrency",
+		"Per-node configured maximum concurrent admitted requests (item 15, 0.13.0). Emitted only when the concurrency gate is enabled.",
+		[]string{"node", "class"}, nil,
+	)
+	nodePerRequestTPSEffectiveDesc = prometheus.NewDesc(
+		"cllm_node_per_request_tps_effective",
+		"Per-node effective per-request decode rate (tokens/second) at current concurrency, after three-regime degradation. Emitted only when per_request_tokens_per_second > 0 on the node.",
+		[]string{"node", "class"}, nil,
+	)
 )
 
 func (c nodeFleetCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -62,6 +77,9 @@ func (c nodeFleetCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- nodeMaxKVTokensDesc
 	ch <- nodeCombinedLoadDesc
 	ch <- nodeKVEstimatorP95Desc
+	ch <- nodeConcurrentRequestsDesc
+	ch <- nodeMaxConcurrencyDesc
+	ch <- nodePerRequestTPSEffectiveDesc
 }
 
 func (c nodeFleetCollector) Collect(ch chan<- prometheus.Metric) {
@@ -103,6 +121,18 @@ func (c nodeFleetCollector) Collect(ch chan<- prometheus.Metric) {
 					ch <- prometheus.MustNewConstMetric(nodeKVEstimatorP95Desc, prometheus.GaugeValue, float64(p95), n.ID, n.Class)
 				}
 			}
+		}
+		// vLLM-style per-request pacing series (item 15, 0.13.0).
+		// Emitted only when the node has the concurrency gate
+		// enabled OR per-request pacing enabled, so passthrough-style
+		// nodes don't stamp zeros into series scrapers would plot.
+		if n.Concurrency != nil {
+			_, conc, _, _ := n.Concurrency.Stats()
+			ch <- prometheus.MustNewConstMetric(nodeConcurrentRequestsDesc, prometheus.GaugeValue, float64(conc), n.ID, n.Class)
+			ch <- prometheus.MustNewConstMetric(nodeMaxConcurrencyDesc, prometheus.GaugeValue, float64(n.Capacity.MaxConcurrency), n.ID, n.Class)
+		}
+		if n.Capacity.PerRequestTPS > 0 {
+			ch <- prometheus.MustNewConstMetric(nodePerRequestTPSEffectiveDesc, prometheus.GaugeValue, n.PerRequestRate(n.ConcurrentRequests()), n.ID, n.Class)
 		}
 	}
 }

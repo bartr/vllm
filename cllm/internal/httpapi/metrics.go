@@ -97,26 +97,26 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		}, []string{"route", "method", "status"}),
 		jobsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_jobs_total",
-			Help: "Total number of cllm jobs by endpoint and result.",
-		}, []string{"endpoint", "result", "source"}),
+			Help: "Total number of cllm jobs by endpoint, result, source, and routed node. The node label is 'unknown' for jobs rejected before routing or in single-node deployments.",
+		}, []string{"endpoint", "result", "source", "node"}),
 		completionTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_completion_tokens_total",
-			Help: "Total number of completion tokens returned by cllm responses.",
-		}, []string{"endpoint", "source"}),
+			Help: "Total number of completion tokens returned by cllm responses, broken down by routed node.",
+		}, []string{"endpoint", "source", "node"}),
 		cacheLookupsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_cache_lookups_total",
 			Help: "Total number of cache lookups by endpoint and result.",
 		}, []string{"endpoint", "result"}),
 		queueWaitDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_queue_wait_duration_seconds",
-			Help:    "Time jobs spend waiting in the request queue before admission.",
+			Help:    "Time jobs spend waiting in the request queue before admission, broken down by routed node.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
-		}, []string{"endpoint"}),
+		}, []string{"endpoint", "node"}),
 		timeToFirstByteDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_time_to_first_byte_seconds",
-			Help:    "Time from job admission to the first response byte written to the client.",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
-		}, []string{"endpoint", "source"}),
+			Help:    "Time from job admission to the first response byte written to the client, broken down by routed node.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 10, 30},
+		}, []string{"endpoint", "source", "node"}),
 		prefillDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_prefill_duration_seconds",
 			Help:    "Simulated prefill latency before the first response byte on cache replay.",
@@ -147,13 +147,13 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		dslJobDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_dsl_job_duration_seconds",
 			Help:    "Job duration by DSL directive family. The family label is 'none' for requests without DSL directives.",
-			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 10, 30, 60},
 		}, []string{"endpoint", "family", "source", "result"}),
 		jobDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_job_duration_seconds",
-			Help:    "Time from job admission to completion.",
-			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
-		}, []string{"endpoint", "source", "result"}),
+			Help:    "Time from job admission to completion, broken down by routed node.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 10, 30, 60},
+		}, []string{"endpoint", "source", "result", "node"}),
 		downstreamRequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cllm_downstream_request_duration_seconds",
 			Help:    "Time spent waiting on downstream chat completion requests.",
@@ -169,7 +169,7 @@ func newHandlerMetrics(handler *Handler) *handlerMetrics {
 		}, []string{"tenant", "class"}),
 		tenantRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_tenant_rejections_total",
-			Help: "Total chat completion requests rejected at admission, by tenant, workload class, and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize, class_queue_timeout, class_ttft_budget).",
+			Help: "Total chat completion requests rejected at admission, by tenant, workload class, and reason (tenant_rate, over_capacity, kv_pressure, kv_oversize, class_queue_timeout, class_ttft_budget, node_concurrency).",
 		}, []string{"tenant", "class", "reason"}),
 		nodeAdmissionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cllm_node_admissions_total",
@@ -328,19 +328,25 @@ func (m *handlerMetrics) observeCacheLookup(endpoint, result string) {
 	m.cacheLookupsTotal.WithLabelValues(endpoint, result).Inc()
 }
 
-func (m *handlerMetrics) observeCompletionTokens(endpoint, source string, tokenCount int) {
+func (m *handlerMetrics) observeCompletionTokens(endpoint, source, node string, tokenCount int) {
 	if tokenCount < 1 {
 		return
 	}
-	m.completionTokensTotal.WithLabelValues(endpoint, source).Add(float64(tokenCount))
+	if node == "" {
+		node = "unknown"
+	}
+	m.completionTokensTotal.WithLabelValues(endpoint, source, node).Add(float64(tokenCount))
 }
 
-func (m *handlerMetrics) observeQueueWait(endpoint string, duration time.Duration) {
-	m.queueWaitDuration.WithLabelValues(endpoint).Observe(duration.Seconds())
+func (m *handlerMetrics) observeQueueWait(endpoint, node string, duration time.Duration) {
+	m.queueWaitDuration.WithLabelValues(endpoint, node).Observe(duration.Seconds())
 }
 
-func (m *handlerMetrics) observeTimeToFirstByte(endpoint, source, _ string, duration time.Duration) {
-	m.timeToFirstByteDuration.WithLabelValues(endpoint, source).Observe(duration.Seconds())
+func (m *handlerMetrics) observeTimeToFirstByte(endpoint, source, node string, duration time.Duration) {
+	if node == "" {
+		node = "unknown"
+	}
+	m.timeToFirstByteDuration.WithLabelValues(endpoint, source, node).Observe(duration.Seconds())
 }
 
 func (m *handlerMetrics) observePrefillDuration(endpoint, source string, duration time.Duration) {
@@ -487,10 +493,13 @@ func (m *handlerMetrics) observePhaseReclaim(class string, tokenSeconds float64)
 	m.phaseReclaimTokenSecondsTotal.WithLabelValues(class).Add(tokenSeconds)
 }
 
-func (m *handlerMetrics) observeJob(endpoint, result, source, _ string, duration time.Duration) {
-	m.jobsTotal.WithLabelValues(endpoint, result, source).Inc()
+func (m *handlerMetrics) observeJob(endpoint, result, source, node string, duration time.Duration) {
+	if node == "" {
+		node = "unknown"
+	}
+	m.jobsTotal.WithLabelValues(endpoint, result, source, node).Inc()
 	if duration > 0 {
-		m.jobDuration.WithLabelValues(endpoint, source, result).Observe(duration.Seconds())
+		m.jobDuration.WithLabelValues(endpoint, source, result, node).Observe(duration.Seconds())
 	}
 }
 

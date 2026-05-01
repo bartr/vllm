@@ -1,13 +1,139 @@
-# Sample prompt list for `ask --bench --file scripts/prompts.yaml`.
+# High-throughput mixed-cache fixture for `ask --bench --loop`.
 #
-# Each entry must include `prompt`. Optional per-prompt overrides:
-#   dsl          DSL directives prepended as ":dsl <text>\n" before the prompt.
-#                When --dsl is also passed on the CLI, both are merged.
-#   max_tokens   Override --max-tokens for this prompt only.
-#   temperature  Override --temperature for this prompt only.
+# Designed against the production-shape node config (see
+# clusters/z01/cllm/nodes-configmap.yaml):
+#
+#   per-node nominal     = 600 tok/s
+#   fleet nominal        = 1200 tok/s (2 nodes)
+#   per-node graceful    = down to 300 tok/s under saturation
+#                          (max_degradation: 50)
+#   per-node queue depth = 600 waiting requests before 429
+#
+# Goals:
+#   - Drive sustained ≥1200 tok/s of *offered* load through the fleet.
+#   - Mix of cache hits + no-cache misses so admission gates fire.
+#   - At --bench 20 the fleet runs near nominal (no degradation).
+#   - At --bench 40 the fleet enters the degradation band (effective
+#     TPS halves, latency p95 ~doubles, but no 429s).
+#   - At --bench 80+ the queue starts to back up; 429s only when
+#     max_waiting_requests is exceeded for sustained intervals.
+#
+# Recommended invocations:
+#
+#   # Nominal (~1200 TPS, no degradation):
+#   ~/go/bin/ask --bench 20 --loop --files scripts/prompts.yaml \
+#                --duration 3m --max-tokens 100
+#
+#   # Graceful overload (~2x offered, watch effective TPS halve):
+#   ~/go/bin/ask --bench 40 --loop --files scripts/prompts.yaml \
+#                --duration 3m --max-tokens 100
+#
+#   # Push the queue (eventually 429s if sustained):
+#   ~/go/bin/ask --bench 80 --loop --files scripts/prompts.yaml \
+#                --duration 3m --max-tokens 100
+#
+# What to watch on Grafana cllm-overview:
+#   - cllm_effective_tokens_per_second / cllm_max_tokens_per_second
+#     ratio falls from 1.0 → 0.5 as load rises into the degradation band.
+#   - cllm_waiting_requests stays at 0 at bench=20, climbs at bench=40,
+#     plateaus near max_waiting_requests at bench=80.
+#   - cllm_tenant_rejections_total{reason} only moves at sustained
+#     overload (queue overflow path).
+#
+# IMPORTANT: do NOT pass --dsl 'no-cache' on the CLI — it would merge
+# into Block A prompts and zero out the cache hit rate.
 
-- prompt: "Explain Azure"
+# ============================================================
+# Block A — Cacheable repeats (NO DSL)
+# 12 distinct prompts. After the first --loop pass these become
+# cache hits. Cache replays bypass the token budget and finish in
+# ~ms regardless of node TPS — they keep the dashboard cache-hit
+# rate visible while not consuming the 600 tok/s/node budget.
+# ============================================================
 
 - prompt: "What is the capital of Texas?"
 
-- prompt: "Explain Kubernetes"
+- prompt: "List three popular programming languages."
+
+- prompt: "Define container orchestration in one sentence."
+
+- prompt: "What does HTTP stand for?"
+
+- prompt: "Name two NoSQL databases."
+
+- prompt: "Briefly explain what a load balancer does."
+
+- prompt: "What is the difference between a process and a thread?"
+
+- prompt: "Give a one-sentence definition of machine learning."
+
+- prompt: "What does CDN stand for?"
+
+- prompt: "Name three Linux package managers."
+
+- prompt: "Explain idempotency in one sentence."
+
+- prompt: "What is a service mesh?"
+
+# ============================================================
+# Block B — Live no-cache traffic on the default (KV-disabled) node
+# Always misses; consumes pacing budget. Half the misses live here
+# so the default node sees ~600 tok/s of real decode work.
+# ============================================================
+
+- prompt: "Explain how DNS resolution works in detail."
+  dsl: "node=default no-cache"
+
+- prompt: "Walk through the OSI model layer by layer."
+  dsl: "node=default no-cache"
+
+- prompt: "Describe how a TCP three-way handshake works."
+  dsl: "node=default no-cache"
+
+- prompt: "Explain CAP theorem with examples."
+  dsl: "node=default no-cache"
+
+- prompt: "Compare relational and document databases."
+  dsl: "node=default no-cache"
+
+- prompt: "Describe how garbage collection works in Go."
+  dsl: "node=default no-cache"
+
+# ============================================================
+# Block C — Live no-cache traffic on kv-node
+# Always misses. Mixed safe KV charges that stay well under the
+# 1024-token KV cap so kv_oversize never fires under medium load.
+# Drives KV occupancy gauges + KV estimator p95.
+# ============================================================
+
+- prompt: "Explain a Kubernetes Pod and its lifecycle."
+  dsl: "node=kv-node kv-cost=192 no-cache"
+
+- prompt: "What is etcd and why does Kubernetes use it?"
+  dsl: "node=kv-node kv-cost=256 no-cache"
+
+- prompt: "Describe how a HorizontalPodAutoscaler decides when to scale."
+  dsl: "node=kv-node kv-cost=384 no-cache"
+
+- prompt: "Compare Deployments and StatefulSets."
+  dsl: "node=kv-node kv-cost=512 no-cache"
+
+- prompt: "Explain how Kubernetes Services route traffic to Pods."
+  dsl: "node=kv-node kv-cost=320 no-cache"
+
+- prompt: "Describe the role of the kubelet on each node."
+  dsl: "node=kv-node kv-cost=448 no-cache"
+
+# ============================================================
+# Mix summary (24 prompts):
+#   12 cacheable           (Block A)  → ~50% of traffic, ~hits after warm-up
+#    6 no-cache default    (Block B)  → ~25% of traffic, drives default TPS
+#    6 no-cache kv-node    (Block C)  → ~25% of traffic, drives kv-node TPS + KV gauges
+#
+# Approx offered load at --bench 20, max-tokens=100, two nodes:
+#   - Cache hits replay nearly free (~5–20 ms each)
+#   - Each miss consumes ~100 tokens of pacing budget per node
+#   - Steady-state offered: ~1100–1300 tok/s fleet → near nominal
+#
+# Doubling --bench to 40 doubles offered load → degradation band.
+# ============================================================

@@ -748,6 +748,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if routedNode != nil {
 		h.logRouterDecisionIfMultiNode(ctx, routedNode, routedReason, replayDSL)
 	}
+	// Stamp the routed node onto replayOverrides so the cache replay
+	// pacer can consult per-node capacity (item 15, 0.13.0). Falls
+	// back to handler globals when nil.
+	replayDSL.routedNode = routedNode
+	// nodeLabel resolves the routed node's ID for per-node metric
+	// labels. It returns "unknown" for the byte-for-byte legacy path
+	// where pickRoutedNode falls back to the implicit single-node
+	// default (routedNode == nil).
+	nodeLabel := func() string {
+		if routedNode == nil {
+			return "unknown"
+		}
+		return routedNode.ID
+	}
 
 	// Phase 4 (docs/design-memory-pressure.md §4.1bis): refine KVCost
 	// using the routed node's KV estimator, but only when the DSL did
@@ -833,10 +847,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rejectBody = "kv oversize\n"
 		case "class_queue_timeout":
 			rejectBody = "class queue timeout\n"
+		case "node_concurrency":
+			rejectBody = "node concurrency\n"
 		default:
 			rejectBody = "over capacity\n"
 		}
-		h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
+		h.metrics.observeJob(endpoint, "rejected", "none", nodeLabel(), 0)
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
 		h.metrics.observeAdmissionRejection(tenant.name, class.name, rejectReason)
 		h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", rejectReason, "request rejected",
@@ -855,11 +871,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	h.metrics.observeJob(endpoint, "accepted", "none", mode, 0)
+	h.metrics.observeJob(endpoint, "accepted", "none", nodeLabel(), 0)
 	h.metrics.observeAdmissionAccept(tenant.name, class.name, mode)
-	if queueWait > 0 {
-		h.metrics.observeQueueWait(endpoint, queueWait)
-	}
+	h.metrics.observeQueueWait(endpoint, nodeLabel(), queueWait)
 	processingStartedAt := time.Now()
 	h.emitLifecycleEvent(ctx, slog.LevelInfo, "started", "", "request started",
 		"mode", mode,
@@ -908,7 +922,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	requestPayload, err := h.populateChatCompletionDefaults(ctx, requestPayload)
 	if err != nil {
-		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+		h.metrics.observeJob(endpoint, "failed", "downstream", nodeLabel(), time.Since(processingStartedAt))
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
 		emitCompleted(slog.LevelInfo, "failed", "downstream", http.StatusBadGateway, 0, 0)
 		markCacheHit(w, false)
@@ -918,7 +932,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	cacheKey, err := buildChatCompletionCacheKey(requestPayload)
 	if err != nil {
-		h.metrics.observeJob(endpoint, "failed", "none", mode, time.Since(processingStartedAt))
+		h.metrics.observeJob(endpoint, "failed", "none", nodeLabel(), time.Since(processingStartedAt))
 		h.metrics.observeDSLJobDuration(endpoint, "none", "failed", dslFamily, time.Since(processingStartedAt))
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
 		emitCompleted(slog.LevelInfo, "failed", "none", http.StatusInternalServerError, 0, 0)
@@ -953,7 +967,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				predictedMs := h.predictTTFTms(promptTokens, replayDSL)
 				if predictedMs > effectiveMaxTTFTMs {
 					tenant.bucket.refund(float64(cost.TotalCost))
-					h.metrics.observeJob(endpoint, "rejected", "none", "unknown", 0)
+					h.metrics.observeJob(endpoint, "rejected", "none", nodeLabel(), 0)
 					h.metrics.observeDSLRequestResult(endpoint, dslFamily, "rejected")
 					h.metrics.observeAdmissionRejection(tenant.name, class.name, "class_ttft_budget")
 					h.emitLifecycleEvent(ctx, slog.LevelWarn, "rejected", "class_ttft_budget", "request rejected",
@@ -986,7 +1000,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 			if prefillErr != nil {
-				h.metrics.observeJob(endpoint, "failed", "cache", mode, time.Since(processingStartedAt))
+				h.metrics.observeJob(endpoint, "failed", "cache", nodeLabel(), time.Since(processingStartedAt))
 				h.metrics.observeDSLJobDuration(endpoint, "cache", "failed", dslFamily, time.Since(processingStartedAt))
 				h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
 				emitCompleted(slog.LevelInfo, "failed", "cache", http.StatusServiceUnavailable, promptTokens, 0)
@@ -995,7 +1009,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 			timedWriter := newFirstByteMetricsWriter(w, func() {
 				ttfb := time.Since(processingStartedAt)
-				h.metrics.observeTimeToFirstByte(endpoint, cachedSource, cachedMode, ttfb)
+				h.metrics.observeTimeToFirstByte(endpoint, cachedSource, nodeLabel(), ttfb)
 				h.metrics.observeDSLTimeToFirstByte(endpoint, cachedSource, dslFamily, ttfb)
 				h.emitLifecycleEvent(ctx, slog.LevelInfo, "first_token", "", "first token emitted",
 					"source", cachedSource,
@@ -1009,6 +1023,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				stream:       requestPayload.Stream,
 				overrides:    replayDSL,
 				class:        class.name,
+				node:         routedNode,
 			}
 			if requestPayload.Stream {
 				h.replayCachedStream(ctx, timedWriter, cachedResponse, replay)
@@ -1016,8 +1031,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if replay.maxTokens > 0 && deliveredTokens > replay.maxTokens {
 					deliveredTokens = replay.maxTokens
 				}
-				h.metrics.observeCompletionTokens(endpoint, "cache", deliveredTokens)
-				h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(true), time.Since(processingStartedAt))
+				h.metrics.observeCompletionTokens(endpoint, "cache", nodeLabel(), deliveredTokens)
+				h.metrics.observeJob(endpoint, "completed", "cache", nodeLabel(), time.Since(processingStartedAt))
 				h.metrics.observeDSLJobDuration(endpoint, "cache", "completed", dslFamily, time.Since(processingStartedAt))
 				h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
 				emitCompleted(slog.LevelInfo, "completed", "cache", cachedResponse.statusCode, promptTokens, deliveredTokens)
@@ -1025,8 +1040,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 
 			h.replayCachedResponse(ctx, timedWriter, cachedResponse, replay)
-			h.metrics.observeCompletionTokens(endpoint, "cache", completionTokens)
-			h.metrics.observeJob(endpoint, "completed", "cache", modeLabel(false), time.Since(processingStartedAt))
+			h.metrics.observeCompletionTokens(endpoint, "cache", nodeLabel(), completionTokens)
+			h.metrics.observeJob(endpoint, "completed", "cache", nodeLabel(), time.Since(processingStartedAt))
 			h.metrics.observeDSLJobDuration(endpoint, "cache", "completed", dslFamily, time.Since(processingStartedAt))
 			h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
 			emitCompleted(slog.LevelInfo, "completed", "cache", cachedResponse.statusCode, promptTokens, completionTokens)
@@ -1038,7 +1053,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	markCacheHit(w, false)
 	timedWriter := newFirstByteMetricsWriter(w, func() {
 		ttfb := time.Since(processingStartedAt)
-		h.metrics.observeTimeToFirstByte(endpoint, "downstream", mode, ttfb)
+		h.metrics.observeTimeToFirstByte(endpoint, "downstream", nodeLabel(), ttfb)
 		h.metrics.observeDSLTimeToFirstByte(endpoint, "downstream", dslFamily, ttfb)
 		h.emitLifecycleEvent(ctx, slog.LevelInfo, "first_token", "", "first token emitted",
 			"source", "downstream",
@@ -1052,7 +1067,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		cachedResponse, err := h.streamChatCompletion(ctx, timedWriter, requestPayload)
 		h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 		if err != nil {
-			h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+			h.metrics.observeJob(endpoint, "failed", "downstream", nodeLabel(), time.Since(processingStartedAt))
 			h.metrics.observeDSLJobDuration(endpoint, "downstream", "failed", dslFamily, time.Since(processingStartedAt))
 			h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
 			emitCompleted(slog.LevelInfo, "failed", "downstream", http.StatusBadGateway, 0, 0)
@@ -1065,8 +1080,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		completionTokens := cachedResponseCompletionTokens(cachedResponse)
 		promptTokens := cachedResponsePromptTokens(cachedResponse)
-		h.metrics.observeCompletionTokens(endpoint, "downstream", completionTokens)
-		h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
+		h.metrics.observeCompletionTokens(endpoint, "downstream", nodeLabel(), completionTokens)
+		h.metrics.observeJob(endpoint, "completed", "downstream", nodeLabel(), time.Since(processingStartedAt))
 		h.metrics.observeDSLJobDuration(endpoint, "downstream", "completed", dslFamily, time.Since(processingStartedAt))
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
 		emitCompleted(slog.LevelInfo, "completed", "downstream", cachedResponse.statusCode, promptTokens, completionTokens)
@@ -1077,7 +1092,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	responseBody, statusCode, contentType, err := h.createChatCompletion(ctx, requestPayload)
 	h.metrics.observeDownstreamRequest(endpoint, mode, downstreamResultLabel(err), time.Since(downstreamStartedAt))
 	if err != nil {
-		h.metrics.observeJob(endpoint, "failed", "downstream", mode, time.Since(processingStartedAt))
+		h.metrics.observeJob(endpoint, "failed", "downstream", nodeLabel(), time.Since(processingStartedAt))
 		h.metrics.observeDSLJobDuration(endpoint, "downstream", "failed", dslFamily, time.Since(processingStartedAt))
 		h.metrics.observeDSLRequestResult(endpoint, dslFamily, "failed")
 		emitCompleted(slog.LevelInfo, "failed", "downstream", http.StatusBadGateway, 0, 0)
@@ -1094,8 +1109,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	_, _ = timedWriter.Write(responseBody)
 	completionTokens := cachedJSONTokenCount(responseBody)
 	promptTokens := cachedJSONPromptTokens(responseBody)
-	h.metrics.observeCompletionTokens(endpoint, "downstream", completionTokens)
-	h.metrics.observeJob(endpoint, "completed", "downstream", mode, time.Since(processingStartedAt))
+	h.metrics.observeCompletionTokens(endpoint, "downstream", nodeLabel(), completionTokens)
+	h.metrics.observeJob(endpoint, "completed", "downstream", nodeLabel(), time.Since(processingStartedAt))
 	h.metrics.observeDSLJobDuration(endpoint, "downstream", "completed", dslFamily, time.Since(processingStartedAt))
 	h.metrics.observeDSLRequestResult(endpoint, dslFamily, "completed")
 	emitCompleted(slog.LevelInfo, "completed", "downstream", statusCode, promptTokens, completionTokens)
@@ -1991,6 +2006,11 @@ type replayOptions struct {
 	// label on phase-transition metrics. Empty defaults to
 	// defaultClassName at the call site.
 	class string
+	// node is the routed node, used for per-node vLLM-shaped pacing
+	// (item 15, 0.13.0). nil falls back to the legacy fleet-divided
+	// rate. Carries no metric labels (those use nodeLabel() at call
+	// sites); used purely for pacer rate selection.
+	node *node.Node
 }
 
 func (h *Handler) replayCachedStream(ctx context.Context, w http.ResponseWriter, cachedResponse cachedVLLMResponse, opts replayOptions) {
@@ -2676,6 +2696,33 @@ func (h *Handler) cachedReplayDelay(tokenCount, tokensSoFar int, overrides repla
 		return 0
 	}
 
+	// vLLM-shaped per-request pacing (item 15, 0.13.0). When the
+	// routed node has PerRequestTPS > 0, every request paces at the
+	// node's per-request rate regardless of fleet capacity. The rate
+	// itself depends on the node's live concurrency (three-regime
+	// curve in node.PerRequestRate). DSL `tps=N` and the phase
+	// envelope still win — they explicitly set a per-request rate,
+	// which is what the new model is doing in any case.
+	if n := overrides.routedNode; n != nil && n.Capacity.PerRequestTPS > 0 {
+		base := n.PerRequestRate(n.ConcurrentRequests())
+		switch {
+		case overrides.tpsOverride > 0:
+			base = float64(overrides.tpsOverride)
+		case overrides.phase.active():
+			rate := overrides.phase.SustainedTPS
+			if tokensSoFar < overrides.phase.InitialTokens {
+				rate = overrides.phase.InitialTPS
+			}
+			if rate > 0 {
+				base = float64(rate)
+			}
+		}
+		if base <= 0 {
+			return 0
+		}
+		return time.Duration(float64(tokenCount) * float64(time.Second) / base)
+	}
+
 	h.configMu.RLock()
 	baseTokensPerSecond := h.maxTokensPerSecond
 	maxDegradation := h.maxDegradation
@@ -3199,6 +3246,33 @@ func (s *requestScheduler) acquireOn(ctx context.Context, cost node.RequestCost,
 		s.metrics.observePrioritySkip(n.ID, n.Class)
 	}
 
+	// Per-request concurrency gate (item 15, 0.13.0). Layered AFTER
+	// the token-cost gate because the token-cost gate is the
+	// historical primary admission control and any KV/concurrency
+	// rejection must refund the compute slot it just acquired. cost=1
+	// per request (this gate counts request slots, not tokens).
+	// Models a real GPU's batch-slot limit: at MaxConcurrency the
+	// per-request rate has fully degraded, and any further request
+	// queues here.
+	concAcquired := false
+	var concWait time.Duration
+	if n.Concurrency != nil {
+		var concSkipped bool
+		concWait, concSkipped, ok = n.Concurrency.AcquireWithPriority(ctx, 1, cost.Priority)
+		if !ok {
+			n.Budget.Release(chargedCost)
+			if emitNodeMetric {
+				s.metrics.observeNodeAdmission(n.ID, n.Class, "rejected")
+			}
+			return nil, queueWait + concWait, false, "node_concurrency"
+		}
+		if concSkipped && emitNodeMetric {
+			s.metrics.observePrioritySkip(n.ID, n.Class)
+		}
+		concAcquired = true
+		queueWait += concWait
+	}
+
 	// KV admission gate. Layered on top of the compute gate per
 	// docs/design-memory-pressure.md \u00a75.2: if the node has KV modeling
 	// enabled and the request's KV cost cannot be charged, release the
@@ -3210,6 +3284,9 @@ func (s *requestScheduler) acquireOn(ctx context.Context, cost node.RequestCost,
 			kvCost = 0
 		} else if kvOK, kvReason := n.KV.TryCharge(kvCost); !kvOK {
 			n.Budget.Release(chargedCost)
+			if concAcquired {
+				n.Concurrency.Release(1)
+			}
 			if emitNodeMetric {
 				s.metrics.observeNodeAdmission(n.ID, n.Class, "rejected")
 			}
@@ -3229,7 +3306,7 @@ func (s *requestScheduler) acquireOn(ctx context.Context, cost node.RequestCost,
 		s.metrics.observeNodeAdmission(n.ID, n.Class, "admitted")
 		s.metrics.observeNodeQueueWait(n.ID, n.Class, queueWait)
 	}
-	return s.releaseFuncWithKV(n, chargedCost, kvCost), queueWait, true, ""
+	return s.releaseFuncWithKV(n, chargedCost, kvCost, concAcquired), queueWait, true, ""
 }
 
 func (s *requestScheduler) Reconfigure(maxTokensInFlight, maxWaitingRequests int) {
@@ -3280,14 +3357,18 @@ func (s *requestScheduler) releaseFuncOn(b *node.TokenBudget, cost int64) func()
 	}
 }
 
-// releaseFuncWithKV returns a release closure that refunds both the
-// compute slot and the KV slot when called. It is the dual of the
-// admission path in acquireOn that charges both budgets atomically.
-func (s *requestScheduler) releaseFuncWithKV(n *node.Node, cost, kvCost int64) func() {
+// releaseFuncWithKV returns a release closure that refunds the compute
+// slot, the KV slot (when modeled), and the concurrency slot (when
+// modeled). It is the dual of the admission path in acquireOn that
+// charges all three budgets.
+func (s *requestScheduler) releaseFuncWithKV(n *node.Node, cost, kvCost int64, concAcquired bool) func() {
 	return func() {
 		n.Budget.Release(cost)
 		if n.KV != nil {
 			n.KV.Release(kvCost)
+		}
+		if concAcquired && n.Concurrency != nil {
+			n.Concurrency.Release(1)
 		}
 	}
 }

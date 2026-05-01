@@ -51,7 +51,7 @@ kubectl delete -f manifests/gpu-smoke-test.yaml
 
 ## Run vLLM In Kubernetes
 
-For your setup, vLLM is the right default if you want an OpenAI-compatible API and better throughput than simpler wrappers. If your priority is the absolute simplest single-node experience, Ollama is easier to get running, but vLLM is the better fit for a GPU-backed Kubernetes service.
+For your setup, vLLM is the right default if you want a Chat Completions API endpoint (the OpenAI-defined `/v1/chat/completions` wire format, also spoken by Azure OpenAI, OpenRouter, Together, Groq, and similar stacks) and better throughput than simpler wrappers. If your priority is the absolute simplest single-node experience, Ollama is easier to get running, but vLLM is the better fit for a GPU-backed Kubernetes service.
 
 ### Pick a starter model
 
@@ -209,7 +209,7 @@ Then call `cllm` through the Traefik external IP on port `8088`:
 curl -i http://192.168.68.63:8088/health
 ```
 
-If `CLLM_TOKEN` is set, `ask` sends it as `Authorization: Bearer ...` for OpenAI-compatible endpoints. If you point `CLLM_URL` at `https://api.openai.com`, set `CLLM_MODEL` to a model you have access to, such as `gpt-4.1`.
+If `CLLM_TOKEN` is set, `ask` sends it as `Authorization: Bearer ...` for Chat Completions API endpoints (vLLM, OpenAI, Azure OpenAI, OpenRouter, Together, Groq, etc.). If you point `CLLM_URL` at `https://api.openai.com`, set `CLLM_MODEL` to a model you have access to, such as `gpt-4.1`.
 
 You can also pass the user context directly:
 
@@ -226,7 +226,7 @@ CLLM_MODEL='gpt-4.1' \
 ./scripts/ask "Give me three uses for an edge-hosted LLM."
 ```
 
-Benchmark an OpenAI-compatible endpoint with the same tool:
+Benchmark any Chat Completions API endpoint with the same tool:
 
 ```bash
 ./scripts/ask --bench 10 --duration 30s --prompt 'explain azure'

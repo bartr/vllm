@@ -5,32 +5,74 @@ metadata:
   namespace: cllm
 data:
   nodes.yaml: |
-    # Two-node fleet for KV-pressure smoke testing.
-    # `kv-node` has a tiny KV ceiling so kv-cost= directives can
-    # provoke kv_pressure / kv_oversize rejections on demand.
-    # `default` keeps KV disabled so the same fleet exercises the
-    # backward-compat fall-through path.
+    # vLLM-shaped per-request pacing (item 15, 0.13.0).
+    #
+    # Model: each request decodes at a fixed per_request_tokens_per_second
+    # up to degradation_threshold concurrent requests. Between
+    # degradation_threshold and max_concurrency the per-request rate
+    # falls linearly to per_request_tokens_per_second*(1-max_degradation%).
+    # Past max_concurrency requests queue (up to max_waiting_requests)
+    # then 429 (reason: node_concurrency).
+    #
+    # Numbers calibrated against observed vLLM (Qwen2.5-3B on this
+    # cluster):
+    #   1 req     -> ~32 tok/s/req      = 32 fleet TPS
+    #   10 req    -> ~31 tok/s/req      = 310 fleet TPS
+    #   20 req    -> ~31 tok/s/req      = 630 fleet TPS
+    #   32 req    -> degradation begins (~25 tok/s/req)
+    #   64 req    -> max_degradation (~25 tok/s/req at 20% degradation)
+    #   65+ req   -> queue (up to 64 waiters), then 429
     nodes:
+      # Modeled lane: vLLM-shaped per-request pacing.
+      cllm-rtx:
+        class: cllm-rtx
+        # Legacy token-cost gate kept generous so the new request-slot
+        # gate (max_concurrency) is the binding admission control.
+        max_tokens_per_second: 600
+        max_tokens_in_flight: 1000000
+        max_waiting_requests: 64
+        # vLLM-shaped per-request pacing (item 15, 0.13.0).
+        per_request_tokens_per_second: 40
+        degradation_threshold: 32
+        max_concurrency: 64
+
+      # vLLM lane: every per-request knob disabled so cllm adds
+      # no shaping to upstream traffic. Use as the "real vLLM" baseline.
+      vllm:
+        class: vllm
+        max_tokens_per_second: 1000000
+        max_tokens_in_flight: 1000000000
+        max_waiting_requests: 100000
+        # 0 disables the per-request pacing model entirely.
+        per_request_tokens_per_second: 0
+        max_concurrency: 0
+
+      # KV-pressure lane: same per-request shape as cllm-rtx, plus the
+      # KV admission gate. Not used in the throughput A/B; kept for KV
+      # demos.
       kv-node:
         class: kv-test
-        max_tokens_per_second: 32
-        max_tokens_in_flight: 16384
-        max_waiting_requests: 100
-        max_kv_tokens: 1024
+        max_tokens_per_second: 600
+        max_tokens_in_flight: 1000000
+        max_waiting_requests: 64
+        per_request_tokens_per_second: 32
+        degradation_threshold: 32
+        max_concurrency: 64
+        max_kv_tokens: 16384
         kv_weight: 1.0
-      default:
-        class: default
-        max_tokens_per_second: 32
-        max_tokens_in_flight: 16384
-        max_waiting_requests: 100
     classes:
+      cllm-rtx:
+        f_load_shape: piecewise_linear
+        # vLLM degrades modestly past saturation, not catastrophically.
+        max_degradation: 20
+        prefill_rate_multiplier: 4
+      vllm:
+        f_load_shape: piecewise_linear
+        max_degradation: 0
+        prefill_rate_multiplier: 0
       kv-test:
         f_load_shape: piecewise_linear
-        max_degradation: 10
-        prefill_rate_multiplier: 4
-      default:
-        f_load_shape: piecewise_linear
-        max_degradation: 10
+        max_degradation: 20
         prefill_rate_multiplier: 4
     router:
       policy: least-loaded

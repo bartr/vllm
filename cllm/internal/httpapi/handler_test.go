@@ -359,10 +359,10 @@ func TestMetricsCollapseStreamModeAndKeepChatCompletionsDurationRoute(t *testing
 	for _, want := range []string{
 		`cllm_http_request_duration_seconds_bucket{method="GET",route="other",status="200"`,
 		`cllm_http_request_duration_seconds_bucket{method="POST",route="POST /v1/chat/completions",status="200"`,
-		`cllm_time_to_first_byte_seconds_bucket{endpoint="chat_completions",source="downstream"`,
-		`cllm_job_duration_seconds_bucket{endpoint="chat_completions",result="completed",source="downstream"`,
+		`cllm_time_to_first_byte_seconds_bucket{endpoint="chat_completions",node="default",source="downstream"`,
+		`cllm_job_duration_seconds_bucket{endpoint="chat_completions",node="default",result="completed",source="downstream"`,
 		`cllm_downstream_request_duration_seconds_bucket{endpoint="chat_completions",result="completed"`,
-		`cllm_completion_tokens_total{endpoint="chat_completions",source="downstream"} 2`,
+		`cllm_completion_tokens_total{endpoint="chat_completions",node="default",source="downstream"} 2`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing substring %q", want)

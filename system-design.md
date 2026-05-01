@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-cLLM is a Kubernetes-native, OpenAI-compatible **GPU experimentation platform** for LLM serving. A single physical GPU calibrates a synthetic execution path; one cLLM process can then model a heterogeneous fleet of vLLM-like nodes — each with its own capacity envelope, FIFO queue, and optional upstream metadata — on the same machine, at no additional GPU cost.
+cLLM is a Kubernetes-native GPU experimentation platform for LLM serving that speaks the **Chat Completions API** — the de-facto industry wire format originally defined by OpenAI and now also implemented by vLLM, Azure OpenAI, OpenRouter, Together, Groq, and most other production inference stacks. A single physical GPU calibrates a synthetic execution path; one cLLM process can then model a heterogeneous fleet of vLLM-like nodes — each with its own capacity envelope, FIFO queue, and optional upstream metadata — on the same machine, at no additional GPU cost.
 
 What it buys an engineering team:
 
@@ -23,7 +23,7 @@ What it is not: a kernel-level GPU simulator. Micro-architectural effects (KV-ca
 
 Modern LLM serving systems are often evaluated through real GPU-backed deployments, which are expensive, non-deterministic, and difficult to experiment with safely. cLLM is a Kubernetes-native LLM inference control plane designed to model serving as a **token-throughput–constrained scheduling problem over shared GPU resources**.
 
-The system provides an OpenAI-compatible API and supports both real backends (e.g., vLLM) and synthetic execution nodes that replay cached responses under per-request rate pacing, cost-based admission, per-tenant fairness, per-node routing, controlled prefill, jitter, and stall injection. By decoupling system behavior from model execution, cLLM enables controlled, reproducible experiments on scheduling, routing, fairness, and backpressure — including heterogeneous fleet and capacity-scaling experiments calibrated against a real GPU baseline on the same hardware — while still reproducing the system-level dynamics of real GPU inference. Because the synthetic path requires no GPU at runtime, the calibration host is the only paid GPU hour: experiments replay on laptops, CI runners, and air-gapped hosts at no additional GPU cost (§13).
+The system speaks the Chat Completions API (the OpenAI-defined `/v1/chat/completions` wire format, also implemented by vLLM, Azure OpenAI, OpenRouter, and similar stacks) and supports both real backends (e.g., vLLM) and synthetic execution nodes that replay cached responses under per-request rate pacing, cost-based admission, per-tenant fairness, per-node routing, controlled prefill, jitter, and stall injection. By decoupling system behavior from model execution, cLLM enables controlled, reproducible experiments on scheduling, routing, fairness, and backpressure — including heterogeneous fleet and capacity-scaling experiments calibrated against a real GPU baseline on the same hardware — while still reproducing the system-level dynamics of real GPU inference. Because the synthetic path requires no GPU at runtime, the calibration host is the only paid GPU hour: experiments replay on laptops, CI runners, and air-gapped hosts at no additional GPU cost (§13).
 
 ---
 
@@ -68,8 +68,8 @@ The goal of cLLM is to provide a **deterministic, controllable environment** tha
 
 ### Functional Goals
 
-* OpenAI-compatible API for seamless integration
-* Per-request routing across an in-process node fleet plus OpenAI-compatible upstream and synthetic cache-replay paths
+* Chat Completions API (`/v1/chat/completions`) for seamless integration with any client that already speaks the OpenAI / vLLM / Azure OpenAI wire format
+* Per-request routing across an in-process node fleet plus Chat Completions API upstreams and synthetic cache-replay paths
 * Token-based throughput constraints with cost-based admission
 * Per-request behavioral overrides via an in-prompt **DSL directive system** (`:dsl …`)
 * Per-tenant fairness with independent rate/burst buckets
@@ -111,7 +111,7 @@ vLLM-like serving instance, not a bare GPU. Each node owns:
 * Its own token-cost admission stock and FIFO waiting queue
 * Its own completion-token estimator
 * Per-node or inherited class realism knobs (`f(load)`, prefill, jitter, variability, stalls)
-* Optional OpenAI-compatible upstream metadata for pass-through / calibration nodes
+* Optional Chat Completions API upstream metadata for pass-through / calibration nodes
 
 Nodes are loaded from `configs/nodes.yaml` (or `CLLM_NODES_FILE`). If no node
 file is present, the handler synthesizes one `default` node from the existing
@@ -126,7 +126,7 @@ Routing is **per-request**, not a deployment-time mode switch. Each
 * The router honors explicit pins first, then uses least-loaded routing by default. Least-loaded routing compares each candidate node's in-flight/capacity ratio and skips nodes whose remaining budget cannot fit the request cost; ties break on lexical node ID for determinism.
 * The configured `router.policy` accepts `class-pinned`, `least-loaded`, or `chained`. `chained` and the empty/default value both expand to `Chained{ClassPinned, LeastLoaded}`; `class-pinned` runs only the pin stage and returns `400 no_node_match` when neither `node=` nor `node-class=` is present. Unknown values fall back to `least-loaded`.
 * **Cache hit** (and no `:dsl no-cache` / `:dsl re-cache` directive): the selected synthetic node replays the cached response under per-request TPS pacing, prefill simulation, inter-token jitter, and configurable stream stalls.
-* **Cache miss, or `:dsl no-cache`, or `:dsl re-cache`**: the request is forwarded to the configured OpenAI-compatible upstream. On success, the response is written back to the cache unless `no-cache` was specified (`re-cache` writes back; `no-cache` does neither lookup nor write). The selected node still owns admission, queueing, and per-node metrics for that request.
+* **Cache miss, or `:dsl no-cache`, or `:dsl re-cache`**: the request is forwarded to the configured Chat Completions API upstream (vLLM, Azure OpenAI, OpenAI, or any other implementation of the same wire format). On success, the response is written back to the cache unless `no-cache` was specified (`re-cache` writes back; `no-cache` does neither lookup nor write). The selected node still owns admission, queueing, and per-node metrics for that request.
 
 Execution-layer mechanics that shape observed latency and throughput:
 
@@ -703,7 +703,7 @@ Combined with per-request DSL directives (§12), the platform supports a wide sp
 * **Global policy sweeps** — ramp `max_tokens_in_flight` or `max_degradation` while a steady benchmark runs and read the response off the three observability layers (§8.4).
 * **A/B comparisons** — split traffic across DSL families (`tps`, `prefill`, `stall`, `no-cache`, `re-cache`) in a single run; metrics are partitioned by family automatically (§8.2).
 * **Cache-state transitions** — `:dsl no-cache` measures the real backend, `:dsl re-cache` refreshes a stale entry, `action=save`/`load` snapshots and restores a known-good cache between experiments.
-* **Backend swaps** — retarget `downstream_url`/`downstream_model` mid-flight to compare the same workload against vLLM, OpenAI, or another OpenAI-compatible upstream without redeploying the synthetic system.
+* **Backend swaps** — retarget `downstream_url`/`downstream_model` mid-flight to compare the same workload against vLLM, Azure OpenAI, OpenAI, OpenRouter, or any other Chat Completions API upstream without redeploying the synthetic system.
 * **Real-time observation of policy changes** — because every knob has a corresponding metric or label dimension, the *moment* a value changes is visible on the dashboards.
 
 In short: every parameter that affects scheduling, admission, generation, or routing is a live knob, every change is observable on the same three-layer dashboard stack, and per-request DSL composition lets a single deployment run multiple experiments concurrently.
@@ -1117,7 +1117,7 @@ The cost story is also an operations story — maybe more so. GPU instances carr
 
 ### 13.3 Runs Almost Anywhere
 
-Because cLLM exposes an OpenAI-compatible API and the synthetic path requires no GPU at runtime, a calibrated cache library is portable to almost any host that can run a Go binary and a Kubernetes pod (or a plain container, or a local process):
+Because cLLM speaks the Chat Completions API and the synthetic path requires no GPU at runtime, a calibrated cache library is portable to almost any host that can run a Go binary and a Kubernetes pod (or a plain container, or a local process):
 
 * **Engineering laptops** — macOS, Windows, Linux — reproduce the calibrated envelope for design and debugging without leaving the developer's machine.
 * **CPU-only servers and CI runners** host long-running benchmark and regression suites without competing for the GPU pool.
@@ -1201,7 +1201,7 @@ The combined effect: experimentation is no longer rate-limited by GPU availabili
 
 ## 15. Conclusion
 
-cLLM is not a simulator. It is a **controllable, instrumented, validated GPU experimentation platform** — built on a real OpenAI-compatible control plane, deployed alongside the same vLLM and observability stack you would run in production, and engineered so that scheduling, routing, admission, fairness, and capacity-scaling decisions can be tested and validated *before* they touch real GPU infrastructure.
+cLLM is not a simulator. It is a **controllable, instrumented, validated GPU experimentation platform** — built on a real Chat Completions API control plane (the same `/v1/chat/completions` wire format every production stack already speaks), deployed alongside the same vLLM and observability stack you would run in production, and engineered so that scheduling, routing, admission, fairness, and capacity-scaling decisions can be tested and validated *before* they touch real GPU infrastructure.
 
 The design choices reinforce each other:
 

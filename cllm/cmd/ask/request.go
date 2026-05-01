@@ -51,7 +51,7 @@ func (r Result) DecodeTPS() float64 {
 	return float64(r.CompletionTokens) / decode.Seconds()
 }
 
-// chatRequest is the OpenAI-compatible request body.
+// chatRequest is the Chat Completions API request body.
 type chatRequest struct {
 	Model         string        `json:"model"`
 	Messages      []chatMessage `json:"messages"`

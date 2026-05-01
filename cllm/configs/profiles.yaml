@@ -66,6 +66,7 @@ kv-light: "kv-cost=64"
 kv-heavy: "kv-cost=512"
 
 # Pathological KV pressure: oversized KV cost designed to provoke
-# kv_oversize rejections on small nodes.
-kv-stress: "kv-cost=4096"
+# kv_oversize rejections. Sized above the production-shape
+# max_kv_tokens (16384); bump again if the cap grows.
+kv-stress: "kv-cost=32768"
 

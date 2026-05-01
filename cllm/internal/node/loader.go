@@ -48,6 +48,12 @@ type NodeSpec struct {
 	MaxTokensPerSecond int   `yaml:"max_tokens_per_second"`
 	MaxWaitingRequests int   `yaml:"max_waiting_requests"`
 
+	// vLLM-style per-request pacing knobs (item 15, 0.13.0). All three
+	// are per-node; class fallbacks live on ClassSpec.
+	PerRequestTPS        *int `yaml:"per_request_tokens_per_second,omitempty"`
+	DegradationThreshold *int `yaml:"degradation_threshold,omitempty"`
+	MaxConcurrency       *int `yaml:"max_concurrency,omitempty"`
+
 	// MaxKVTokens / KVWeight are the per-node KV-cache axis knobs. 0
 	// for MaxKVTokens disables the entire axis on this node and
 	// inherits from the class default; KVWeight uses class default
@@ -89,6 +95,12 @@ type ClassSpec struct {
 	StreamStallProbPct    int     `yaml:"stream_stall_probability_percent"`
 	StreamStallMinMs      int     `yaml:"stream_stall_min_ms"`
 	StreamStallMaxMs      int     `yaml:"stream_stall_max_ms"`
+
+	// vLLM-style per-request pacing class defaults (item 15, 0.13.0).
+	// 0 means "leave to per-node config / handler legacy behavior."
+	PerRequestTPS        int `yaml:"per_request_tokens_per_second"`
+	DegradationThreshold int `yaml:"degradation_threshold"`
+	MaxConcurrency       int `yaml:"max_concurrency"`
 
 	// MaxKVTokens / KVWeight are the class-level defaults for the KV
 	// admission axis. A node with its own non-zero MaxKVTokens
@@ -186,6 +198,26 @@ func (s *FileSpec) Validate() error {
 		if n.MaxWaitingRequests < 0 {
 			return fmt.Errorf("node %q: max_waiting_requests must be >= 0", id)
 		}
+		if n.PerRequestTPS != nil && *n.PerRequestTPS < 0 {
+			return fmt.Errorf("node %q: per_request_tokens_per_second must be >= 0", id)
+		}
+		if n.DegradationThreshold != nil && *n.DegradationThreshold < 0 {
+			return fmt.Errorf("node %q: degradation_threshold must be >= 0", id)
+		}
+		if n.MaxConcurrency != nil && *n.MaxConcurrency < 0 {
+			return fmt.Errorf("node %q: max_concurrency must be >= 0", id)
+		}
+	}
+	for name, c := range s.Classes {
+		if c.PerRequestTPS < 0 {
+			return fmt.Errorf("class %q: per_request_tokens_per_second must be >= 0", name)
+		}
+		if c.DegradationThreshold < 0 {
+			return fmt.Errorf("class %q: degradation_threshold must be >= 0", name)
+		}
+		if c.MaxConcurrency < 0 {
+			return fmt.Errorf("class %q: max_concurrency must be >= 0", name)
+		}
 	}
 	return nil
 }
@@ -220,6 +252,11 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 			MaxKVTokens:        pickInt64(spec.MaxKVTokens, class.MaxKVTokens),
 			KVWeight:           derefFloat64(spec.KVWeight, class.KVWeight),
 			KVCompletionFactor: derefFloat64(spec.KVCompletionFactor, class.KVCompletionFactor),
+			// vLLM-style per-request pacing knobs (0.13.0). Per-node
+			// override > class default > 0 (= legacy disabled).
+			PerRequestTPS:        derefInt(spec.PerRequestTPS, class.PerRequestTPS),
+			DegradationThreshold: derefInt(spec.DegradationThreshold, class.DegradationThreshold),
+			MaxConcurrency:       derefInt(spec.MaxConcurrency, class.MaxConcurrency),
 		}
 		// Only normalize KVWeight when KV modeling is enabled; leave
 		// it zero otherwise so a node with KV disabled has a Capacity
@@ -277,6 +314,14 @@ func (s *FileSpec) Build(fallback Capacity) []*Node {
 			// the cost estimator so the two converge in lock-step
 			// when the operator hasn't supplied a factor.
 			n.KVEstimator = NewCompletionEstimator(256, 50)
+		}
+		// vLLM-style request-slot gate (item 15, 0.13.0). Created only
+		// when MaxConcurrency > 0; cost=1 per request. Queue depth is
+		// MaxWaitingRequests, shared with the token-cost Budget. nil
+		// when disabled = byte-for-byte legacy admission.
+		if cap.MaxConcurrency > 0 {
+			n.Concurrency = NewTokenBudget(int64(cap.MaxConcurrency), cap.MaxWaitingRequests)
+			n.Concurrency.SetAgingStepMs(DefaultPriorityAgingStepMs)
 		}
 		out = append(out, n)
 	}

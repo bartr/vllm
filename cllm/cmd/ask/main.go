@@ -1,4 +1,4 @@
-// Command ask is a single CLI for talking to an OpenAI-compatible chat
+// Command ask is a single CLI for talking to a Chat Completions API chat
 // completions endpoint, either as a one-shot interactive request or as a
 // concurrent benchmark.
 //
@@ -315,7 +315,8 @@ func validateOptions(opts options) error {
 
 const usageText = `Usage: ask [OPTIONS] [PROMPT...]
 
-Talk to an OpenAI-compatible chat endpoint, either one-shot (default) or as a
+Talk to a Chat Completions API endpoint (vLLM, OpenAI, Azure OpenAI, OpenRouter,
+Together, Groq, etc.), either one-shot (default) or as a
 concurrent benchmark (--bench N).
 
 Single-shot:

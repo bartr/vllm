@@ -37,7 +37,7 @@ The server supports these runtime settings:
 
 - `CACHE_CACHE_SIZE` or `--cache-size` / `-c`: maximum number of cached chat responses
 - `CACHE_CACHE_FILE_PATH` or `--cache-file-path`: cache persistence file path, default `/var/lib/cllm/cache.json`
-- `CACHE_DOWNSTREAM_URL` or `--downstream-url`: downstream OpenAI-compatible base URL, default `http://localhost:8000`
+- `CACHE_DOWNSTREAM_URL` or `--downstream-url`: downstream Chat Completions API base URL (vLLM, OpenAI, Azure OpenAI, OpenRouter, etc.), default `http://localhost:8000`
 - `CACHE_DOWNSTREAM_TOKEN` or `--downstream-token`: bearer token sent to the downstream API
 - `CACHE_DOWNSTREAM_MODEL` or `--downstream-model`: default downstream model when incoming requests omit `model`
 - `CACHE_SYSTEM_PROMPT` or `--system-prompt`: default system prompt for chat completions
@@ -269,7 +269,7 @@ curl 'http://127.0.0.1:8080/cache?size=200'
 
 `/cache` responses include `cache_file_path`, and save/load actions also report the number of entries written or loaded. `/cache/{key}` returns metadata for the matching cache entry plus the cached content, a whitespace-split `text_tokens` view, and the raw cached body.
 
-Example switching the downstream source to OpenAI-compatible settings at runtime:
+Example switching the downstream source to another Chat Completions API at runtime:
 
 ```bash
 curl 'http://127.0.0.1:8080/config?downstream-url=https%3A%2F%2Fapi.openai.com&downstream-token=your-token&downstream-model=gpt-4.1'
@@ -318,7 +318,7 @@ For `POST /v1/chat/completions`, structured lifecycle events are emitted as logs
 make build
 ```
 
-This builds the local container image `cllm:0.11.0`.
+This builds the local container image `cllm:0.13.0`.
 
 To build and import that image into the local k3s container runtime:
 
@@ -329,8 +329,8 @@ make deploy
 That runs the equivalent of:
 
 ```bash
-docker build -t cllm:0.11.0 .
-docker save cllm:0.11.0 | sudo k3s ctr images import -
+docker build -t cllm:0.13.0 .
+docker save cllm:0.13.0 | sudo k3s ctr images import -
 ```
 
 ## Test
@@ -342,8 +342,8 @@ go test ./...
 ## Docker
 
 ```bash
-docker build -t cllm:0.11.0 .
-docker run --rm -p 8080:8080 cllm:0.11.0
+docker build -t cllm:0.13.0 .
+docker run --rm -p 8080:8080 cllm:0.13.0
 ```
 
 The Docker image copies the committed [cache.json](/home/bartr/vllm/cllm/cache.json) artifact into `/var/lib/cllm/cache.json`, which `cllm` then auto-loads on startup if it contains entries.
@@ -356,7 +356,7 @@ The local k3s manifests live under [clusters/z01/cllm](/home/bartr/vllm/clusters
 
 They:
 
-- deploy `cllm:0.11.0`
+- deploy `cllm:0.13.0`
 - set `imagePullPolicy: Never` so the local image is never pulled from a registry
 - run `cllm` in the `cllm` namespace
 - mount a `local-path` PVC at `/var/lib/cllm` so `cache.json` persists across pod replacement and overrides the image-bundled cache seed at that path
