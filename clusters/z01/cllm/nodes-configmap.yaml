@@ -36,8 +36,9 @@ data:
         max_tokens_in_flight: 200000
         max_waiting_requests: 32
         # vLLM-shaped per-request pacing (item 15, 0.13.0).
-        per_request_tokens_per_second: 32
+        per_request_tokens_per_second: 30
         degradation_threshold: 10
+        max_degradation: 50
         max_concurrency: 128
 
       # vLLM lane: every per-request knob disabled so cllm adds
