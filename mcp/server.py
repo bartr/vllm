@@ -21,6 +21,7 @@ import client
 import benchmark
 import metrics
 import audit
+import scenario as scenario_mod
 
 # Numeric field bounds for synthetic node creation and updates.
 _BOUNDS: dict[str, tuple[int, int]] = {
@@ -520,9 +521,10 @@ async def run_benchmark_window(
         return json.dumps({"error": f"Failed to capture before-snapshot: {e}"})
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    log_path_tilde = f"~/logs/bench-window-{timestamp}.log"
-    log_path = os.path.expanduser(log_path_tilde)
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    os.makedirs(settings.BENCHMARK_LOGS_DIR, exist_ok=True)
+    log_filename = f"bench-window-{timestamp}.log"
+    log_path = os.path.join(settings.BENCHMARK_LOGS_DIR, log_filename)
+    log_path_display = f"benchmark/logs/{log_filename}"
 
     cmd = [
         "ask", "--bench", str(concurrency),
@@ -589,7 +591,7 @@ async def run_benchmark_window(
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
         "command": " ".join(cmd),
-        "log_path": log_path_tilde,
+        "log_path": log_path_display,
         "killed_existing": killed_existing,
         "before": before_snapshot,
         "after": after_snapshot,
@@ -598,6 +600,144 @@ async def run_benchmark_window(
     }
     audit.log("run_benchmark_window", {"duration_seconds": duration_seconds, "concurrency": concurrency}, result)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def run_scenario(name: str) -> str:
+    """Run a named benchmark scenario from benchmark/scenarios/ and write a report.
+
+    Loads benchmark/scenarios/{name}.yaml, validates it, applies any node overrides
+    (restoring them on exit), runs all groups in parallel, captures before/after
+    metrics snapshots, writes a markdown report to benchmark/reports/, and logs an
+    audit entry. Node overrides are always restored even if the run fails.
+
+    Args:
+        name: Scenario filename without extension, e.g. 'baseline' or 'mixed-tenants'.
+    """
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+
+    scenario_path = os.path.join(settings.BENCHMARK_SCENARIOS_DIR, f"{name}.yaml")
+    if not os.path.exists(scenario_path):
+        available = [f[:-5] for f in os.listdir(settings.BENCHMARK_SCENARIOS_DIR) if f.endswith(".yaml")]
+        return json.dumps({"error": f"Scenario '{name}' not found", "available": available})
+
+    try:
+        spec = scenario_mod.load(scenario_path)
+    except (ValueError, KeyError) as e:
+        return json.dumps({"error": f"Scenario parse error: {e}"})
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    try:
+        result = await scenario_mod.run(spec, timestamp)
+    except Exception as e:
+        return json.dumps({"error": f"Scenario run failed: {e}"})
+
+    # Write markdown report
+    report_filename = f"{timestamp}-{spec.scenario}.md"
+    report_path = os.path.join(settings.BENCHMARK_REPORTS_DIR, report_filename)
+    os.makedirs(settings.BENCHMARK_REPORTS_DIR, exist_ok=True)
+    _write_scenario_report(spec, result, report_path, scenario_path)
+
+    result["report_path"] = f"benchmark/reports/{report_filename}"
+    audit.log("run_scenario", {"name": name, "scenario_hash": spec.source_hash}, result)
+    return json.dumps(result, indent=2)
+
+
+def _write_scenario_report(spec: scenario_mod.ScenarioSpec, result: dict, path: str, scenario_path: str) -> None:
+    groups = result["groups"]
+    started = result["started_at"][:19].replace("T", " ") + " UTC"
+    completed = result["completed_at"][:19].replace("T", " ") + " UTC"
+
+    # windowed admission deltas
+    b_adm = {n["node"]: int(n.get("admissions_total_admitted", 0)) for n in result["before"].get("node_metrics", [])}
+    a_adm = {n["node"]: int(n.get("admissions_total_admitted", 0)) for n in result["after"].get("node_metrics", [])}
+    active_nodes = {n for n in a_adm if a_adm[n] - b_adm.get(n, 0) > 0}
+    total_delta = sum(a_adm[n] - b_adm.get(n, 0) for n in active_nodes) or 1
+
+    lines = [
+        f"# Scenario: {spec.scenario}",
+        "",
+        f"**{spec.description}**",
+        "",
+        f"**Date:** {started}  ",
+        f"**Duration:** {spec.duration}s  ",
+        f"**Warmup:** {spec.warmup}s  ",
+        f"**Scenario hash:** `{spec.source_hash}`  ",
+        f"**Scenario file:** `benchmark/scenarios/{os.path.basename(scenario_path)}`",
+        "",
+    ]
+
+    if spec.tags:
+        lines += [f"**Tags:** {', '.join(spec.tags)}", ""]
+
+    lines += ["## Prompt", "", "> Run scenario `" + spec.scenario + "` and summarize results.", ""]
+
+    lines += ["## Tools Invoked", "", "1. `run_scenario(name=\"" + spec.scenario + "\")`", ""]
+
+    # topology
+    before_nodes = result["before"].get("node_metrics", [])
+    lines += ["## Topology", ""]
+    lines += ["| Node | TPS (effective) | Max Concurrency | Max Tokens In Flight | Protected |"]
+    lines += ["|------|-----------------|-----------------|----------------------|-----------|"]
+    for n in before_nodes:
+        if "max_tokens_in_flight" not in n:
+            continue
+        node_id = n["node"]
+        protected = "Yes" if node_id in settings.PROTECTED_NODES else "No"
+        tps = n.get("per_request_tps_effective", "—")
+        conc = int(n.get("max_concurrency", 0))
+        tif = int(n.get("max_tokens_in_flight", 0))
+        lines.append(f"| `{node_id}` | {tps} | {conc} | {tif:,} | {protected} |")
+    lines.append("")
+
+    if spec.node_overrides:
+        lines += ["### Node Overrides Applied", ""]
+        for node_id, fields in spec.node_overrides.items():
+            for k, v in fields.items():
+                lines.append(f"- `{node_id}.{k}`: set to `{v}` for this run, restored after")
+        lines += ["", f"Nodes restored: {', '.join(f'`{n}`' for n in result['node_overrides_restored'])}", ""]
+
+    # groups
+    lines += ["## Groups", ""]
+    for g in groups:
+        lines += [f"### {g['name']}", ""]
+        lines += [f"**Command:** `{g['cmd']}`  "]
+        lines += [f"**Log:** `{g['log_path']}`", ""]
+        s = g["stats"]
+        lines += ["| Metric | Value |", "|--------|-------|"]
+        lines += [f"| Total rows | {s.get('total_rows', '—')} |"]
+        lines += [f"| Warmup rows excluded | {s.get('warmup_rows_excluded', '—')} |"]
+        if s.get("cache_hit_rate_pct") is not None:
+            lines += [f"| Cache hit rate | {s['cache_hit_rate_pct']}% |"]
+        if s.get("avg_ttft_ms") is not None:
+            lines += [f"| Avg TTFT | {s['avg_ttft_ms']} ms |"]
+        if s.get("avg_req_tok_s") is not None:
+            lines += [f"| Avg req tok/s | {s['avg_req_tok_s']} |"]
+        if s.get("avg_total_tok_s") is not None:
+            lines += [f"| Avg total tok/s | {s['avg_total_tok_s']} |"]
+        lines.append("")
+
+    # traffic split
+    lines += ["## Traffic Split (windowed admission deltas)", ""]
+    lines += ["| Node | Delta | Share |", "|------|-------|-------|"]
+    for node in sorted(active_nodes):
+        d = a_adm[node] - b_adm.get(node, 0)
+        lines.append(f"| `{node}` | +{d:,} | {100*d/total_delta:.1f}% |")
+    lines += [f"| **Total** | **+{total_delta:,}** | |", ""]
+
+    lines += [
+        "## Caveats",
+        "",
+        "- Admission counts are lifetime counters; windowed deltas are used here.",
+        "- Ghost metric series for deleted nodes may appear with zero window deltas.",
+        "- For time-windowed conclusions, use Prometheus range queries or the Grafana dashboard.",
+        f"- Dashboard: <{settings.CLLM_GRAFANA_URL}>",
+    ]
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

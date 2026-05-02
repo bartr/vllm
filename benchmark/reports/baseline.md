@@ -1,0 +1,72 @@
+# Scenario: baseline
+
+**2-node fleet (cllm + vllm), 120 connections (60/node), prompts.yaml, max-tokens 100**
+
+**Date:** 2026-05-02 19:52:05 UTC  
+**Duration:** 60s  
+**Warmup:** 15s  
+**Scenario hash:** `8a93684dd5b2`  
+**Scenario file:** `benchmark/scenarios/baseline.yaml`
+
+**Tags:** baseline, 2-node
+
+## Prompt
+
+> Run scenario `baseline` and summarize results.
+
+## Tools Invoked
+
+1. `run_scenario(name="baseline")`
+
+## Topology
+
+| Node | TPS (effective) | Max Concurrency | Max Tokens In Flight | Protected |
+|------|-----------------|-----------------|----------------------|-----------|
+| `cllm` | 32.0 | 128 | 200,000 | No |
+| `vllm` | — | 0 | 200,000 | Yes |
+
+### Node Overrides Applied
+
+- `cllm.max_tokens_in_flight`: set to `200000` for this run, restored after
+- `cllm.max_waiting_requests`: set to `32` for this run, restored after
+- `cllm.per_request_tokens_per_second`: set to `32` for this run, restored after
+- `cllm.degradation_threshold`: set to `10` for this run, restored after
+- `cllm.max_concurrency`: set to `128` for this run, restored after
+- `cllm.max_degradation`: set to `60` for this run, restored after
+- `cllm.prefill_rate_multiplier`: set to `10` for this run, restored after
+- `cllm.prefill_base_overhead_ms`: set to `30` for this run, restored after
+- `cllm.prefill_jitter_percent`: set to `10` for this run, restored after
+- `cllm.prefill_max_ms`: set to `800` for this run, restored after
+
+Nodes restored: `cllm`
+
+## Groups
+
+### default
+
+**Command:** `ask --bench 120 --duration 60s --files /home/bartr/vllm/scripts/prompts.yaml --max-tokens 100`  
+**Log:** `benchmark/logs/20260502-195205-baseline-default.log`
+
+| Metric | Value |
+|--------|-------|
+| Total rows | 1680 |
+| Warmup rows excluded | 480 |
+| Cache hit rate | 49.8% |
+| Avg TTFT | 166.1 ms |
+| Avg req tok/s | 19.92 |
+| Avg total tok/s | 2650.5 |
+
+## Traffic Split (windowed admission deltas)
+
+| Node | Delta | Share |
+|------|-------|-------|
+| `cllm` | +839 | 49.9% |
+| `vllm` | +841 | 50.1% |
+| **Total** | **+1,680** | |
+
+## Caveats
+
+- Admission counts are lifetime counters; windowed deltas are used here.
+- Ghost metric series for deleted nodes may appear with zero window deltas.
+- For time-windowed conclusions, use Prometheus range queries or the Grafana dashboard.
+- Dashboard: <http://192.168.68.63:3000/d/cllm-overview/cllm-overview>

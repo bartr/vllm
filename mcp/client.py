@@ -28,6 +28,14 @@ async def put(path: str, body: dict) -> dict:
         return r.json()
 
 
+async def delete(path: str) -> dict:
+    url = settings.CLLM_BASE_URL + path
+    async with httpx.AsyncClient(timeout=settings.CLLM_REQUEST_TIMEOUT_SECONDS) as http:
+        r = await http.delete(url, headers=_HEADERS)
+        r.raise_for_status()
+        return r.json()
+
+
 async def get_text(path: str) -> str:
     url = settings.CLLM_BASE_URL + path
     async with httpx.AsyncClient(timeout=settings.CLLM_REQUEST_TIMEOUT_SECONDS) as http:

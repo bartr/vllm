@@ -12,4 +12,13 @@ CLLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("CLLM_REQUEST_TIMEOUT_SECOND
 CLLM_BENCH_WARMUP_SECONDS = int(os.environ.get("CLLM_BENCH_WARMUP_SECONDS", "15"))
 CLLM_AUDIT_LOG = os.environ.get("CLLM_AUDIT_LOG", "~/logs/cllm-audit.log")
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BENCHMARK_DIR = os.environ.get(
+    "CLLM_BENCHMARK_DIR",
+    os.path.normpath(os.path.join(_HERE, "..", "benchmark")),
+)
+BENCHMARK_SCENARIOS_DIR = os.path.join(BENCHMARK_DIR, "scenarios")
+BENCHMARK_REPORTS_DIR  = os.path.join(BENCHMARK_DIR, "reports")
+BENCHMARK_LOGS_DIR     = os.path.join(BENCHMARK_DIR, "logs")
+
 PROTECTED_NODES: frozenset[str] = frozenset({"vllm"}) if CLLM_PROTECT_REAL_NODE else frozenset()

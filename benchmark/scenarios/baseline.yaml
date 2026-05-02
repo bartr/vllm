@@ -1,0 +1,27 @@
+scenario: baseline
+description: "2-node fleet (cllm + vllm), 120 connections (60/node), prompts.yaml, max-tokens 100"
+duration: 60s
+warmup: 15s
+tags: [baseline, 2-node]
+
+# Pin cllm to ConfigMap defaults so baseline results are always comparable
+# regardless of any in-session node modifications.
+# Source: kubectl get configmap cllm-nodes -n cllm
+nodes:
+  cllm:
+    max_tokens_in_flight: 200000
+    max_waiting_requests: 32
+    per_request_tokens_per_second: 32
+    degradation_threshold: 10
+    max_concurrency: 128
+    max_degradation: 60
+    prefill_rate_multiplier: 10
+    prefill_base_overhead_ms: 30
+    prefill_jitter_percent: 10
+    prefill_max_ms: 800
+
+groups:
+  default:
+    concurrency: 120
+    prompts: scripts/prompts.yaml
+    max_tokens: 100
