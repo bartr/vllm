@@ -41,24 +41,24 @@ data:
         max_degradation: 50
         max_concurrency: 128
 
-      # vLLM lane: every per-request knob disabled so cllm adds
-      # no shaping to upstream traffic. Use as the "real vLLM" baseline.
+      # vLLM lane: cllm acts as admission controller in front of the real GPU.
+      # No per-request pacing (passthrough speed), but max_concurrency=128
+      # and max_waiting_requests=32 mirror cllm so that cllm queues and
+      # rejects before requests reach vLLM's internal scheduler. At
+      # sub-saturation load the queue is empty and cllm adds zero latency;
+      # at saturation cllm provides observable metrics, FIFO fairness, and
+      # controlled rejection — protecting vLLM from unbounded overload.
       vllm:
         class: vllm
         # bypass_cache forces `:dsl no-cache` semantics for every
         # request routed here, so this lane always hits the real GPU
         # and is never contaminated by cached replays from other lanes.
         bypass_cache: true
-        # Matched to cllm so router policy=least-loaded compares
-        # in_flight/capacity ratios on equal denominators and balances
-        # un-pinned traffic across both lanes (~50/50). With max_concurrency=0
-        # this is the ONLY admission gate for the vllm lane; 200K ≈ 128
-        # concurrent × ~1.5K tokens, matching the shared GPU's real ceiling.
         max_tokens_in_flight: 200000
-        max_waiting_requests: 100000
-        # 0 disables the per-request pacing model entirely.
+        max_waiting_requests: 32
+        max_concurrency: 128
+        # 0 disables per-request pacing — vLLM runs at real GPU speed.
         per_request_tokens_per_second: 0
-        max_concurrency: 0
 
       # KV-pressure lane: same per-request shape as cllm, plus the
       # KV admission gate. Not used in the throughput A/B; kept for KV

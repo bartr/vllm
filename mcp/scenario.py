@@ -173,7 +173,8 @@ def load(path: str) -> ScenarioSpec:
 def build_cmd(group: GroupSpec, duration: int) -> list[str]:
     prompts_path, is_file = _resolve_prompts(group.prompts)
 
-    cmd = ["ask", "--bench", str(group.concurrency), "--duration", f"{duration}s"]
+    bench_n = group.ramp_to if group.ramp_to else group.concurrency
+    cmd = ["ask", "--bench", str(bench_n), "--duration", f"{duration}s"]
 
     if is_file and prompts_path.endswith(".yaml"):
         cmd += ["--files", prompts_path]

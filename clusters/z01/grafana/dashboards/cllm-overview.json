@@ -129,7 +129,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (node) (cllm_node_waiting_requests)",
+          "expr": "max_over_time(sum by (node) (cllm_node_waiting_requests)[$__rate_interval:])",
           "legendFormat": "{{node}}",
           "range": true,
           "refId": "A"
