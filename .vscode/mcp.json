@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "cllm-ops": {
+      "command": "python3",
+      "args": ["${workspaceFolder}/mcp/server.py"],
+      "env": {
+        "CLLM_BASE_URL": "http://192.168.68.63:8088",
+        "CLLM_GRAFANA_URL": "http://192.168.68.63:3000/d/cllm-overview/cllm-overview",
+        "CLLM_BENCH_LOG": "${env:HOME}/logs/bench.log",
+        "CLLM_AUDIT_LOG": "${env:HOME}/logs/cllm-audit.log"
+      }
+    }
+  }
+}

@@ -431,6 +431,101 @@ vllm:time_to_first_token_seconds_bucket
 
 The pinned `vllm/vllm-openai:v0.19.1` image exposes Prometheus metrics at `/metrics` on the same API service port, so the current setup now scrapes request, token, cache, and HTTP server metrics from the active `vllm` workload. That adds application-level latency and throughput visibility on top of the node, GPU, and infrastructure-cost dashboards.
 
+## Run benchmark scenarios
+
+Reproducible experiments live under [benchmark/](/home/bartr/vllm/benchmark):
+
+- [benchmark/SPEC.md](/home/bartr/vllm/benchmark/SPEC.md) — scenario file format and run lifecycle
+- [benchmark/scenarios/](/home/bartr/vllm/benchmark/scenarios) — checked-in scenario YAMLs (`baseline`, `high-traffic`, `capacity-limit`, `3-node-baseline`, `3-node-high-traffic`)
+- [benchmark/reports/](/home/bartr/vllm/benchmark/reports) — one Markdown report per run, named `{timestamp}-{scenario}.md`
+- `benchmark/logs/` — raw `ask --bench` output, one file per group per run
+
+A scenario declares groups of concurrent `ask --bench` workers, optional per-node overrides applied for the run and restored after, and an optional `baseline:` reference that triggers an auto-diff in the report. Scenarios are executed by the MCP `run_scenario` tool (see below); the runner captures before/after metrics snapshots, parses the per-group logs, and writes the report.
+
+The "headline" reports (no timestamp prefix) in [benchmark/reports/](/home/bartr/vllm/benchmark/reports) are the canonical results for each scenario; timestamped files alongside them are individual run artifacts.
+
+## Operate via the MCP server
+
+[mcp/](/home/bartr/vllm/mcp) is a small, bounded MCP server that exposes the cLLM control plane, benchmark scenarios, and metrics-backed summaries to an MCP-aware client (Copilot Chat in agent mode, Claude Code, Codex). The full contract is in [mcp-spec.md](/home/bartr/vllm/mcp-spec.md).
+
+Tools exposed by [mcp/server.py](/home/bartr/vllm/mcp/server.py):
+
+- `list_nodes`, `get_node` — inspect the fleet
+- `get_config`, `get_cache_status`, `get_metrics_snapshot` — runtime config, cache state, live Prometheus data
+- `get_benchmark_status` — liveness + recent rows from the long-running `ask --bench` log
+- `create_synthetic_node`, `update_node` — add or tune synthetic lanes (the real `vllm` lane is protected and never mutated)
+- `run_benchmark_window` — bounded ad-hoc benchmark with before/after metric deltas
+- `run_scenario` — execute a YAML scenario from `benchmark/scenarios/` and write a report
+- `summarize_experiment` — structured evidence bundle for natural-language summaries
+
+### Install dependencies
+
+The server uses `mcp[cli]` (FastMCP) and `httpx`:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install 'mcp[cli]' httpx pyyaml
+```
+
+### Configure the endpoint
+
+The server reads its target from environment variables (defaults shown):
+
+```bash
+export CLLM_BASE_URL="http://192.168.68.63:8088"
+export CLLM_GRAFANA_URL="http://192.168.68.63:3000/d/cllm-overview/cllm-overview"
+export CLLM_BENCH_LOG="$HOME/logs/bench.log"
+export CLLM_AUDIT_LOG="$HOME/logs/cllm-audit.log"
+# Optional safety toggles
+export CLLM_READ_ONLY=false
+export CLLM_PROTECT_REAL_NODE=true
+```
+
+### Run it standalone (smoke test)
+
+```bash
+python3 mcp/server.py
+```
+
+FastMCP listens on stdio, so a successful start is silent — exit with `Ctrl-C`.
+
+### Use it from Copilot Chat in VS Code
+
+Copilot Chat supports MCP servers in **agent mode**. Register the cLLM server in your workspace `.vscode/mcp.json` (create it if it does not exist):
+
+```json
+{
+  "servers": {
+    "cllm-ops": {
+      "command": "python3",
+      "args": ["${workspaceFolder}/mcp/server.py"],
+      "env": {
+        "CLLM_BASE_URL": "http://192.168.68.63:8088",
+        "CLLM_GRAFANA_URL": "http://192.168.68.63:3000/d/cllm-overview/cllm-overview",
+        "CLLM_BENCH_LOG": "${env:HOME}/logs/bench.log",
+        "CLLM_AUDIT_LOG": "${env:HOME}/logs/cllm-audit.log"
+      }
+    }
+  }
+}
+```
+
+Then:
+
+1. Open the Copilot Chat view and switch the mode picker to **Agent**.
+2. Click the tools icon in the chat input and confirm the `cllm-ops` tools (`list_nodes`, `run_scenario`, …) are listed and enabled.
+3. Ask operator-style questions, for example:
+   - *"List the nodes and tell me which lane is the real GPU."*
+   - *"Run the `baseline` scenario and summarize the report."*
+   - *"Add a synthetic `rtx` node at 64 tps and 1024 max tokens in flight, then run `high-traffic`."*
+
+Copilot will call the MCP tools, show each invocation inline, and ask for confirmation before mutating tools (`create_synthetic_node`, `update_node`, `run_benchmark_window`, `run_scenario`). Set `CLLM_READ_ONLY=true` if you want to disable mutations entirely for a session.
+
+### Use it from Claude Code or Codex
+
+The same server works unchanged from any MCP host. For Claude Code, add an entry to `~/.config/claude/mcp.json` (or your platform's equivalent) with the same `command`/`args`/`env` shape shown above.
+
 ## Reset the cluster
 
 ```bash

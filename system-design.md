@@ -784,6 +784,15 @@ This is what moves cLLM from a *simulator* to a **GPU experimentation platform**
 
 In short: reproducible workloads are not just stored prompts — they are stored *cached responses* layered on top of a multi-target driver model, and the combined surface lets a single GPU host as many parallel experiments as the synthetic admission gate will admit.
 
+### 10.3 Scenario Files and the MCP Operator Surface
+
+The reproducibility loop is operationalized by two repo-managed surfaces:
+
+* **Scenario files** under [benchmark/scenarios/](/home/bartr/vllm/benchmark/scenarios) declare an experiment as data: groups of concurrent `ask --bench` workers, optional per-node overrides applied for the run and restored on completion or error, and an optional `baseline:` reference that triggers an auto-diff. Each run produces a Markdown report under [benchmark/reports/](/home/bartr/vllm/benchmark/reports) keyed by `{timestamp}-{scenario}.md`, with raw per-group logs under `benchmark/logs/`. The full schema and lifecycle live in [benchmark/SPEC.md](/home/bartr/vllm/benchmark/SPEC.md).
+* **The MCP server** under [mcp/](/home/bartr/vllm/mcp) exposes the cLLM control plane (`list_nodes`, `get_node`, `get_config`, `get_cache_status`, `get_metrics_snapshot`, `get_benchmark_status`), bounded mutation (`create_synthetic_node`, `update_node`), and bounded experimentation (`run_benchmark_window`, `run_scenario`, `summarize_experiment`) to MCP-aware clients. The real `vllm` lane is protected by default, deletion is intentionally not exposed, and every mutating tool is audit-logged with before/after node state. The full contract is in [mcp-spec.md](/home/bartr/vllm/mcp-spec.md).
+
+Together, these surfaces close the loop: a scenario YAML is the reproducible unit, `run_scenario` is the execution primitive, and the resulting report is the evidence — captured as a file in the repo, not as transient operator state.
+
 ---
 
 ## 11. Validation Against Real Systems
