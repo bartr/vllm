@@ -121,7 +121,7 @@ func NewHandler() *Handler {
 // `--max-tokens-per-second`) and degradation curve (legacy
 // `--max-degradation`) were retired in 0.14.0; they live on per-node
 // Capacity.PerRequestTPS / Degradation.MaxDegradation now (see
-// system-design.md §6.X). The implicit fallback Node continues to seed
+// docs/system-design.md §6.X). The implicit fallback Node continues to seed
 // PerRequestTPS at the historical 32 tok/s default so cached replay
 // still paces by default.
 func (h *Handler) SetRequestProcessingLimits(maxTokensInFlight, maxWaitingRequests int) {
@@ -696,7 +696,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return routedNode.ID
 	}
 
-	// Phase 4 (docs/design-memory-pressure.md §4.1bis): refine KVCost
+	// Phase 4 (docs/spec-n-memory-pressure.md §4.1bis): refine KVCost
 	// using the routed node's KV estimator, but only when the DSL did
 	// not already pin the value. The routed node's KVEstimator is nil
 	// when KV modeling is disabled on that node — in which case
@@ -2925,7 +2925,7 @@ func (s *requestScheduler) Acquire(ctx context.Context, cost node.RequestCost, p
 // reason is "" on success. On failure it is "over_capacity" (TokenBudget
 // rejected: queue full or oversize compute), "kv_pressure" (node KV
 // budget is currently full), or "kv_oversize" (kv_cost alone exceeds
-// MaxKVTokens). See docs/design-memory-pressure.md \u00a75.2.
+// MaxKVTokens). See docs/spec-n-memory-pressure.md \u00a75.2.
 func (s *requestScheduler) AcquireOnNode(ctx context.Context, cost node.RequestCost, path string, n *node.Node) (func(), time.Duration, bool, string) {
 	if n == nil {
 		release, waited, ok, reason := s.acquireOn(ctx, cost, path, s.node)
@@ -3006,7 +3006,7 @@ func (s *requestScheduler) acquireOn(ctx context.Context, cost node.RequestCost,
 	}
 
 	// KV admission gate. Layered on top of the compute gate per
-	// docs/design-memory-pressure.md \u00a75.2: if the node has KV modeling
+	// docs/spec-n-memory-pressure.md \u00a75.2: if the node has KV modeling
 	// enabled and the request's KV cost cannot be charged, release the
 	// just-acquired compute slot and reject. The released compute slot
 	// wakes the next FIFO waiter so the system stays work-conserving.

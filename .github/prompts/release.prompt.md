@@ -5,7 +5,7 @@ description: Cut a new cllm release. Walks the version-touchpoint bump, smoke ga
 
 # Release a new cllm version
 
-Canonical doc: `cllm/docs/release-process.md`. This prompt is the executable wrapper. **Do not deviate from the order of steps.**
+Canonical doc: `docs/release-process.md`. This prompt is the executable wrapper. **Do not deviate from the order of steps.**
 
 ## Inputs (ask the user up-front if missing)
 1. Target release version `X.Y.Z` (will be tagged on `main`).

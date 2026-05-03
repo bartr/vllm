@@ -247,7 +247,7 @@ Real numbers from this repo, April 18 → May 2:
 - **~1.6K lines of Python** (MCP server)
 - **~8.3K lines of K8s YAML** (Flux-managed)
 - **~6.2K lines of Markdown** — design docs, ADRs, evidence reports
-- **5 design docs** in `cllm/docs/`, co-written with Copilot
+- **5 design docs** in `docs/`, co-written with Copilot
 - **5 scenarios + 5 evidence reports** in `benchmark/`
 - **`go test -race ./...`** — green
 
@@ -278,7 +278,7 @@ All of this came together in days, not quarters:
 **Process**
 
 - **Treat every project as an HVE case study from day one.** Be disciplined on Git practices so the story is recoverable. I wasn't at first and lost storytelling evidence. AI is great at analyzing Git history and building an HVE story.
-- **`release-process.md` is gold.** Forces good hygiene. We *used* to squash-merge — it lost individual commits and erased a lot of the HVE story. **We switched to FF-merge** so the full development arc survives on `main`.
+- **`docs/release-process.md` is gold.** Forces good hygiene. We *used* to squash-merge — it lost individual commits and erased a lot of the HVE story. **We switched to FF-merge** so the full development arc survives on `main`.
 - **Update repo memory at every release.** Came from asking Copilot how to get more out of Copilot.
 - **Save your designs and plans.** I saved some; many are lost in chat history. Use a process and stay disciplined.
 
@@ -371,7 +371,7 @@ If HVE is real, **the unit of planning has to change.**
 
 **Open:** sessions are personal · big things still need arcs · ceremonies need to change · how do we roll up to quarter-level reporting?
 
-<span class="small">Full notes: `cllm/docs/sessions-not-stories.md`</span>
+<span class="small">Full notes: `docs/sessions-not-stories.md`</span>
 
 ---
 

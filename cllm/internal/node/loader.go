@@ -61,13 +61,13 @@ type NodeSpec struct {
 	// MaxKVTokens / KVWeight are the per-node KV-cache axis knobs. 0
 	// for MaxKVTokens disables the entire axis on this node and
 	// inherits from the class default; KVWeight uses class default
-	// when nil. (§4.4 of docs/design-memory-pressure.md.)
+	// when nil. (§4.4 of docs/spec-n-memory-pressure.md.)
 	MaxKVTokens int64    `yaml:"max_kv_tokens,omitempty"`
 	KVWeight    *float64 `yaml:"kv_weight,omitempty"`
 
 	// KVCompletionFactor scales the per-node KV estimator's p95
 	// completion prediction (Phase 4 of
-	// docs/design-memory-pressure.md). nil inherits from class;
+	// docs/spec-n-memory-pressure.md). nil inherits from class;
 	// 0 falls back to 1.0. Only consulted on nodes with KV modeling
 	// enabled.
 	KVCompletionFactor *float64 `yaml:"kv_completion_factor,omitempty"`
@@ -109,12 +109,12 @@ type ClassSpec struct {
 	// MaxKVTokens / KVWeight are the class-level defaults for the KV
 	// admission axis. A node with its own non-zero MaxKVTokens
 	// overrides; KVWeight defaults to 1.0 when class and node both
-	// leave it unset. (\u00a74.4 of docs/design-memory-pressure.md.)
+	// leave it unset. (\u00a74.4 of docs/spec-n-memory-pressure.md.)
 	MaxKVTokens int64   `yaml:"max_kv_tokens"`
 	KVWeight    float64 `yaml:"kv_weight"`
 	// KVCompletionFactor is the class-level default for the per-node
 	// KV estimator multiplier (Phase 4 of
-	// docs/design-memory-pressure.md). 0 falls back to 1.0 at use
+	// docs/spec-n-memory-pressure.md). 0 falls back to 1.0 at use
 	// time; only consulted on nodes with KV modeling enabled.
 	KVCompletionFactor float64 `yaml:"kv_completion_factor"`
 }

@@ -2,8 +2,8 @@
 
 Status: **draft for review**
 Owners: bartr
-Future Work item: §14, item 13 in [system-design.md](../../system-design.md)
-Companion docs: [design-cost-admission.md](design-cost-admission.md), [design-memory-pressure.md](design-memory-pressure.md), [design-multi-node.md](design-multi-node.md)
+Future Work item: §14, item 13 in [system-design.md](system-design.md)
+Companion docs: [spec-cost-admission.md](spec-cost-admission.md), [spec-n-memory-pressure.md](spec-n-memory-pressure.md), [spec-n-multi-node.md](spec-n-multi-node.md)
 
 ---
 

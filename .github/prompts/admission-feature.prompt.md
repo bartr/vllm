@@ -5,7 +5,7 @@ description: Add a new per-class admission gate to cllm (e.g., max_X_ms or per-c
 
 # Add a class-level admission gate
 
-Same shape as `max_queue_ms` (14B), `priority` (14C), `max_ttft_ms` (item 13 follow-on). Follow this exact sequence — deviating is how the regression traps in `cllm/docs/release-process.md` got created.
+Same shape as `max_queue_ms` (14B), `priority` (14C), `max_ttft_ms` (item 13 follow-on). Follow this exact sequence — deviating is how the regression traps in `docs/release-process.md` got created.
 
 ## Inputs (ask up-front)
 1. **Field name** on `ClassSpec`/`ClassConfig` (snake_case YAML, CamelCase Go).
@@ -55,8 +55,8 @@ Same shape as `max_queue_ms` (14B), `priority` (14C), `max_ttft_ms` (item 13 fol
 - `clusters/z01/grafana/dashboards/cllm-overview.json`: extend the rejection-reason regex to include the new reason. Bump dashboard version.
 
 ### 9. Docs
-- `system-design.md`: add a §6.X subsection describing the gate, default, and bypass conditions.
-- `cllm/docs/`: new `design-<feature>.md` if the gate has non-trivial semantics.
+- `docs/system-design.md`: add a §6.X subsection describing the gate, default, and bypass conditions.
+- `docs/`: new `spec-<feature>.md` if the gate has non-trivial semantics.
 - `cllm/configs/classes.yaml`: comment the new field with default + units.
 
 ### 10. Repo memory
