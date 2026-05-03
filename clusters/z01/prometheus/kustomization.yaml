@@ -11,3 +11,4 @@ resources:
   - ingress.yaml
   - vllm-servicemonitor.yaml
   - cllm-servicemonitor.yaml
+  - rules/cllm-windows.yaml

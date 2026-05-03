@@ -1,0 +1,92 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cllm-windows
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: cllm
+    app.kubernetes.io/component: recording-rules
+spec:
+  groups:
+    - name: cllm.windows
+      interval: 15s
+      rules:
+        # ── Admissions ────────────────────────────────────────────────
+        # Per-second admission rate, per node and result (admitted|rejected).
+        - record: cllm:admissions:rate1m
+          expr: rate(cllm_node_admissions_total[1m])
+
+        # Total admissions over a 5m window (counter-reset safe via increase()).
+        - record: cllm:admissions:increase5m
+          expr: increase(cllm_node_admissions_total[5m])
+
+        # Rejection ratio per node over 1m. Useful for capacity-limit scenarios.
+        - record: cllm:admissions:reject_ratio:rate1m
+          expr: |
+            sum by (node) (rate(cllm_node_admissions_total{result="rejected"}[1m]))
+            /
+            clamp_min(
+              sum by (node) (rate(cllm_node_admissions_total[1m])),
+              1
+            )
+
+        # ── Cache ────────────────────────────────────────────────────
+        # Cache hit ratio over 1m, by endpoint.
+        - record: cllm:cache_hit_ratio:rate1m
+          expr: |
+            sum by (endpoint) (rate(cllm_cache_lookups_total{result="hit"}[1m]))
+            /
+            clamp_min(
+              sum by (endpoint) (rate(cllm_cache_lookups_total[1m])),
+              1
+            )
+
+        # ── Throughput ────────────────────────────────────────────────
+        # Completion tokens per second, per node and source (cache|downstream).
+        - record: cllm:completion_tokens:rate30s
+          expr: rate(cllm_completion_tokens_total[30s])
+
+        # Aggregate completion tokens/sec across the whole fleet.
+        - record: cllm:completion_tokens:rate30s:total
+          expr: sum(rate(cllm_completion_tokens_total[30s]))
+
+        # ── Latency percentiles ───────────────────────────────────────
+        # P95 TTFT over 1m, per node.
+        - record: cllm:ttft:p95:1m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, node) (rate(cllm_time_to_first_byte_seconds_bucket[1m]))
+            )
+
+        # P99 TTFT over 1m, per node.
+        - record: cllm:ttft:p99:1m
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, node) (rate(cllm_time_to_first_byte_seconds_bucket[1m]))
+            )
+
+        # P95 queue wait over 1m, per node.
+        - record: cllm:queue_wait:p95:1m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, node) (rate(cllm_node_queue_wait_seconds_bucket[1m]))
+            )
+
+        # P95 end-to-end job duration over 1m, per node.
+        - record: cllm:job_duration:p95:1m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, node) (rate(cllm_job_duration_seconds_bucket[1m]))
+            )
+
+        # ── Concurrency snapshot ──────────────────────────────────────
+        # Saturation = tokens-in-flight / max-tokens-in-flight, per node.
+        - record: cllm:saturation:tokens
+          expr: |
+            cllm_node_tokens_in_flight
+            /
+            clamp_min(cllm_node_max_tokens_in_flight, 1)

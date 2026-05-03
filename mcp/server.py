@@ -21,6 +21,7 @@ import client
 import benchmark
 import metrics
 import audit
+import prom
 import scenario as scenario_mod
 
 # Numeric field bounds for synthetic node creation and updates.
@@ -634,6 +635,16 @@ async def run_scenario(name: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"Scenario run failed: {e}"})
 
+    # Counter-reset-safe windowed deltas via Prometheus query API.
+    # Falls back silently if Prometheus is unreachable; the report still
+    # renders using the in-process before/after subtraction.
+    try:
+        result["window_metrics"] = await prom.scenario_window_summary(
+            result["started_at"], result["completed_at"]
+        )
+    except Exception as e:
+        result["window_metrics"] = {"error": f"prometheus query failed: {e}"}
+
     # Write markdown report
     report_filename = f"{timestamp}-{spec.scenario}.md"
     report_path = os.path.join(settings.BENCHMARK_REPORTS_DIR, report_filename)
@@ -726,6 +737,56 @@ def _write_scenario_report(spec: scenario_mod.ScenarioSpec, result: dict, path: 
         d = a_adm[node] - b_adm.get(node, 0)
         lines.append(f"| `{node}` | +{d:,} | {100*d/total_delta:.1f}% |")
     lines += [f"| **Total** | **+{total_delta:,}** | |", ""]
+
+    # Prometheus-derived window metrics (counter-reset safe).
+    win = result.get("window_metrics")
+    if isinstance(win, dict) and "error" not in win:
+        adm = win.get("admissions_by_node") or {}
+        if adm:
+            lines += [
+                "## Prometheus Window Metrics",
+                "",
+                "Computed via `increase()` / `rate()` over "
+                f"`[started_at, completed_at]` (~{int(win['window']['duration_seconds'])}s). "
+                "Counter resets within the window are handled by Prometheus.",
+                "",
+                "### Admissions (window)",
+                "",
+                "| Node | Admitted | Rejected | Reject ratio |",
+                "|------|---------:|---------:|-------------:|",
+            ]
+            for node in sorted(adm):
+                a = adm[node]
+                lines.append(
+                    f"| `{node}` | {int(a.get('admitted', 0)):,} | "
+                    f"{int(a.get('rejected', 0)):,} | "
+                    f"{100*a.get('reject_ratio', 0):.2f}% |"
+                )
+            lines.append("")
+
+        ttft = win.get("ttft_p95_seconds_by_node") or {}
+        tps = win.get("tokens_per_second_by_node") or {}
+        nodes = sorted(set(ttft) | set(tps))
+        if nodes:
+            lines += [
+                "### Latency and throughput (window)",
+                "",
+                "| Node | P95 TTFT | Avg tok/s |",
+                "|------|---------:|----------:|",
+            ]
+            for node in nodes:
+                p95 = ttft.get(node)
+                ts = tps.get(node)
+                p95_s = f"{p95*1000:.0f} ms" if p95 is not None else "—"
+                ts_s = f"{ts:.1f}" if ts is not None else "—"
+                lines.append(f"| `{node}` | {p95_s} | {ts_s} |")
+            lines.append("")
+
+        hit = win.get("cache_hit_ratio")
+        if hit is not None:
+            lines += [f"**Cache hit ratio (window):** {100*hit:.1f}%", ""]
+    elif isinstance(win, dict) and "error" in win:
+        lines += [f"_Prometheus window metrics unavailable: {win['error']}_", ""]
 
     lines += [
         "## Caveats",
