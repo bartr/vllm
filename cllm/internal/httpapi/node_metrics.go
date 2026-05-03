@@ -99,9 +99,20 @@ func (c nodeFleetCollector) Collect(ch chan<- prometheus.Metric) {
 		if n == nil || n.Budget == nil {
 			continue
 		}
-		capacity, inFlight, _, _ := n.Budget.Stats()
+		capacity, inFlight, budgetWaiting, _ := n.Budget.Stats()
 		ch <- prometheus.MustNewConstMetric(nodeTokensInFlightDesc, prometheus.GaugeValue, float64(inFlight), n.ID, n.Class)
 		ch <- prometheus.MustNewConstMetric(nodeMaxTokensInFlightDesc, prometheus.GaugeValue, float64(capacity), n.ID, n.Class)
+		// cllm_node_waiting_requests is the depth of whichever admission
+		// queue is actually gating this node: the concurrency gate when
+		// enabled, otherwise the budget FIFO. Emitted unconditionally
+		// in the multi-node case so dashboards keep a single coherent
+		// series per node regardless of which gate is configured.
+		waitingForGate := budgetWaiting
+		if n.Concurrency != nil {
+			_, _, concWaiting, _ := n.Concurrency.Stats()
+			waitingForGate = concWaiting
+		}
+		ch <- prometheus.MustNewConstMetric(nodeWaitingRequestsDesc, prometheus.GaugeValue, float64(waitingForGate), n.ID, n.Class)
 		// KV-axis series are emitted only for nodes that have it
 		// enabled, so deployments mixing KV-modeled and KV-disabled
 		// nodes don't produce zero-valued KV series for the disabled
@@ -126,10 +137,9 @@ func (c nodeFleetCollector) Collect(ch chan<- prometheus.Metric) {
 		// enabled OR per-request pacing enabled, so passthrough-style
 		// nodes don't stamp zeros into series scrapers would plot.
 		if n.Concurrency != nil {
-			_, conc, concWaiting, _ := n.Concurrency.Stats()
+			_, conc, _, _ := n.Concurrency.Stats()
 			ch <- prometheus.MustNewConstMetric(nodeConcurrentRequestsDesc, prometheus.GaugeValue, float64(conc), n.ID, n.Class)
 			ch <- prometheus.MustNewConstMetric(nodeMaxConcurrencyDesc, prometheus.GaugeValue, float64(n.Capacity.MaxConcurrency), n.ID, n.Class)
-			ch <- prometheus.MustNewConstMetric(nodeWaitingRequestsDesc, prometheus.GaugeValue, float64(concWaiting), n.ID, n.Class)
 		}
 		if n.Capacity.PerRequestTPS > 0 {
 			ch <- prometheus.MustNewConstMetric(nodePerRequestTPSEffectiveDesc, prometheus.GaugeValue, n.PerRequestRate(n.ConcurrentRequests()), n.ID, n.Class)
