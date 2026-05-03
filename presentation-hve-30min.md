@@ -202,7 +202,7 @@ This is the take-home segment. Frame it as **gifts to the room**, not a retrospe
 
 > Treat every project as an HVE case study from day one. Several of my early commits went straight to `main` — the story would be cleaner if I had branched and PR'd from the start, even working alone.
 >
-> The release process I documented in `release-process.md` is gold — it forces good hygiene. **One open question for the room:** we squash-merge at release, and the side effect is that **a lot of individual commits are now invisible**. There are far more commits behind this work than the 125 you see — each release became one. We should decide squash vs fast-forward deliberately, not by default.
+> The release process I documented in `release-process.md` is gold — it forces good hygiene. **One lesson we already acted on:** we used to squash-merge at release. The side effect was that **a lot of individual commits became invisible** — each release collapsed into one. The HVE story we needed ("99 commits in the first 5 days," the day-by-day arc of admission, DSL, MCP) was being thrown away on `main`. **We switched to FF-merge** so the full history survives. Squash felt tidy; FF tells the truth.
 >
 > **Update repo memory at every release.** That practice came from asking Copilot how to get more out of Copilot — best meta-tip of the project.
 >

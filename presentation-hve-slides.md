@@ -278,7 +278,7 @@ All of this came together in days, not quarters:
 **Process**
 
 - **Treat every project as an HVE case study from day one.** Be disciplined on Git practices so the story is recoverable. I wasn't at first and lost storytelling evidence. AI is great at analyzing Git history and building an HVE story.
-- **`release-process.md` is gold.** Forces good hygiene. **Squash-merge** at release loses individual commits — we are missing real history because each release became one commit. Decide squash-vs-FF deliberately.
+- **`release-process.md` is gold.** Forces good hygiene. We *used* to squash-merge — it lost individual commits and erased a lot of the HVE story. **We switched to FF-merge** so the full development arc survives on `main`.
 - **Update repo memory at every release.** Came from asking Copilot how to get more out of Copilot.
 - **Save your designs and plans.** I saved some; many are lost in chat history. Use a process and stay disciplined.
 
@@ -351,6 +351,30 @@ Four honest caveats:
 
 ---
 
+<!-- _class: dense -->
+
+# Backup: Sessions, Not Stories
+
+If HVE is real, **the unit of planning has to change.**
+
+| Old primitive: **the story** | New primitive: **the session** |
+|---|---|
+| Sized in points | Sized in *focus minutes* |
+| Bounded by sprint calendar | Bounded by cognitive context |
+| Accepted via demo | Accepted via tests + tag + repo-memory |
+| Not replayable | **Replayable** — chat, git, memory |
+| Backlog grows | **Compounds** — each session paves the next |
+
+**Developers** — plan in release-able sessions. Every session ends green: tests, FF-merge, tag, memory update.
+**PMs** — stop estimating in points. **Frame the session** (goal, constraints, what *not* to do). Higher leverage, not lower.
+**Planning** — velocity becomes *sessions-per-week to value*. Mis-framed wastes a session, not a sprint.
+
+**Open:** sessions are personal · big things still need arcs · ceremonies need to change · how do we roll up to quarter-level reporting?
+
+<span class="small">Full notes: `cllm/docs/sessions-not-stories.md`</span>
+
+---
+
 # Backup: Likely Q&A
 
 | Question | Short answer |
@@ -361,3 +385,4 @@ Four honest caveats:
 | Does this kill engineering jobs? | No — it raises the floor. Same arc as compilers, IDEs, cloud. |
 | Replicate for real customer work? | Yes. cLLM is the proof. That is the case for org-wide adoption. |
 | Greenfield AI/ML research? | HVE accelerates the scaffolding. Novel research still needs human insight. |
+| How does this change PMs / planning? | Big topic — see backup *"Sessions, Not Stories."* Short version: estimate in sessions, not points. PMs frame; engineers ship. |

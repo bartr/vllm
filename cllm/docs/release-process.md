@@ -79,18 +79,44 @@ git checkout bartr
 git push origin bartr
 ```
 
-### 2. Squash-merge `bartr` → `main`
+### 2. Fast-forward merge `bartr` → `main`
 
-A squash merge keeps `main` history linear with one commit per release.
-The commit message is always `Version X.Y.Z` (no body — the annotated
-tag carries the release notes).
+A fast-forward merge **preserves every commit** from `bartr` on `main`.
+This is a deliberate change from the previous squash-merge policy.
 
 ```sh
 git checkout main
 git pull --ff-only
-git merge --squash bartr
-git commit -m "Version X.Y.Z"
+git merge --ff-only bartr
 ```
+
+If `--ff-only` refuses (because `main` has commits `bartr` does not),
+rebase `bartr` onto `main` first, re-run smoke, and try again. **Do
+not fall back to a non-FF merge or a squash to make the merge succeed.**
+
+The release commit on `main` is whatever the tip of `bartr` already is.
+There is no separate "Version X.Y.Z" commit — the **annotated tag**
+(step 3) carries the release notes.
+
+#### Why FF, not squash
+
+We used to squash-merge with the message `Version X.Y.Z`. It produced
+a clean linear `main` history — one commit per release — and that felt
+tidy at the time.
+
+The cost only became visible later, when telling the cLLM story:
+**every release collapsed dozens of real commits into one.** The HVE
+narrative — "99 commits in the first 5 days," the day-by-day evolution
+of admission, the DSL, the MCP server — was largely invisible on
+`main`. The history we needed for evidence had been thrown away.
+
+FF-merge keeps the full commit graph. AI tools (and humans) can
+reconstruct the actual development arc from `git log` instead of from
+fading memory and chat transcripts. The annotated tag still gives us a
+clean release-notes view; the per-commit detail is preserved
+underneath. **Storytelling and forensics both want the full history.
+Releases want a single authoritative anchor.** The tag is that anchor;
+the commits are the story.
 
 ### 3. Tag the release with annotated notes
 
@@ -194,13 +220,16 @@ git checkout -b hotfix-X.Y.(Z+1) X.Y.Z
 # … make minimal change, bump version touchpoints …
 go test ./... && ask --files scripts/smoke-test.yaml --bench 1
 git checkout main
-git merge --squash hotfix-X.Y.(Z+1)
-git commit -m "Version X.Y.(Z+1)"
+git merge --ff-only hotfix-X.Y.(Z+1)   # rebase the hotfix onto main first if needed
 git tag -a X.Y.(Z+1) -m "Version X.Y.(Z+1): <fix summary>"
 git push origin main X.Y.(Z+1)
 # Then forward-merge main back into bartr to pick up the fix:
 git checkout bartr && git merge main && git push
 ```
+
+Same FF-only rule as the main release path: if `--ff-only` refuses,
+rebase the hotfix branch onto `main` rather than falling back to a
+non-FF or squash merge.
 
 ## Why no Flux on dev
 

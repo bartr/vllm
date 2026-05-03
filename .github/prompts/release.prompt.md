@@ -1,6 +1,6 @@
 ---
 mode: agent
-description: Cut a new cllm release. Walks the version-touchpoint bump, smoke gate, squash-merge, annotated tag, push, post-release bartr reset + dev bump, redeploy, and post-deploy verification. Use when the user says "release", "cut version", "tag X.Y.Z", or "bump to X.Y.Z".
+description: Cut a new cllm release. Walks the version-touchpoint bump, smoke gate, fast-forward merge, annotated tag, push, post-release bartr reset + dev bump, redeploy, and post-deploy verification. Use when the user says "release", "cut version", "tag X.Y.Z", or "bump to X.Y.Z".
 ---
 
 # Release a new cllm version
@@ -36,9 +36,10 @@ Verify: `grep -rn 'cllm:X\.Y\.Z\|var Version' cllm clusters` returns ONLY the ne
 # 1. Push dev
 git checkout bartr && git push origin bartr
 
-# 2. Squash-merge bartr -> main (commit message MUST be "Version X.Y.Z" — no body)
+# 2. FF-merge bartr -> main (preserves full commit history; tag carries release notes)
 git checkout main && git pull --ff-only
-git merge --squash bartr && git commit -m "Version X.Y.Z"
+git merge --ff-only bartr
+# If --ff-only refuses, rebase bartr onto main and retry. Do NOT fall back to squash.
 
 # 3. Annotated tag — body is the release notes. WRITE TAG MESSAGE TO A FILE FIRST.
 #    Inline -m with multi-line in zsh leaks \u00a7 escapes; always use -F.
