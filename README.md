@@ -446,7 +446,7 @@ The "headline" reports (no timestamp prefix) in [benchmark/reports/](/home/bartr
 
 ## Operate via the MCP server
 
-[mcp/](/home/bartr/vllm/mcp) is a small, bounded MCP server that exposes the cLLM control plane, benchmark scenarios, and metrics-backed summaries to an MCP-aware client (Copilot Chat in agent mode, Claude Code, Codex). The full contract is in [mcp-spec.md](/home/bartr/vllm/mcp-spec.md).
+[mcp/](/home/bartr/vllm/mcp) is a small, bounded MCP server that exposes the cLLM control plane, benchmark scenarios, and metrics-backed summaries to an MCP-aware client (Copilot Chat in agent mode, Claude Code, Codex). The full contract is in [docs/spec-mcp.md](/home/bartr/vllm/docs/spec-mcp.md).
 
 Tools exposed by [mcp/server.py](/home/bartr/vllm/mcp/server.py):
 

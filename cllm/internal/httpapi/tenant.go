@@ -10,7 +10,7 @@ import (
 
 // Tenant resolution is purely advisory: the X-Tenant-Id header is trusted
 // the same way other clusters trust X-Forwarded-For. Real auth (JWT/OIDC)
-// is out of scope; see docs/design-cost-admission.md.
+// is out of scope; see docs/spec-cost-admission.md.
 const (
 	tenantHeader      = "X-Tenant-Id"
 	defaultTenantName = "default"

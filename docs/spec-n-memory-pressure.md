@@ -2,8 +2,8 @@
 
 Status: **Phases 1+2+3+4 shipped (cllm 0.10.x); Phase 5 owned by §14 item 9**
 Owners: bartr
-Future Work item: §14, item 1 in [system-design.md](../../system-design.md)
-Companion docs: [design-cost-admission.md](design-cost-admission.md), [design-multi-node.md](design-multi-node.md)
+Future Work item: §14, item 1 in [system-design.md](system-design.md)
+Companion docs: [spec-cost-admission.md](spec-cost-admission.md), [spec-n-multi-node.md](spec-n-multi-node.md)
 
 ---
 
@@ -78,7 +78,7 @@ defensible.
   regardless of topic. Content-dependent decode variance is §14 item 10.
 - No global KV pool. KV is per-node; a node models a vLLM instance, and KV
   cache does not migrate across instances. Same justification as per-node
-  FIFO (§3 of [design-multi-node.md](design-multi-node.md)).
+  FIFO (§3 of [spec-n-multi-node.md](spec-n-multi-node.md)).
 
 ---
 
@@ -512,7 +512,7 @@ is the close-out for item 1.
    GPUs would help" from "smaller-context workloads would help."
 4. **Per-class default `max_kv_tokens`.** Should classes carry a default
    that nodes inherit, mirroring `max_degradation`? Default proposal: yes
-   (consistent with §5 of `design-multi-node.md`).
+   (consistent with §5 of `spec-n-multi-node.md`).
 5. **Cancel-on-KV-pressure for streaming requests.** Today admitted requests
    run to completion. Should KV pressure trigger a cooperative cancel of an
    in-flight long-context request to save the fleet? Default proposal: no —

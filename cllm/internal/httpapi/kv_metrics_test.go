@@ -11,7 +11,7 @@ import (
 
 // TestCombinedLoadDrivesDegradationWhenKVEnabled is the canonical
 // "memory-bound vs compute-bound" experiment from
-// docs/design-memory-pressure.md: at the same admitted token cost, a
+// docs/spec-n-memory-pressure.md: at the same admitted token cost, a
 // long-context request degrades a KV-enabled node faster than a
 // short-context request because kv_load > cost_load.
 func TestCombinedLoadDrivesDegradationWhenKVEnabled(t *testing.T) {

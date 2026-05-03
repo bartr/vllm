@@ -59,7 +59,7 @@ ask me any questions and then let's plan a 30 minute presentation.
 
 ## Copilot Q&A
 
-The following clarifying questions were asked by GitHub Copilot before drafting the HVE presentation plan in `presentation-hve-30min.md`. Captured here so anyone else running a similar Helium-vs-HVE comparison for their own project can answer the same questions and get a comparable plan.
+The following clarifying questions were asked by GitHub Copilot before drafting the HVE presentation plan in `presentations/hve.md`. Captured here so anyone else running a similar Helium-vs-HVE comparison for their own project can answer the same questions and get a comparable plan.
 
 ### 1. Audience
 
@@ -168,7 +168,7 @@ To run the same comparison for another project:
 3. Build the **HVE project** under measurable conditions: real git history, tests, docs, evidence reports.
 4. Pull the **quantified evidence**: commits per day, Go/Python LOC, test LOC, YAML LOC, docs LOC, design-doc count, scenario-report count.
 5. Answer the 8 questions above for your audience and goals.
-6. Produce a side-by-side table on the same axes used in `presentation-hve-30min.md` and let the **ratio of people-weeks** speak first.
+6. Produce a side-by-side table on the same axes used in `presentations/hve.md` and let the **ratio of people-weeks** speak first.
 
 ## Open Questions for You
 

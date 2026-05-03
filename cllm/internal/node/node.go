@@ -50,7 +50,7 @@ type Capacity struct {
 
 	// MaxKVTokens is the per-node KV-cache occupancy ceiling, in KV
 	// tokens. 0 disables the KV admission axis entirely (§10 of
-	// docs/design-memory-pressure.md): no charge, no gate, no metrics.
+	// docs/spec-n-memory-pressure.md): no charge, no gate, no metrics.
 	MaxKVTokens int64 `json:"max_kv_tokens"`
 
 	// KVWeight scales kv_load when computing the combined load fed
@@ -60,7 +60,7 @@ type Capacity struct {
 
 	// KVCompletionFactor scales the KV estimator's p95 completion
 	// prediction when computing per-request KVCost (Phase 4 of
-	// docs/design-memory-pressure.md). A factor < 1.0 models
+	// docs/spec-n-memory-pressure.md). A factor < 1.0 models
 	// amortization (prefix cache, mid-stream KV release) on hardware
 	// where peak KV residency is below prompt+completion. 0 falls
 	// back to 1.0; values are clamped to (0, 4.0]. Only consulted
@@ -72,7 +72,7 @@ type Capacity struct {
 //
 // Phase 1: shape is a fixed piecewise-linear curve in code; only
 // MaxDegradation is operator-tunable. Future: pluggable shapes (see §14
-// item 2 in system-design.md).
+// item 2 in docs/system-design.md).
 type Degradation struct {
 	Shape          string `json:"f_load_shape"`    // "piecewise_linear" for now
 	MaxDegradation int    `json:"max_degradation"` // percent, 0-95
@@ -80,7 +80,7 @@ type Degradation struct {
 
 // Realism holds the per-node opt-in realism knobs (prefill simulation and
 // stream perturbations). Mirrors the runtime-tunable knobs documented in
-// §7.1 and §7.2 of system-design.md.
+// §7.1 and §7.2 of docs/system-design.md.
 type Realism struct {
 	PrefillRateMultiplier float64 `json:"prefill_rate_multiplier"`
 	PrefillBaseOverheadMs int     `json:"prefill_base_overhead_ms"`
@@ -120,7 +120,7 @@ type Node struct {
 	Estimator *CompletionEstimator
 
 	// KVEstimator is the per-node KV-residency p95 estimator (Phase 4
-	// of docs/design-memory-pressure.md). nil when MaxKVTokens == 0.
+	// of docs/spec-n-memory-pressure.md). nil when MaxKVTokens == 0.
 	// Observes actual completion-token counts on a separate sample
 	// stream from Estimator so KV cost can decouple from compute cost
 	// (e.g., when the operator sets KVCompletionFactor < 1 to model

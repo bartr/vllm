@@ -49,7 +49,7 @@ var (
 	)
 	nodeKVEstimatorP95Desc = prometheus.NewDesc(
 		"cllm_node_kv_estimator_p95",
-		"Per-node KV estimator p95 of recent completion tokens (Phase 4 of design-memory-pressure.md). Emitted only when the node has KV modeling enabled and the estimator has reached its warm-up sample count; otherwise the series is omitted.",
+		"Per-node KV estimator p95 of recent completion tokens (Phase 4 of docs/spec-n-memory-pressure.md). Emitted only when the node has KV modeling enabled and the estimator has reached its warm-up sample count; otherwise the series is omitted.",
 		[]string{"node", "class"}, nil,
 	)
 	nodeConcurrentRequestsDesc = prometheus.NewDesc(

@@ -1,6 +1,6 @@
 # HVE Presentation: Helium vs cLLM — 30-Minute Talk + Q&A
 
-Audience: CVP, partner FDEs, principal FDEs (same as `presentation-30min-demo.md`)
+Audience: CVP, partner FDEs, principal FDEs (same as `cllm-demo.md`)
 Scope: Standalone HVE talk. cLLM is the case study, not the subject.
 Format: 30 minutes talk + 15–20 minutes Q&A.
 
@@ -61,7 +61,7 @@ Pulled from git and `wc -l` on April 18 → May 2:
 - **~1.6K lines of Python** (MCP server).
 - **~8.3K lines of K8s YAML** (Flux-managed cluster).
 - **~6.2K lines of Markdown** — design docs, ADR-style docs, scenario reports.
-- **5 design docs** in `cllm/docs/` (cost admission, memory pressure, multi-node, phase-aware allocation, release process) — co-written with Copilot.
+- **5 design docs** in `docs/` (cost admission, memory pressure, multi-node, phase-aware allocation, release process) — co-written with Copilot.
 - **5 scenarios + 5 evidence reports** in `benchmark/`.
 
 This is the slide that ends the "but is it real?" conversation.
@@ -170,7 +170,7 @@ This is a critical narrative beat. **I did not set out to build "Helium 2."** I 
 
 ### 16:00 – 24:00 — Live Demo
 
-Reuse the existing MCP-driven cLLM demo from `presentation-30min-demo.md`. The framing is different here: we are not selling cLLM, we are showing what HVE produces.
+Reuse the existing MCP-driven cLLM demo from `cllm-demo.md`. The framing is different here: we are not selling cLLM, we are showing what HVE produces.
 
 **Honesty note for this segment:** the **cLLM service, benchmark client, structured logs, Prometheus metrics, Grafana dashboards, and GitOps** were all in the 4-day MVP. The **MCP control plane** is *not* part of the 4-day count — it was added later, in roughly **another half-day to a day** of HVE work on top. Call this out on stage so no one feels misled when they ask later.
 
@@ -188,7 +188,7 @@ Anchor steps 1–3 with: *"the cLLM side of this shipped in the 4-day MVP."* Whe
 This is the "prove the 4 days" slide. Show the numbers from the **Quantified Evidence** section. Add screenshots of:
 
 - `git log --oneline` first week (99 commits in 5 days).
-- `cllm/docs/` directory listing — 5 design docs, none hand-waved.
+- `docs/` directory listing — 5 design docs, none hand-waved.
 - `benchmark/reports/` — 5 evidence-backed scenario reports.
 - `go test -race ./...` green.
 
@@ -202,7 +202,7 @@ This is the take-home segment. Frame it as **gifts to the room**, not a retrospe
 
 > Treat every project as an HVE case study from day one. Several of my early commits went straight to `main` — the story would be cleaner if I had branched and PR'd from the start, even working alone.
 >
-> The release process I documented in `release-process.md` is gold — it forces good hygiene. **One lesson we already acted on:** we used to squash-merge at release. The side effect was that **a lot of individual commits became invisible** — each release collapsed into one. The HVE story we needed ("99 commits in the first 5 days," the day-by-day arc of admission, DSL, MCP) was being thrown away on `main`. **We switched to FF-merge** so the full history survives. Squash felt tidy; FF tells the truth.
+> The release process I documented in `docs/release-process.md` is gold — it forces good hygiene. **One lesson we already acted on:** we used to squash-merge at release. The side effect was that **a lot of individual commits became invisible** — each release collapsed into one. The HVE story we needed ("99 commits in the first 5 days," the day-by-day arc of admission, DSL, MCP) was being thrown away on `main`. **We switched to FF-merge** so the full history survives. Squash felt tidy; FF tells the truth.
 >
 > **Update repo memory at every release.** That practice came from asking Copilot how to get more out of Copilot — best meta-tip of the project.
 >

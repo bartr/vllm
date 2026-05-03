@@ -34,7 +34,7 @@ Verify: `grep -rn 'cllm:X\.Y\.Z\|var Version' cllm clusters` returns only the ne
 - Use `multi_replace_string_in_file` for >1 edit in a single response.
 - Don't add docstrings, comments, or type changes to lines you didn't otherwise modify.
 - Don't refactor unrelated code under the cover of a feature change.
-- Combine code edits with their corresponding doc edit (`system-design.md`, `cllm/docs/*.md`) in one turn.
+- Combine code edits with their corresponding doc edit (`docs/system-design.md`, `docs/spec-*.md`) in one turn.
 
 ## Prefer-grep rule
 For symbol lookups in this codebase, prefer `grep_search`/`file_search` over `semantic_search`. Reserve `semantic_search` for unknown territory.

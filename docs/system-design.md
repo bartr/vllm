@@ -421,7 +421,7 @@ Each node may declare an optional `max_kv_tokens` capacity (and an
 optional `kv_weight` between 0 and 1). When set, the node carries a
 second budget — `Node.KV` — alongside the existing compute `TokenBudget`.
 Each request computes a `kv_cost` (currently mirroring `total_cost` per
-v1 of [design-memory-pressure.md](cllm/docs/design-memory-pressure.md)).
+v1 of [spec-n-memory-pressure.md](spec-n-memory-pressure.md)).
 Admission is then a *layered* gate:
 
 1. The compute `TokenBudget.Acquire` succeeds (FIFO ordering preserved).
@@ -789,7 +789,7 @@ In short: reproducible workloads are not just stored prompts — they are stored
 The reproducibility loop is operationalized by two repo-managed surfaces:
 
 * **Scenario files** under [benchmark/scenarios/](/home/bartr/vllm/benchmark/scenarios) declare an experiment as data: groups of concurrent `ask --bench` workers, optional per-node overrides applied for the run and restored on completion or error, and an optional `baseline:` reference that triggers an auto-diff. Each run produces a Markdown report under [benchmark/reports/](/home/bartr/vllm/benchmark/reports) keyed by `{timestamp}-{scenario}.md`, with raw per-group logs under `benchmark/logs/`. The full schema and lifecycle live in [benchmark/SPEC.md](/home/bartr/vllm/benchmark/SPEC.md).
-* **The MCP server** under [mcp/](/home/bartr/vllm/mcp) exposes the cLLM control plane (`list_nodes`, `get_node`, `get_config`, `get_cache_status`, `get_metrics_snapshot`, `get_benchmark_status`), bounded mutation (`create_synthetic_node`, `update_node`), and bounded experimentation (`run_benchmark_window`, `run_scenario`, `summarize_experiment`) to MCP-aware clients. The real `vllm` lane is protected by default, deletion is intentionally not exposed, and every mutating tool is audit-logged with before/after node state. The full contract is in [mcp-spec.md](/home/bartr/vllm/mcp-spec.md).
+* **The MCP server** under [mcp/](/home/bartr/vllm/mcp) exposes the cLLM control plane (`list_nodes`, `get_node`, `get_config`, `get_cache_status`, `get_metrics_snapshot`, `get_benchmark_status`), bounded mutation (`create_synthetic_node`, `update_node`), and bounded experimentation (`run_benchmark_window`, `run_scenario`, `summarize_experiment`) to MCP-aware clients. The real `vllm` lane is protected by default, deletion is intentionally not exposed, and every mutating tool is audit-logged with before/after node state. The full contract is in [spec-mcp.md](spec-mcp.md).
 
 Together, these surfaces close the loop: a scenario YAML is the reproducible unit, `run_scenario` is the execution primitive, and the resulting report is the evidence — captured as a file in the repo, not as transient operator state.
 

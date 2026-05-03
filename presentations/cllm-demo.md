@@ -1,6 +1,6 @@
 # cLLM Presentation Track: 30-Minute Demo + 20-Minute Q&A
 
-Audience: CVP, partner FDEs, principal FDEs  
+Audience: CVP, partner FDEs, principal FDEs
 Goal: Show cLLM as a field-driven LLM inference experimentation platform, not as a toy benchmark or dashboard project.
 
 ## Core Message
@@ -55,7 +55,7 @@ Emphasize:
 
 ## Architecture: 6:00-11:00
 
-Show: `system-design.md`, `/nodes`, and Grafana dashboard.
+Show: `docs/system-design.md`, `/nodes`, and Grafana dashboard.
 
 Talk track:
 
