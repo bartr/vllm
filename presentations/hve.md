@@ -77,8 +77,8 @@ This is the slide that ends the "but is it real?" conversation.
 | 13:00 – 16:00 | **How this actually happened** | Organic origin story — vLLM → ask → bench → cLLM → DSL → MCP |
 | 16:00 – 24:00 | Live demo | MCP-driven cLLM benchmark, end-to-end |
 | 24:00 – 26:00 | Evidence + the stack | Numbers + breadth of what shipped |
-| 26:00 – 28:00 | **Lessons learned / IP to harvest** | Process, tooling, Copilot, mindset — take-home value |
-| 28:00 – 29:00 | Caveats (briefly, on purpose) | Honest about seniority, reuse, repeat domain |
+| 26:00 – 28:30 | **Lessons learned / IP to harvest** | Process · Tooling · Copilot & Mindset — three slides |
+| 28:30 – 29:00 | Caveats (briefly, on purpose) | Honest about seniority, reuse, repeat domain |
 | 29:00 – 30:00 | Call to action | HVE is the new floor. Adopt the practice. |
 | 30:00 – 50:00 | Q&A | Productization, fidelity, where HVE breaks |
 
@@ -194,11 +194,11 @@ This is the "prove the 4 days" slide. Show the numbers from the **Quantified Evi
 
 > Not a prototype. Not a sketch. Tests pass. Designs are written down. Reports back the claims.
 
-### 26:00 – 28:00 — Lessons Learned / IP to Harvest
+### 26:00 – 28:30 — Lessons Learned / IP to Harvest
 
-This is the take-home segment. Frame it as **gifts to the room**, not a retrospective. Move quickly — one sentence per bullet. Tell them they will get the slide.
+This is the take-home segment. Frame it as **gifts to the room**, not a retrospective. The deck splits this into **three slides** — Process, Tooling, Copilot & Mindset. Move quickly — one sentence per bullet. Tell them they will get the slides.
 
-**Process**
+**Process** *(slide 1)*
 
 > Treat every project as an HVE case study from day one. Several of my early commits went straight to `main` — the story would be cleaner if I had branched and PR'd from the start, even working alone.
 >
@@ -208,29 +208,33 @@ This is the take-home segment. Frame it as **gifts to the room**, not a retrospe
 >
 > **Save your designs and plans.** I saved some; many are lost in chat history. Be disciplined.
 
-**Tooling**
+**Tooling** *(slide 2)*
 
 > The `ask` CLI is highly reusable — pull it out as standalone IP for any LLM-fronted project.
 >
 > Use the **Grafana API**, not ConfigMap dashboards — ConfigMap dashboards cannot be edited and saved live. The API can also auto-add dashboards to favorites.
 >
 > Use **Tombstone** to clear test metrics and keep dashboards tidy.
+>
+> **Marp VS Code extension** — these slides are authored as Markdown with live preview in the editor and exported to PDF/HTML/PPTX. Slides become diff-able artifacts that live next to the code they describe; the deck *is* in the repo, reviewed like code.
+>
+> **`make deploy` and `make install` pull K8s into the inner loop.** One command goes code → image → k3s import → rollout restart; another installs the `ask` CLI to `$GOBIN`. The cluster stops being a deployment target you visit at the end and becomes part of the edit-build-test cycle — which is what makes 3-layer observability usable while you are still writing the code.
 
-**Working with Copilot**
+**Copilot & Mindset** *(slide 3)*
 
 > Copilot had one major hallucination on this project — lost the plot of what we were building. **The tests and dashboards caught it early.** That is the safety net. If you do not have tests and dashboards, you do not have a safety net.
 >
 > Ask Copilot for suggestions on getting more value from Copilot. Compounding insight.
-
-**Mindset**
-
+>
 > Don't be afraid to try things — **cut a release first** so `git revert` is one command away.
 >
 > Have fun. The speed is genuinely amazing. Let it be.
 >
 > **PMs get as much value from HVE as engineers — possibly more.** Bring them in. Deanna would have *loved* this.
+>
+> **Go greenfield every 6 months.** One net-new project per half keeps instincts sharp, the stack current, and your HVE multiplier honest — budget ~10–12 sessions. cLLM was my first greenfield in six months and the rust showed; staying current is a discipline, not an accident.
 
-### 28:00 – 29:00 — Caveats (brief, on purpose)
+### 28:30 – 29:00 — Caveats (brief, on purpose)
 
 Four sentences, then move on. The room will respect that you said it; they will not respect a 5-minute disclaimer. **Be specific about seniority — honesty is the credibility lever.**
 
@@ -274,24 +278,31 @@ Anticipate and pre-answer:
 | What did Copilot get wrong? | Pull a real example or two from your commit history during prep — credibility booster. |
 | Will this work for greenfield AI/ML research? | HVE accelerates engineering scaffolding around research. The novel research itself still needs human insight. |
 
-## Slide List (15 slides)
+## Slide List
 
 1. Title: "Helium vs cLLM — Evidence for HVE"
 2. The bet: 26 weeks vs 4 days
-3. Helium baseline (honor the team, NGSA, Walmart, Triplet Strategy)
-4. The comparison table (axis)
-5. The feature checklist (same engineering bar, different domain)
-6. The 130× number — evolution, not superset
-7. What actually changed (4 forces: Copilot+HVE, reuse, experience, repeat domain)
-8. The strongest evidence (GPUs, vLLM, cost model — net-new)
-9. **How this actually happened** (organic origin story: vLLM → ask → bench → cLLM → DSL → MCP)
-10. Live demo — MCP-driven cLLM
-11. Evidence it is real (git, LOC, tests, docs, reports)
-12. What that buys you — the stack
-13. **Lessons learned — IP to harvest** (process, tooling, Copilot, mindset)
-14. Caveats — owned, not hidden
-15. Why it matters / call to action — HVE is the new floor
-16. Q&A
+3. The bet (narrative)
+4. Helium baseline (honor the team, NGSA, Walmart, Triplet Strategy)
+5. The comparison table (axis)
+6. The feature checklist (same engineering bar, different domain)
+7. The 130× number — evolution, not superset
+8. What actually changed (4 forces: Copilot+HVE, reuse, experience, repeat domain)
+9. The strongest evidence (GPUs, vLLM, cost model — net-new)
+10. **How this actually happened (1/2)** — vLLM → ask → bench → Go rewrite
+11. **How this actually happened (2/2)** — cLLM → DSL → MCP
+12. Live demo — MCP-driven cLLM
+13. Evidence it is real (git, LOC, tests, docs, reports)
+14. What that buys you — the stack
+15. **Lessons Learned — Process**
+16. **Lessons Learned — Tooling** *(includes Marp + `make deploy` / `make install`)*
+17. **Lessons Learned — Copilot & Mindset**
+18. Caveats — owned, not hidden
+19. Why it matters
+20. HVE is the new floor / call to action
+21. Q&A
+22. Backup: Sessions, Not Stories
+23. Backup: Likely Q&A
 
 ## Pre-Talk Checklist
 
