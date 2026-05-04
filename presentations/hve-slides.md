@@ -302,6 +302,7 @@ All of this came together in days, not quarters:
 - **Don't be afraid to try things — cut a release first** so `git revert` is one command away.
 - **Have fun.** The speed is genuinely amazing. Let it be.
 - **PMs get as much value from HVE as engineers — maybe more.** Bring them in.
+- **Go greenfield every 6 months.** One net-new project per half keeps instincts sharp, stack current, and your HVE multiplier honest — budget ~10–12 sessions. cLLM was my first greenfield in six months and the rust showed; staying current is a discipline, not an accident.
 
 ---
 
