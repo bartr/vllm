@@ -84,9 +84,9 @@ May 2026
 
 # The Bet
 
-> Five years ago, **four of us** spent **26 weeks** shipping the first good release of Helium.
+> Five years ago, **four of us** spent **26 weeks** shipping the Helium MVP.
 >
-> Three weeks ago, **alone**, with **Copilot and an HVE workflow**, I shipped a comparable MVP in **four days** — same engineering bar, different domain.
+> Three weeks ago, with **Copilot and an HVE workflow**, I shipped a comparable MVP in **four days** — same engineering bar, different domain.
 
 Today's talk is not "AI built it for me."
 
@@ -98,12 +98,12 @@ It is: **what one experienced FDE can now ship in a week.**
 
 The core team that shipped Helium:
 
-- **Bart** — Partner FDE today (Principal at the time)
+- **Bart** — Partner FDE (Principal at the time)
 - **Joseph** — Principal FDE
 - **Anne** — Principal FDE (Senior at the time)
 - **Deanna** — Principal PM
 
-What we delivered: **6 mo MVP · 7 mo release**
+What we delivered: **6 mo MVP**
 
 What we were: **all new to Kubernetes, Prometheus, Grafana, GitOps**
 
@@ -128,7 +128,7 @@ What we were: **all new to Kubernetes, Prometheus, Grafana, GitOps**
 
 # Same Engineering Bar. Different Domain.
 
-cLLM is **an evolution of Helium**, not a competitor to it.
+cLLM is **an evolution of Helium**.
 The service is different — so the logs, metrics, and dashboards are different.
 The **engineering fundamentals** are the same.
 
@@ -166,7 +166,7 @@ Four forces, in order of magnitude:
 
 1. **GitHub Copilot + HVE workflow** — the largest single multiplier. Codifies best practices, error handling, and contracts into the loop. ADRs alongside code. Design conversations become working prototypes in one session.
 
-2. **Reuse — it's in my DNA.** I started from the **K8s-on-the-edge + GitOps** stack I have spent the **last year building for Domino's**. Cluster manifests, Flux layout, Prometheus + Grafana wiring — all reused. *That* is why the first 5 days produced 99 commits.
+2. **Reuse — it's in my DNA.** I started from the **K8s-on-the-edge + GitOps** stack I have spent the **last year building with Domino's**. Cluster manifests, Flux layout, Prometheus + Grafana wiring — all reused. *That* is why the first 5 days produced 99 commits.
 
 3. **Five years of compounding experience** — K8s, Prometheus, Grafana, GitOps are now muscle memory. That is what lets Copilot move at full speed without producing slop.
 
