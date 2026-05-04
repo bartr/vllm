@@ -273,20 +273,22 @@ All of this came together in days, not quarters:
 
 ---
 
-# Lessons Learned — Process & Tooling
-
-**Process**
+# Lessons Learned — Process
 
 - **Treat every project as an HVE case study from day one.** Be disciplined on Git practices so the story is recoverable. I wasn't at first and lost storytelling evidence. AI is great at analyzing Git history and building an HVE story.
 - **`docs/release-process.md` is gold.** Forces good hygiene. We *used* to squash-merge — it lost individual commits and erased a lot of the HVE story. **We switched to FF-merge** so the full development arc survives on `main`.
 - **Update repo memory at every release.** Came from asking Copilot how to get more out of Copilot.
 - **Save your designs and plans.** I saved some; many are lost in chat history. Use a process and stay disciplined.
 
-**Tooling**
+---
+
+# Lessons Learned — Tooling
 
 - **`ask` is highly reusable.** Pull it out as standalone IP for any LLM-fronted project.
 - **Use the Grafana API, not ConfigMap dashboards.** ConfigMaps cannot be edited and saved. Bonus: the API can auto-add to favorites.
 - **Use Tombstone** to clear test metrics and keep dashboards tidy.
+- **Marp VS Code extension** — author slides as Markdown, live preview in the editor, export to PDF/HTML/PPTX. Slides become diff-able artifacts that live next to the code they describe.
+- **`make deploy` / `make install` pull K8s into the inner loop.** One command goes code → image → k3s import → rollout restart; another installs the `ask` CLI to `$GOBIN`. The cluster stops being a deployment target you visit at the end and becomes part of the edit-build-test cycle — which is what makes 3-layer observability usable while you are still writing the code.
 
 ---
 
