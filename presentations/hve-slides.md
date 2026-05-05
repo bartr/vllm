@@ -119,6 +119,7 @@ What we were: **all new to Kubernetes, Prometheus, Grafana, GitOps**
 | Time to MVP | **26 weeks** | **4 days** |
 | Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
 | **People-weeks** | **~104** | **~0.8** |
+| **Same team rebuild today, no HVE, no reuse** | **~13 weeks (~52 person-weeks)** — team's own estimate | — |
 | Stack experience at start | New to K8s, Prom, Grafana, GitOps | 8 yrs each, top-tier K8s FDE |
 | Domain experience | First time | Nth Helium-shaped project |
 | Net-new domain for me | — | GPUs on K8s, vLLM |
@@ -155,6 +156,32 @@ The **engineering fundamentals** are the same.
 ### cLLM is an **evolution** of Helium — a different service, with the same fundamentals shipped in days
 
 <span class="small">104 FDE-weeks → 0.8 FDE-weeks</span>
+
+---
+
+<!-- _class: dense -->
+
+# "Isn't 130× Too Aggressive?" — The Honest Bracket
+
+Fair pushback. So I asked the **Helium team** directly:
+
+> *"Imagine you waited 6 months after Helium MVP shipped, then the same 4 of you rebuilt Helium from scratch — no reuse of the original code, no notes, no HVE, no Copilot. Just the experience of having done it once. How long?"*
+
+Their estimate: **~3 months. Roughly half the original time.**
+
+| Scenario | Person-weeks | Ratio vs cLLM |
+|---|---:|---:|
+| Original Helium (2018, no prior experience) | **~104** | **~130×** |
+| Same team rebuilds today, no HVE, no reuse | **~52** | **~65×** |
+| cLLM — 1 FDE, 4 days, with HVE | **~0.8** | — |
+
+**Two factors, named separately:**
+
+- **Experience alone** → **~2×** (104 → 52 person-weeks)
+- **HVE on top of experience** → **~65×** (52 → 0.8 person-weeks)
+- **Combined** → **~130×** — the honest end-to-end ratio
+
+> The 130× is not "all HVE." It is **experience × HVE**, and we are naming both. Even the experience-adjusted read still puts HVE at **~65×**. That number does not go away.
 
 ---
 
@@ -318,6 +345,28 @@ Four honest caveats:
 4. **This is one project, not a fleet.** More data points coming as more FDEs adopt HVE.
 
 > None of those caveats remove the 130× number. **They explain it.**
+> And the **~65× HVE-only** number — bracketed by the Helium team's own rebuild estimate — does not depend on any of them.
+
+---
+
+<!-- _class: dense -->
+
+# Next Experiment — More Evidence, Different Engineer
+
+**One project is not a fleet.** The next data point is already framed.
+
+- **Engineer:** TBD FDE — fluent in **Copilot and Claude Code**, *not* in the Helium stack
+- **Target:** Helium MVP bar — **service · structured logs · Prometheus · Grafana dashboard · load-test client**
+- **Method:** the **sessions methodology** from `context-first/core` — every session ends green: tests, FF-merge, tag, repo memory updated
+- **Logged in the open** as a context-first experiment in `experiments/`
+
+**What this controls for that cLLM didn't:**
+
+- Different engineer — not me, not 8 years of K8s muscle memory
+- Different starting expertise — fluent in AI tooling, *new* to the Helium stack
+- Same engineering bar, same target artifact — directly comparable
+
+> If HVE is real, the multiplier should hold. If it doesn't, we will name where it broke. **Either way, more evidence.**
 
 ---
 
@@ -374,7 +423,30 @@ If HVE is real, **the unit of planning has to change.**
 
 **Open:** sessions are personal · big things still need arcs · ceremonies need to change · how do we roll up to quarter-level reporting?
 
-<span class="small">Full notes: `docs/sessions-not-stories.md`</span>
+<span class="small">Full notes: `docs/sessions-not-stories.md` · public repo: `context-first/core`</span>
+
+---
+
+<!-- _class: dense -->
+
+# Backup: Context-first vs HVE Core
+
+**Two layers. Complementary, not competing.** They sit at different altitudes and answer different questions.
+
+| | **HVE Core** *(microsoft/hve-core)* | **context-first/core** |
+|---|---|---|
+| **Layer** | IDE / Copilot tooling | Planning / methodology |
+| **Question it answers** | *How do I get high-quality output from Copilot on one task?* | *What is the unit of work, and how do ceremonies wrap it?* |
+| **Primitive** | Agents, instructions, prompts, skills | The **session** (replaces the story) |
+| **Signature pattern** | **RPI** — Research → Plan → Implement → Review, `/clear` between phases | **Frame · Build · Ship · Close** — 60–120 min, ends with green tests + FF-merge + tag + memory |
+| **Form factor** | VS Code Marketplace extension (49 agents · 102 instructions · 63 prompts · 11 skills) | Markdown methodology + experiment logs |
+| **Audience** | Engineer at the keyboard | Engineer **and** PM, manager, planner |
+
+**The fit:** RPI runs *inside* a session. HVE makes the inner loop fast; context-first makes the outer loop (standups, planning, retros, reporting) catch up so the speed isn't lost to ceremony.
+
+**Why both:** the feedback from teams adopting HVE is consistent — *"the agile process gets in the way."* HVE alone exposes the mismatch. Context-first is the process catching up to the tools.
+
+<span class="small">`microsoft.github.io/hve-core` · `github.com/context-first/core`</span>
 
 ---
 
@@ -382,6 +454,8 @@ If HVE is real, **the unit of planning has to change.**
 
 | Question | Short answer |
 |---|---|
+| Isn't 130× too aggressive? | Asked the Helium team: *"6 mo cooling off, no reuse, no HVE \u2014 how long?"* Estimate **~3 mo / ~52 person-weeks**. So **experience alone ~2×; HVE on top ~65×; combined ~130×.** All three numbers are in the deck. |
+| Sample size of one? | Next experiment is framed: a different FDE \u2014 fluent in Copilot/Claude Code, *not* the Helium stack \u2014 rebuilds the Helium MVP using the sessions methodology. Logged in the open. |
 | Would a junior engineer hit 130×? | No — probably 3–10×. The multiplier scales with judgment. |
 | Is the 4-day code production-grade? | Test-passing, race-clean, GitOps-deployed. Same level as Helium at week 26. |
 | Hallucinations / wrong code? | Caught by tests, by review-as-you-go, and by writing the design doc *with* Copilot **before** the code. |
@@ -389,3 +463,4 @@ If HVE is real, **the unit of planning has to change.**
 | Replicate for real customer work? | Yes. cLLM is the proof. That is the case for org-wide adoption. |
 | Greenfield AI/ML research? | HVE accelerates the scaffolding. Novel research still needs human insight. |
 | How does this change PMs / planning? | Big topic — see backup *"Sessions, Not Stories."* Short version: estimate in sessions, not points. PMs frame; engineers ship. |
+| How does context-first relate to HVE Core? | Different layers. HVE Core = Copilot tooling (RPI, agents, prompts). Context-first = planning primitive (sessions replace stories). RPI runs *inside* a session. See backup. |
