@@ -27,7 +27,9 @@ This talk is not "AI built it for me." It is: an experienced FDE, equipped with 
 | Time to MVP | **26 weeks** (6 months) | **4 days** of focused work |
 | Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
 | People-weeks | **~104** | **~0.8** |
-| Reduction | — | **~130×** less effort |
+| Counterfactual rebuild (same team, no HVE, 6 mo later, no reuse) | **~13 weeks** (~52 person-weeks) — Helium team's own estimate | — |
+| Reduction vs original Helium | — | **~130×** less effort |
+| Reduction vs *experienced* rebuild (HVE-attributable) | — | **~65×** less effort |
 | Stack experience at start | New to K8s, Prometheus, Grafana, GitOps | 8 yrs each, top-tier K8s FDE |
 | Domain experience | First time building this kind of service | Nth Helium-shaped project |
 | Net-new for me | — | GPUs on K8s, vLLM (had never heard of it) |
@@ -72,14 +74,14 @@ This is the slide that ends the "but is it real?" conversation.
 |---:|---|---|
 | 0:00 – 2:00 | Opening: the bet | Frame HVE as the question, Helium vs cLLM as the answer |
 | 2:00 – 5:00 | Helium baseline | Honor the team and the work; set the 26-week / 4-person bar |
-| 5:00 – 9:00 | The comparison slide | Side-by-side table, then the 130× reduction reveal |
+| 5:00 – 9:00 | The comparison slide | Side-by-side table, the 130× reveal, and the experience-adjusted ~65× bracket |
 | 9:00 – 13:00 | What changed | Four forces: Copilot+HVE, reuse, experience, repeat domain |
 | 13:00 – 16:00 | **How this actually happened** | Organic origin story — vLLM → ask → bench → cLLM → DSL → MCP |
 | 16:00 – 24:00 | Live demo | MCP-driven cLLM benchmark, end-to-end |
 | 24:00 – 26:00 | Evidence + the stack | Numbers + breadth of what shipped |
 | 26:00 – 28:30 | **Lessons learned / IP to harvest** | Process · Tooling · Copilot & Mindset — three slides |
 | 28:30 – 29:00 | Caveats (briefly, on purpose) | Honest about seniority, reuse, repeat domain |
-| 29:00 – 30:00 | Call to action | HVE is the new floor. Adopt the practice. |
+| 29:00 – 30:00 | **Next experiment + Call to action** | New FDE rebuilds Helium with sessions methodology · HVE is the new floor |
 | 30:00 – 50:00 | Q&A | Productization, fidelity, where HVE breaks |
 
 ## Segment-by-Segment Talk Track
@@ -126,6 +128,23 @@ Then deliver the reveal:
 > And to be fair: Helium earned its depth over years — NGSA, Walmart production, the SRE tooling, the Triplet Strategy. cLLM is three weeks old. We are not claiming cLLM has surpassed Helium. We are claiming **the engineering scaffolding now takes days, not months.**
 
 Pause. This is the photograph slide.
+
+**Pre-empt the "130× is too aggressive" pushback — own it on stage.** This is the next slide.
+
+> I have heard the pushback that 130× is too aggressive — that some of the gap is just experience, not HVE. That is a fair critique, and I went and asked the Helium team directly.
+>
+> The question I asked them: *"Imagine you waited 6 months after Helium MVP shipped, then the same 4 of you rebuilt Helium from scratch — no reuse of the original code, no notes, no Copilot, no HVE. Just the experience of having done it once. How long?"*
+>
+> Their estimate: **about 3 months. Roughly half the original time.**
+>
+> So now the math has three numbers, not two:
+>
+> - **Original Helium:** ~104 person-weeks.
+> - **Experienced rebuild, no HVE:** ~52 person-weeks. **2× from experience alone.**
+> - **cLLM with HVE:** ~0.8 person-weeks. **65× from HVE on top of experience.**
+> - **Combined: ~130×** — and that is the honest end-to-end ratio.
+>
+> The 130× is not "all HVE." It is **experience × HVE.** I am naming both factors instead of letting the room argue about which one to attribute the gap to. **Even the most conservative read — experience-adjusted — still puts HVE at ~65×.** That is the number that does not go away.
 
 ### 9:00 – 13:00 — What Actually Changed
 
@@ -240,9 +259,21 @@ Four sentences, then move on. The room will respect that you said it; they will 
 
 > Four honest caveats. One: I am one of the most senior ICs in this org — in a team of about 1,100 FDEs, there are 4 Partner-level ICs and 2 Distinguished Engineers, and I am one of those 6 — HVE rewards experience and I have a lot of it. Two: I have built Helium-shaped projects before — repeat domain helps. Three: I reused a year of K8s-on-the-edge and GitOps work from my Domino's project as the starting stack — reuse is in my DNA, and it should be in yours. Four: this is one project, not a fleet — we will get more data points as more FDEs adopt HVE.
 >
-> None of those caveats remove the 130× number. They explain it.
+> None of those caveats remove the 130× number. They explain it. And the **~65× HVE-only number** — bracketed by the Helium team's own rebuild estimate — does not depend on any of them.
 
-### 29:00 – 30:00 — Call to Action
+### 29:00 – 30:00 — Next Experiment + Call to Action
+
+Land the next data point *before* the CTA. It pre-empts the "sample size of one" pushback.
+
+> One project is not a fleet, so the next experiment is already framed: an FDE who is **fluent in Copilot and Claude Code but does not know the Helium stack** will rebuild the Helium MVP using the **sessions methodology** from `context-first/core` — same engineering bar: a service, structured logs, Prometheus, a Grafana dashboard, and a load-test client. **Different engineer, different starting expertise, same target.** That run will be logged in the open as a context-first experiment. If HVE is real, the multiplier should hold without my eight years of K8s muscle memory in the loop. If it does not, we will name where it broke. **Either way, more evidence.**
+
+Then close with the CTA:
+
+> HVE is no longer the future. It is the new floor for what one experienced FDE can ship in a week. We are adopting it as standard practice in this org because the evidence is now overwhelming — and this is one more data point.
+>
+> If you are an FDE and you are not yet running an HVE workflow daily, you are leaving an order of magnitude on the table. That is the message.
+
+Close.
 
 > HVE is no longer the future. It is the new floor for what one experienced FDE can ship in a week. We are adopting it as standard practice in this org because the evidence is now overwhelming — and this is one more data point.
 >
@@ -270,6 +301,8 @@ Anticipate and pre-answer:
 
 | Likely question | Short answer |
 |---|---|
+| Isn't 130× too aggressive? | Asked the Helium team directly: "if you waited 6 months and rebuilt from scratch, no reuse, no HVE — how long?" Estimate: ~3 months / ~52 person-weeks. So **experience alone is ~2×; HVE on top is ~65×; combined is ~130×.** All three numbers are in the deck. |
+| What stops this from being a sample size of one? | Next experiment is already framed: a different FDE — fluent in Copilot/Claude Code, *not* in the Helium stack — rebuilds the Helium MVP using the sessions methodology from `context-first/core`. Logged in the open. |
 | Would a junior engineer hit 130×? | No. They would still gain meaningfully — probably 3–10×. The multiplier scales with judgment. |
 | Is the 4-day code production-grade? | Test-passing, race-clean, GitOps-deployed, evidence-reported. Not yet hardened for multi-tenant prod, but neither was Helium at week 26. |
 | What about hallucinations / wrong code? | Caught by tests, by review-as-you-go, and by the HVE habit of writing the design doc with Copilot before the code. |
@@ -277,6 +310,7 @@ Anticipate and pre-answer:
 | Can we replicate this for *real* customer work? | Yes — this is the case for adopting HVE org-wide. cLLM is the proof. |
 | What did Copilot get wrong? | Pull a real example or two from your commit history during prep — credibility booster. |
 | Will this work for greenfield AI/ML research? | HVE accelerates engineering scaffolding around research. The novel research itself still needs human insight. |
+| How does context-first/core compare to HVE Core? | Different layers, complementary. **HVE Core = Copilot tooling** (agents, prompts, instructions, RPI workflow) — answers *"how do I get high-quality output from Copilot on one task?"* **context-first = planning methodology** (the session replaces the story) — answers *"what is the unit of work, and how do ceremonies wrap it?"* RPI runs *inside* a session. The honest read from teams adopting HVE: the tools are fast, the agile process gets in the way. Context-first is the process catching up to the tools. See backup slide. |
 
 ## Slide List
 
@@ -287,22 +321,25 @@ Anticipate and pre-answer:
 5. The comparison table (axis)
 6. The feature checklist (same engineering bar, different domain)
 7. The 130× number — evolution, not superset
-8. What actually changed (4 forces: Copilot+HVE, reuse, experience, repeat domain)
-9. The strongest evidence (GPUs, vLLM, cost model — net-new)
-10. **How this actually happened (1/2)** — vLLM → ask → bench → Go rewrite
-11. **How this actually happened (2/2)** — cLLM → DSL → MCP
-12. Live demo — MCP-driven cLLM
-13. Evidence it is real (git, LOC, tests, docs, reports)
-14. What that buys you — the stack
-15. **Lessons Learned — Process**
-16. **Lessons Learned — Tooling** *(includes Marp + `make deploy` / `make install`)*
-17. **Lessons Learned — Copilot & Mindset**
-18. Caveats — owned, not hidden
-19. Why it matters
-20. HVE is the new floor / call to action
-21. Q&A
-22. Backup: Sessions, Not Stories
-23. Backup: Likely Q&A
+8. **The experience-adjusted bracket — ~65× from HVE alone** (rebuild counterfactual)
+9. What actually changed (4 forces: Copilot+HVE, reuse, experience, repeat domain)
+10. The strongest evidence (GPUs, vLLM, cost model — net-new)
+11. **How this actually happened (1/2)** — vLLM → ask → bench → Go rewrite
+12. **How this actually happened (2/2)** — cLLM → DSL → MCP
+13. Live demo — MCP-driven cLLM
+14. Evidence it is real (git, LOC, tests, docs, reports)
+15. What that buys you — the stack
+16. **Lessons Learned — Process**
+17. **Lessons Learned — Tooling** *(includes Marp + `make deploy` / `make install`)*
+18. **Lessons Learned — Copilot & Mindset**
+19. Caveats — owned, not hidden
+20. Why it matters
+21. **Next experiment — new FDE rebuilds Helium with sessions methodology**
+22. HVE is the new floor / call to action
+23. Q&A
+24. Backup: Sessions, Not Stories
+25. **Backup: Context-first vs HVE Core** (two layers, complementary)
+26. Backup: Likely Q&A
 
 ## Pre-Talk Checklist
 
@@ -318,4 +355,16 @@ Anticipate and pre-answer:
 
 - **Helium team is named** on the baseline slide: Bart (Partner FDE today; Principal at the time), Joseph (Principal FDE), Anne (Senior FDE), Deanna (Principal PM).
 - **Live demo is MCP-only.** No on-stage Copilot coding moment. The "what changed" segment stays narrative.
+
+## Addressing Feedback: Context-first vs HVE Core
+
+Feedback received: *"How does `context-first/core` compare to HVE Core?"*
+
+Short answer for stage (use only if asked, then point to the backup slide):
+
+> They are at different altitudes. **HVE Core is the Copilot tooling layer** — 49 agents, 102 instructions, 63 prompts, 11 skills, and the RPI (Research → Plan → Implement → Review) workflow. It optimizes the inner loop at the keyboard. **Context-first is the planning methodology layer** — the session is the planning primitive that replaces the story. It optimizes the outer loop: standups, retros, planning, demos, reporting up. RPI runs *inside* a session.
+>
+> The honest read from teams already running HVE is consistent: the tools are fast, the agile process gets in the way. **Context-first is the process catching up to the tools.** Mostly complementary, with a small overlap in the "impose structure on AI work" mindset. They are designed to be used together.
+
+Slide reference: backup slide 23 ("Context-first vs HVE Core"). Q&A row added in the Likely Q&A backup.
 - **CVP-level emphasis** (for Dan): HVE adoption, time-to-customer-value, observability, engineering fundamentals, AI adoption. Mapped to specific deck moments in the *CVP-Level Talking Points* section above.
