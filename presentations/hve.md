@@ -6,7 +6,7 @@ Format: 30 minutes talk + 15–20 minutes Q&A.
 
 ## Core Message
 
-> Helium took 4 of us 26 weeks to ship an MVP. Five years later, with GitHub Copilot and HVE, I built a comparable MVP — same engineering bar, different domain — in 4 days, alone.
+> Helium took 4 of us 26 weeks to ship an MVP. Eight years later, with GitHub Copilot and HVE, I built a comparable MVP — same engineering bar, different domain — in 4 days, alone.
 >
 > cLLM is **an evolution of Helium**, not a competitor. The service is different, so the logs and metrics and dashboards are different. The fundamentals are the same. The shock is **how fast the fundamentals come back together** with HVE.
 >
@@ -22,10 +22,10 @@ This talk is not "AI built it for me." It is: an experienced FDE, equipped with 
 
 ## The Honest Comparison (the slide everyone will photograph)
 
-| Axis | Helium (2020-ish) | cLLM (Apr–May 2026) |
+| Axis | Helium (spring 2018) | cLLM (Apr–May 2026) |
 |---|---|---|
 | Time to MVP | **26 weeks** (6 months) | **4 days** of focused work |
-| Team | 1 Partner FDE + 1 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
+| Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
 | People-weeks | **~104** | **~0.8** |
 | Reduction | — | **~130×** less effort |
 | Stack experience at start | New to K8s, Prometheus, Grafana, GitOps | 5 yrs each, top-tier K8s FDE |
@@ -88,7 +88,7 @@ This is the slide that ends the "but is it real?" conversation.
 
 Open cold with the comparison number. No throat-clearing.
 
-> Five years ago, four of us — two principals, a senior, and a PM — spent 26 weeks shipping the first good release of Helium. Most of you remember it. Several of you helped build it.
+> Eight years ago, in the spring of 2018, four of us — two principals, a senior, and a PM — spent 26 weeks shipping the first good release of Helium. Most of you remember it. Several of you helped build it.
 >
 > Three weeks ago, alone, with Copilot and an HVE workflow, I shipped a comparable MVP in four days — a service, benchmark client, structured logs, Prometheus, live Grafana, GitOps. Same bar Helium set. Then I kept going.
 >
@@ -133,7 +133,7 @@ No live coding here. Keep this segment narrative — the only live demo in the d
 
 1. **GitHub Copilot + HVE workflow** — the largest single multiplier. Codifies best practices, error handling, and contracts into the loop. Generates ADRs alongside code. Turns design conversations into working prototypes inside one session.
 2. **Reuse — it is in my DNA as a senior engineer.** I did not start cLLM from a blank repo. I started from the **K8s-on-the-edge + GitOps** stack I have been building for **Domino's** for the last year — cluster manifests, Flux layout, Prometheus and Grafana wiring, the deployment patterns. That is why the first 5 days produced 99 commits: the runway was already paved. **Reuse is not a shortcut. It is the craft.**
-3. **Five years of compounding experience** — K8s, Prometheus, Grafana, GitOps are now muscle memory. I am considered one of the strongest K8s FDEs in Microsoft. That experience is what lets Copilot move at full speed without producing slop.
+3. **Eight years of compounding experience** — K8s, Prometheus, Grafana, GitOps are now muscle memory. I am considered one of the strongest K8s FDEs in Microsoft. That experience is what lets Copilot move at full speed without producing slop.
 4. **Repeat domain** — I have built Helium-shaped systems multiple times. Pattern recognition is free velocity.
 
 The honest framing:
