@@ -28,7 +28,7 @@ This talk is not "AI built it for me." It is: an experienced FDE, equipped with 
 | Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
 | People-weeks | **~104** | **~0.8** |
 | Reduction | — | **~130×** less effort |
-| Stack experience at start | New to K8s, Prometheus, Grafana, GitOps | 5 yrs each, top-tier K8s FDE |
+| Stack experience at start | New to K8s, Prometheus, Grafana, GitOps | 8 yrs each, top-tier K8s FDE |
 | Domain experience | First time building this kind of service | Nth Helium-shaped project |
 | Net-new for me | — | GPUs on K8s, vLLM (had never heard of it) |
 | Tooling | Hand-written, Stack Overflow, docs | GitHub Copilot + HVE workflow |
