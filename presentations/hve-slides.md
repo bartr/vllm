@@ -84,7 +84,7 @@ May 2026
 
 # The Bet
 
-> Five years ago, **four of us** spent **26 weeks** shipping the Helium MVP.
+> Eight years ago (spring 2018), **four of us** spent **26 weeks** shipping the Helium MVP.
 >
 > Three weeks ago, with **Copilot and an HVE workflow**, I shipped a comparable MVP in **four days** — same engineering bar, different domain.
 
@@ -114,7 +114,7 @@ What we were: **all new to Kubernetes, Prometheus, Grafana, GitOps**
 
 # The Apples-to-Apples Comparison
 
-| Axis | Helium (2020-ish) | cLLM (Apr–May 2026) |
+| Axis | Helium (spring 2018) | cLLM (Apr–May 2026) |
 |---|---|---|
 | Time to MVP | **26 weeks** | **4 days** |
 | Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
@@ -168,7 +168,7 @@ Four forces, in order of magnitude:
 
 2. **Reuse — it's in my DNA.** I started from the **K8s-on-the-edge + GitOps** stack I have spent the **last year building with Domino's**. Cluster manifests, Flux layout, Prometheus + Grafana wiring — all reused. *That* is why the first 5 days produced 99 commits.
 
-3. **Five years of compounding experience** — K8s, Prometheus, Grafana, GitOps are now muscle memory. That is what lets Copilot move at full speed without producing slop.
+3. **Eight years of compounding experience** — K8s, Prometheus, Grafana, GitOps are now muscle memory. That is what lets Copilot move at full speed without producing slop.
 
 4. **Repeat domain** — I have built Helium-shaped systems multiple times. Pattern recognition is free velocity.
 

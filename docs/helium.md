@@ -49,9 +49,9 @@ For Helium , let's use 26 weeks as the baseline for an MVP.
 Using GitHub Copilot, I was able to create a similar MVP in 4 days.
 
 Some of the differences
-it's about 5 years later and I've done Helium like projects multiple times
+it's about 8 years later (Helium started in the spring of 2018) and I've done Helium like projects multiple times
 we were all new to Kubernetes, Prometheus, Grafana, GitOps
-I now have 5 years of experiences in each and am considered one of the best K8s FDEs in Microsoft
+I now have 8 years of experiences in each and am considered one of the best K8s FDEs in Microsoft
 I didn't have much experience with GPUs on K8s when I started
 I had never heard of vLLM
 
