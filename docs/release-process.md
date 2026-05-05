@@ -71,34 +71,64 @@ Add additional `match[]=...` selectors for any other smoke-only labels
 cycle. Prometheus must have `enableAdminAPI: true` set on its CR — this
 is already the case on z01.
 
-### 1. Push the dev branch
+### 1. Push the dev branch and open a PR
 
 ```sh
 cd ~/vllm
 git checkout bartr
 git push origin bartr
+gh pr create --base main --head bartr --title "Release X.Y.Z" --body-file -
 ```
 
-### 2. Fast-forward merge `bartr` → `main`
+The PR body should describe what is shipping (feature blocks, new
+metrics, breaking changes, ops-relevant config). It is the input for
+the annotated tag in step 3 — you can copy from the PR body when
+writing the tag message.
 
-A fast-forward merge **preserves every commit** from `bartr` on `main`.
-This is a deliberate change from the previous squash-merge policy.
+**Solo-dev note.** cLLM currently has one engineer. Self-approval is
+fine and the PR does not need a second reviewer. The PR exists to
+produce **repo evidence** (a permanent, addressable record of what
+shipped, why, and what the diff looked like) and to keep the workflow
+identical to how FDEs work on multi-engineer teams. When a second
+engineer joins cLLM, the workflow does not change — only the
+approval policy does.
+
+Do not skip this step "because it is just me." The PR is the artifact,
+not the gate.
+
+### 2. Merge the PR — rebase by default, merge commit only if rebase fails
+
+**Default: rebase merge.**
 
 ```sh
-git checkout main
-git pull --ff-only
-git merge --ff-only bartr
+gh pr merge --rebase --delete-branch
 ```
 
-If `--ff-only` refuses (because `main` has commits `bartr` does not),
-rebase `bartr` onto `main` first, re-run smoke, and try again. **Do
-not fall back to a non-FF merge or a squash to make the merge succeed.**
+This replays every commit from `bartr` onto `main` and fast-forwards.
+Result: linear history, **every individual commit retained**, no merge
+commit. This is the cLLM default.
 
-The release commit on `main` is whatever the tip of `bartr` already is.
-There is no separate "Version X.Y.Z" commit — the **annotated tag**
-(step 3) carries the release notes.
+**Fallback: merge commit, only when rebase cannot succeed cleanly.**
 
-#### Why FF, not squash
+```sh
+gh pr merge --merge --delete-branch
+```
+
+Use `--merge` only when GitHub refuses to rebase (conflicts that need
+human resolution, or a long-lived branch where the merge commit itself
+is a meaningful waypoint). The merge commit also retains every
+individual commit — it just adds the diamond shape to the graph.
+
+**Never `--squash`.** Squash collapses the entire branch into one
+commit and destroys the per-commit history we need for storytelling,
+forensics, and AI-assisted reconstruction.
+
+The release commit on `main` is whatever the tip of `bartr` already
+is (rebase) or the merge commit (`--merge`). There is no separate
+"Version X.Y.Z" commit — the **annotated tag** (step 3) carries the
+release notes.
+
+#### Why never squash, and why prefer rebase
 
 We used to squash-merge with the message `Version X.Y.Z`. It produced
 a clean linear `main` history — one commit per release — and that felt
@@ -110,13 +140,16 @@ narrative — "99 commits in the first 5 days," the day-by-day evolution
 of admission, the DSL, the MCP server — was largely invisible on
 `main`. The history we needed for evidence had been thrown away.
 
-FF-merge keeps the full commit graph. AI tools (and humans) can
-reconstruct the actual development arc from `git log` instead of from
-fading memory and chat transcripts. The annotated tag still gives us a
-clean release-notes view; the per-commit detail is preserved
-underneath. **Storytelling and forensics both want the full history.
-Releases want a single authoritative anchor.** The tag is that anchor;
-the commits are the story.
+Rebase merge keeps the full commit graph **and** keeps `main` linear.
+Merge commits keep the full graph but add diamond shapes per PR.
+Both retain history; rebase just looks cleaner in `git log` and
+`git bisect`. Squash retains nothing and is forbidden.
+
+The annotated tag still gives us a clean release-notes view; the
+per-commit detail is preserved underneath. **Storytelling and
+forensics both want the full history. Releases want a single
+authoritative anchor.** The tag is that anchor; the commits are the
+story.
 
 ### 3. Tag the release with annotated notes
 
@@ -130,10 +163,15 @@ backward-compat contracts, ops-relevant config additions>"
 The tag's body should be self-contained: `git show X.Y.Z` is the release
 notes for anyone trying to understand what shipped.
 
-### 4. Push `main` and the tag
+### 4. Pull `main` and push the tag
+
+After `gh pr merge` the remote `main` is already updated. Sync local
+`main` and push the tag:
 
 ```sh
-git push origin main X.Y.Z
+git checkout main
+git pull --ff-only
+git push origin X.Y.Z
 ```
 
 ### 5. Reset `bartr` to the new `main` and bump to next dev version
@@ -219,17 +257,18 @@ For an urgent fix that does not warrant the full `bartr` train:
 git checkout -b hotfix-X.Y.(Z+1) X.Y.Z
 # … make minimal change, bump version touchpoints …
 go test ./... && ask --files scripts/smoke-test.yaml --bench 1
-git checkout main
-git merge --ff-only hotfix-X.Y.(Z+1)   # rebase the hotfix onto main first if needed
+git push origin hotfix-X.Y.(Z+1)
+gh pr create --base main --head hotfix-X.Y.(Z+1) --title "Hotfix X.Y.(Z+1)" --body "<fix summary>"
+gh pr merge --rebase --delete-branch     # rebase by default; --merge only if rebase fails. Never --squash.
+git checkout main && git pull --ff-only
 git tag -a X.Y.(Z+1) -m "Version X.Y.(Z+1): <fix summary>"
-git push origin main X.Y.(Z+1)
+git push origin X.Y.(Z+1)
 # Then forward-merge main back into bartr to pick up the fix:
 git checkout bartr && git merge main && git push
 ```
 
-Same FF-only rule as the main release path: if `--ff-only` refuses,
-rebase the hotfix branch onto `main` rather than falling back to a
-non-FF or squash merge.
+Same merge-strategy rule as the main release path: rebase by default,
+`--merge` only when rebase cannot succeed cleanly, **never** `--squash`.
 
 ## Why no Flux on dev
 
