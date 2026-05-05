@@ -119,7 +119,7 @@ What we were: **all new to Kubernetes, Prometheus, Grafana, GitOps**
 | Time to MVP | **26 weeks** | **4 days** |
 | Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
 | **People-weeks** | **~104** | **~0.8** |
-| Stack experience at start | New to K8s, Prom, Grafana, GitOps | 5 yrs each, top-tier K8s FDE |
+| Stack experience at start | New to K8s, Prom, Grafana, GitOps | 8 yrs each, top-tier K8s FDE |
 | Domain experience | First time | Nth Helium-shaped project |
 | Net-new domain for me | — | GPUs on K8s, vLLM |
 | Tooling | Hand-written, docs, Stack Overflow | **GitHub Copilot + HVE** |
