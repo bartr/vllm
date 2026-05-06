@@ -29,6 +29,7 @@ When bumping, every one of these must change in lockstep:
 | `cllm/internal/buildinfo/version.go` | Compiled into the binary; surfaced at `/version`. |
 | `cllm/Makefile` | `IMAGE ?= cllm:X.Y.Z`; controls what `make build`, `make deploy` produce and import into k3s. |
 | `clusters/z01/cllm/deployment.yaml` | Pod `image: cllm:X.Y.Z`. |
+| `clusters/z01/ask/deployment.yaml` | askd Pod `image: cllm:X.Y.Z` (askd shares the cllm image). |
 | `cllm/README.md` | Four `cllm:X.Y.Z` references in the build/run sections. |
 
 A `grep -rn 'cllm:X\.Y\.Z\|var Version' cllm clusters` after the bump
