@@ -62,6 +62,12 @@ type options struct {
 
 	// Bench-only behavior.
 	warmup bool
+
+	// Serve mode (askd / Kubernetes). Mutually exclusive with --bench
+	// run; serve is the long-running HTTP control plane around ask.
+	serve bool
+	addr  string
+	logDir string
 }
 
 func main() {
@@ -82,6 +88,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	opts, err := parseFlags(args, stderr)
 	if err != nil {
 		return err
+	}
+
+	// --serve activates the HTTP control plane (askd). It does not
+	// resolve a prompt or run a request directly: jobs are submitted via
+	// the API. --bench is intentionally ignored in serve mode.
+	if opts.serve {
+		return runServe(opts, stdout, stderr)
 	}
 
 	// Resolve the user prompt for single-shot mode (and as the canonical
@@ -170,6 +183,11 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	// Bench-only.
 	fs.BoolVar(&opts.warmup, "warmup", false, "run one untimed warmup request before bench workers start")
 
+	// Serve mode (askd / Kubernetes control plane).
+	fs.BoolVar(&opts.serve, "serve", false, "run the ask HTTP control plane (askd); does not run a CLI request")
+	fs.StringVar(&opts.addr, "addr", envOr("ASK_ADDR", ":8008"), "address for --serve HTTP control plane")
+	fs.StringVar(&opts.logDir, "log-dir", envOr("ASK_LOG_DIR", "/var/log/askd"), "per-run log directory used by --serve")
+
 	fs.Usage = func() {
 		fmt.Fprint(stderr, usageText)
 	}
@@ -222,7 +240,7 @@ func defaultOptions() options {
 		token:        envOr("CLLM_TOKEN", ""),
 		model:        envOr("CLLM_MODEL", ""),
 		systemPrompt: envOr("CLLM_SYSTEM_PROMPT", "You are a helpful assistant."),
-		maxTokens:    envIntOr("CLLM_MAX_TOKENS", 1024),
+		maxTokens:    envIntOr("CLLM_MAX_TOKENS", 100),
 		temperature:  envFloatOr("CLLM_TEMPERATURE", 0.2),
 		stream:       true,
 		dsl:          envOr("CLLM_DSL", ""),
@@ -382,6 +400,15 @@ Output:
   --report / --no-report   Final summary in bench mode (default on)
   -h, --help               Show this help
   --version                Print version and exit
+
+Serve mode (askd / Kubernetes):
+  --serve                  Run the ask HTTP control plane instead of a one-shot
+                           request. Exposes /health, /ready, /version, /config,
+                           /bench (start/status), /bench/{pause,start,stop,restart},
+                           /config/reset, and /logs. CLI flags become defaults
+                           that the API can override per job.
+  --addr ADDR              Listen address for --serve (default :8008 / $ASK_ADDR)
+  --log-dir PATH           Per-run log directory (default /var/log/askd / $ASK_LOG_DIR)
 
 Environment (lower precedence than flags):
   CLLM_URL, CLLM_TOKEN, CLLM_MODEL, CLLM_SYSTEM_PROMPT,

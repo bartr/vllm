@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -11,13 +10,14 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PROMPTS_FILE = os.path.join(_REPO_ROOT, "scripts", "prompts.yaml")
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 import settings
 import client
+import ask_client
+import askd_logs
 import benchmark
 import metrics
 import audit
@@ -189,9 +189,12 @@ async def get_benchmark_status(tail_lines: int = 40) -> str:
     Args:
         tail_lines: Number of recent log lines to read (default 40).
     """
-    running = benchmark.is_running()
-    lines = benchmark.tail_log(tail_lines)
+    try:
+        status = await ask_client.get_status()
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
 
+    lines = await benchmark.tail_log(tail_lines)
     rows = [r for line in lines if (r := benchmark.parse_row(line)) is not None]
 
     # warming_up: based on the most recent data row's total_tok_s field
@@ -200,13 +203,15 @@ async def get_benchmark_status(tail_lines: int = 40) -> str:
         warming_up = rows[-1]["total_tok_s"] is None
 
     result = {
-        "running": running,
-        "command_hint": "ask --bench 120 --loop --files prompts.yaml --max-tokens 100",
-        "log_path": settings.CLLM_BENCH_LOG,
+        "running": status.get("state") in ("running", "paused"),
+        "job_state": status.get("state"),
+        "job": status,
+        "log_file": status.get("log_file"),
         "warming_up": warming_up,
         "recent_rows": rows,
         "notes": [
-            "total_tok_s may be blank during benchmark warmup and should not be treated as zero"
+            "total_tok_s may be blank during benchmark warmup and should not be treated as zero",
+            "benchmarks now run in the askd Kubernetes pod; use start/pause/stop/restart_bench tools to control them",
         ],
     }
     return json.dumps(result, indent=2)
@@ -400,8 +405,13 @@ async def _experiment_report(question: str = "", snapshot: dict | None = None) -
             snapshot = {"node_metrics": [], "cache_metrics": {}}
             errors.append(f"metrics: {e}")
 
-    bench_running = benchmark.is_running()
-    bench_rows = [r for line in benchmark.tail_log(40) if (r := benchmark.parse_row(line)) is not None]
+    try:
+        bench_running = await benchmark.is_running()
+        bench_rows = [r for line in await benchmark.tail_log(40) if (r := benchmark.parse_row(line)) is not None]
+    except ask_client.AskNotDeployedError as e:
+        bench_running = False
+        bench_rows = []
+        errors.append(f"ask: {e}")
     bench_warming = bench_rows[-1]["total_tok_s"] is None if bench_rows else None
 
     nodes = nodes_data.get("nodes", [])
@@ -496,11 +506,13 @@ async def run_benchmark_window(
     duration_seconds: int = 120,
     concurrency: int = 120,
 ) -> str:
-    """Run a bounded benchmark and return before/after metrics with a summary report.
+    """Run a bounded benchmark inside the askd Kubernetes pod.
 
-    Kills any existing ask --bench process, runs ask --bench for the requested
-    duration, tees output to ~/logs/, then captures an after-metrics snapshot
-    and generates an experiment report automatically.
+    Stops any in-flight askd job, starts a fresh run for the requested
+    duration via POST /bench, polls until completion, then captures
+    before/after metrics and generates an experiment report. The
+    benchmark log is the per-run file inside the askd pod
+    (/var/log/askd/run-*.log) — fetched via GET /logs/<name>.
 
     Args:
         duration_seconds: How long to run the benchmark (30–600, default 120).
@@ -513,46 +525,40 @@ async def run_benchmark_window(
     if not (1 <= concurrency <= 256):
         return json.dumps({"error": f"Validation error: concurrency={concurrency} outside [1, 256]"})
 
-    kill_result = subprocess.run(["pkill", "-f", "ask --bench"], capture_output=True)
-    killed_existing = kill_result.returncode == 0
+    try:
+        await ask_client.ensure_deployed()
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+    # Fresh log: stop any in-flight job (closes its log file), then start.
+    pre_status = await ask_client.get_status()
+    killed_existing = pre_status.get("state") in ("running", "paused")
+    if killed_existing:
+        await ask_client.stop_bench()
 
     try:
         before_snapshot = metrics.build_snapshot(await client.get_text("/metrics"))
     except httpx.HTTPError as e:
         return json.dumps({"error": f"Failed to capture before-snapshot: {e}"})
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    os.makedirs(settings.BENCHMARK_LOGS_DIR, exist_ok=True)
-    log_filename = f"bench-window-{timestamp}.log"
-    log_path = os.path.join(settings.BENCHMARK_LOGS_DIR, log_filename)
-    log_path_display = f"benchmark/logs/{log_filename}"
-
-    cmd = [
-        "ask", "--bench", str(concurrency),
-        "--duration", f"{duration_seconds}s",
-        "--files", _PROMPTS_FILE,
-        "--max-tokens", "100",
-    ]
-
+    spec = {
+        "bench": concurrency,
+        "duration_ms": duration_seconds * 1000,
+        "max_tokens": 100,
+    }
     started_at = datetime.now(timezone.utc)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    start_resp = await ask_client.start_bench(spec)
+    log_filename = start_resp.get("log_file") or ""
 
-    output_lines: list[str] = []
-    with open(log_path, "w") as log_f:
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="replace")
-            log_f.write(decoded)
-            log_f.flush()
-            output_lines.append(decoded.rstrip())
+    # Poll until askd reports idle (job ended) or we exceed duration + 30s grace.
+    deadline = asyncio.get_event_loop().time() + duration_seconds + 30
+    final_status: dict = start_resp
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(2)
+        final_status = await ask_client.get_status()
+        if final_status.get("state") == "idle":
+            break
 
-    await proc.wait()
     completed_at = datetime.now(timezone.utc)
 
     try:
@@ -560,9 +566,16 @@ async def run_benchmark_window(
         after_snapshot = metrics.build_snapshot(after_text)
     except httpx.HTTPError as e:
         after_snapshot = {"error": str(e)}
-        after_text = None
 
-    # Parse rows from captured output; exclude warmup rows for stats
+    # Pull the run log back out of askd and parse it.
+    output_lines: list[str] = []
+    if log_filename:
+        try:
+            text = await ask_client.tail_log_text(log_filename)
+            output_lines = text.splitlines()
+        except httpx.HTTPError as e:
+            output_lines = [f"<failed to fetch log: {e}>"]
+
     rows = [r for line in output_lines if (r := benchmark.parse_row(line)) is not None]
     warmed = [r for r in rows if r.get("total_tok_s") is not None]
 
@@ -591,9 +604,11 @@ async def run_benchmark_window(
         "concurrency": concurrency,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
-        "command": " ".join(cmd),
-        "log_path": log_path_display,
+        "spec": spec,
+        "log_file": log_filename,
+        "log_url": settings.CLLM_ASK_BASE_URL + f"/logs/{log_filename}" if log_filename else None,
         "killed_existing": killed_existing,
+        "final_status": final_status,
         "before": before_snapshot,
         "after": after_snapshot,
         "window_stats": window_stats,
@@ -601,6 +616,323 @@ async def run_benchmark_window(
     }
     audit.log("run_benchmark_window", {"duration_seconds": duration_seconds, "concurrency": concurrency}, result)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def start_bench(
+    bench: int = 120,
+    duration_seconds: int | None = None,
+    count: int | None = None,
+    files: list[str] | None = None,
+    prompt: str | None = None,
+    max_tokens: int = 100,
+    warmup: bool = False,
+) -> str:
+    """Start a benchmark job in the askd Kubernetes pod (POST /bench).
+
+    Returns immediately with the job status; use get_benchmark_status
+    to poll. The job runs until count/duration is reached, or until
+    pause_bench / stop_bench / restart_bench is called.
+    """
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    spec: dict = {"bench": bench, "max_tokens": max_tokens, "warmup": warmup}
+    if duration_seconds is not None:
+        spec["duration_ms"] = int(duration_seconds * 1000)
+    if count is not None:
+        spec["count"] = count
+    if files:
+        spec["files"] = files
+    if prompt:
+        spec["prompt"] = prompt
+    try:
+        return json.dumps(await ask_client.start_bench(spec), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def pause_bench() -> str:
+    """Pause the askd job: stop accepting new prompts, drain in-flight."""
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    try:
+        return json.dumps(await ask_client.pause_bench(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def resume_bench() -> str:
+    """Resume a paused askd job (or start using current defaults if idle)."""
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    try:
+        return json.dumps(await ask_client.start_or_resume_bench(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def stop_bench() -> str:
+    """Stop the askd job: drain in-flight, close the per-run log file."""
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    try:
+        return json.dumps(await ask_client.stop_bench(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def restart_bench() -> str:
+    """Restart the askd job: stop + fresh start with current spec (warmup forced)."""
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    try:
+        return json.dumps(await ask_client.restart_bench(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def list_bench_logs() -> str:
+    """List per-run log files inside the askd pod (most recent first)."""
+    try:
+        return json.dumps(await ask_client.list_logs(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def get_ask_config() -> str:
+    """Return askd's current runtime config (defaults applied to new jobs)."""
+    try:
+        return json.dumps(await ask_client.get_config(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def reset_ask_config() -> str:
+    """Reset askd's runtime config back to startup defaults (ConfigMap values)."""
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    try:
+        return json.dumps(await ask_client.reset_config(), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def get_askd_status() -> str:
+    """One-shot view of askd: deployed?, version, current job state, current config.
+
+    Use this to answer 'is askd running and under what config?'. The
+    askd HTTP server is always running once the Deployment is up; the
+    job state (idle / running / paused) describes the bench workload
+    inside it. start_bench / pause_bench / stop_bench / restart_bench
+    drive that workload.
+    """
+    result: dict = {
+        "ask_base_url": settings.CLLM_ASK_BASE_URL,
+        "deployed": False,
+    }
+    try:
+        version = await ask_client.get_version()
+    except (ask_client.AskNotDeployedError, httpx.HTTPError) as e:
+        result["error"] = (
+            f"ask service unreachable at {settings.CLLM_ASK_BASE_URL}. "
+            "Deploy with: kubectl apply -k clusters/z01/ask/  "
+            f"(detail: {e})"
+        )
+        return json.dumps(result, indent=2)
+
+    result["deployed"] = True
+    result["version"] = version
+    try:
+        result["job"] = await ask_client.get_status()
+    except httpx.HTTPError as e:
+        result["job_error"] = str(e)
+    try:
+        result["config"] = await ask_client.get_config()
+    except httpx.HTTPError as e:
+        result["config_error"] = str(e)
+    try:
+        listing = await ask_client.list_logs()
+        logs = listing.get("logs", [])
+        result["log_dir"] = listing.get("log_dir")
+        result["recent_log"] = logs[0] if logs else None
+        result["total_logs"] = len(logs)
+    except httpx.HTTPError as e:
+        result["logs_error"] = str(e)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def update_ask_config(
+    bench: int | None = None,
+    count: int | None = None,
+    duration_seconds: int | None = None,
+    ramp_start: int | None = None,
+    ramp_end: int | None = None,
+    ramp_duration_seconds: int | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    url: str | None = None,
+    model: str | None = None,
+    system: str | None = None,
+    prompt: str | None = None,
+    dsl: str | None = None,
+    files: list[str] | None = None,
+    loop: bool | None = None,
+    random: bool | None = None,
+    warmup: bool | None = None,
+    stream: bool | None = None,
+    quiet: bool | None = None,
+    json_output: bool | None = None,
+    report: bool | None = None,
+    extra: dict | None = None,
+) -> str:
+    """Edit askd's runtime config (PUT /config).
+
+    Only fields you pass are sent; everything else is left alone. Use
+    `extra` to pass through anything not covered by the typed args.
+    Use `reset_ask_config` to revert to ConfigMap defaults. Note: zero-
+    valued ints/strings would be ignored server-side (treated as
+    'unset'); pass booleans via the typed args (they are sent as JSON
+    booleans). `json_output` maps to the API field `json`.
+    """
+    if settings.CLLM_READ_ONLY:
+        return json.dumps({"error": "Refused: CLLM_READ_ONLY=true"})
+    patch: dict = {}
+    if bench is not None: patch["bench"] = bench
+    if count is not None: patch["count"] = count
+    if duration_seconds is not None: patch["duration_ms"] = int(duration_seconds * 1000)
+    if ramp_start is not None: patch["ramp_start"] = ramp_start
+    if ramp_end is not None: patch["ramp_end"] = ramp_end
+    if ramp_duration_seconds is not None: patch["ramp_duration_ms"] = int(ramp_duration_seconds * 1000)
+    if max_tokens is not None: patch["max_tokens"] = max_tokens
+    if temperature is not None: patch["temperature"] = temperature
+    if url is not None: patch["url"] = url
+    if model is not None: patch["model"] = model
+    if system is not None: patch["system"] = system
+    if prompt is not None: patch["prompt"] = prompt
+    if dsl is not None: patch["dsl"] = dsl
+    if files is not None: patch["files"] = files
+    if loop is not None: patch["loop"] = loop
+    if random is not None: patch["random"] = random
+    if warmup is not None: patch["warmup"] = warmup
+    if stream is not None: patch["stream"] = stream
+    if quiet is not None: patch["quiet"] = quiet
+    if json_output is not None: patch["json"] = json_output
+    if report is not None: patch["report"] = report
+    if extra:
+        patch.update(extra)
+    if not patch:
+        return json.dumps({"error": "no fields supplied; nothing to update"})
+    try:
+        return json.dumps(await ask_client.update_config(patch), indent=2)
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def query_askd_logs(
+    last_seconds: int | None = None,
+    last_minutes: int | None = None,
+    last_hours: int | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    run_name: str | None = None,
+    include_rows: bool = False,
+    max_rows_per_run: int = 20,
+    max_runs: int = 10,
+) -> str:
+    """Inspect askd run logs over a time window.
+
+    Each askd run writes its own log file (`run-<UTC>.log`); this tool
+    finds matching files and returns parsed summary stats per run.
+
+    Time window — pass exactly one of:
+      * last_seconds / last_minutes / last_hours (relative to now)
+      * since + until as ISO-8601 (e.g. "2026-05-06T13:00:00Z")
+      * run_name to fetch one specific log file by name
+    Omit all three to summarize every run on disk (capped by max_runs).
+
+    For natural-language requests like 'around 1:00 today' or
+    'yesterday between 12:30 and 1:30', translate them into ISO-8601
+    `since` / `until` UTC values before calling.
+
+    Returns: per-run summary (rows, warmup_rows, cache_hit_rate_pct,
+    avg_ttft_ms, avg_req_tok_s, avg_total_tok_s) plus the askd marker
+    lines (start/pause/resume/stop/end). Set include_rows=True to also
+    get up to max_rows_per_run parsed data rows from each matching log.
+    """
+    try:
+        since_dt, until_dt, err = askd_logs.resolve_window(
+            last_seconds, last_minutes, last_hours, since, until,
+        )
+    except Exception as e:
+        return json.dumps({"error": f"window parse: {e}"})
+    if err:
+        return json.dumps({"error": err})
+
+    try:
+        if run_name:
+            matched = [{"name": run_name}]
+        else:
+            listing = await ask_client.list_logs()
+            entries = listing.get("logs", [])
+            if since_dt or until_dt:
+                matched = askd_logs.runs_in_window(entries, since_dt, until_dt)
+            else:
+                matched = entries
+            matched = matched[:max_runs]
+    except ask_client.AskNotDeployedError as e:
+        return json.dumps({"error": str(e)})
+
+    if not matched:
+        return json.dumps({
+            "ask_base_url": settings.CLLM_ASK_BASE_URL,
+            "window": {
+                "since": since_dt.isoformat() if since_dt else None,
+                "until": until_dt.isoformat() if until_dt else None,
+            },
+            "runs": [],
+            "note": "no askd run logs match the requested window",
+        }, indent=2)
+
+    runs: list[dict] = []
+    for entry in matched:
+        name = entry["name"]
+        try:
+            text = await ask_client.tail_log_text(name)
+        except (ask_client.AskNotDeployedError, httpx.HTTPError) as e:
+            runs.append({"name": name, "error": str(e)})
+            continue
+        run_summary: dict = {
+            "name": name,
+            "started_at": entry.get("started_at") or (askd_logs.parse_run_name(name).isoformat() if askd_logs.parse_run_name(name) else None),
+            "size_bytes": entry.get("size"),
+            "modified": entry.get("modified"),
+            "summary": askd_logs.summarize_log_text(text),
+            "markers": askd_logs.extract_markers(text),
+        }
+        if include_rows:
+            rows = [r for line in text.splitlines() if (r := benchmark.parse_row(line)) is not None]
+            run_summary["rows"] = rows[-max_rows_per_run:] if len(rows) > max_rows_per_run else rows
+        runs.append(run_summary)
+
+    return json.dumps({
+        "ask_base_url": settings.CLLM_ASK_BASE_URL,
+        "window": {
+            "since": since_dt.isoformat() if since_dt else None,
+            "until": until_dt.isoformat() if until_dt else None,
+        },
+        "matched_runs": len(runs),
+        "runs": runs,
+    }, indent=2)
 
 
 @mcp.tool()

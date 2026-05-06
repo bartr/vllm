@@ -2,6 +2,14 @@
 
 `cllm` is a small Go web server that listens on port `8080` by default.
 
+This module also ships **`ask`** (under `cmd/ask`): a single binary that
+acts as both a one-shot CLI and a long-running Kubernetes control plane.
+
+- `ask hello` / `ask --bench 8 ...` — local CLI (no HTTP service).
+- `ask --serve` — `askd`: HTTP control plane on `:8008`. Started by the
+  Kubernetes Deployment in `clusters/z01/ask/`. Spec:
+  [docs/spec-askd.md](../docs/spec-askd.md).
+
 ## Endpoints
 
 - `GET /cache` returns cache status, size, entries, and cache key summaries; it also supports cache actions through query params
