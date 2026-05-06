@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: askd
+  namespace: cllm
+  labels:
+    app.kubernetes.io/name: askd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: askd
+  template:
+    metadata:
+      labels:
+        app: askd
+        app.kubernetes.io/name: askd
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: askd
+          image: cllm:0.19.0
+          imagePullPolicy: Never
+          # Override the image's default /cllm entrypoint with the
+          # /ask binary in --serve mode. CLI flags can still override
+          # any env-var default.
+          command: ["/ask"]
+          args: ["--serve"]
+          envFrom:
+            - configMapRef:
+                name: askd-defaults
+          ports:
+            - containerPort: 8008
+              name: http
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log/askd
+      volumes:
+        - name: logs
+          emptyDir: {}

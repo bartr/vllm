@@ -1,8 +1,14 @@
-"""Log-tail parser and process-table check for get_benchmark_status."""
+"""Benchmark log parser + askd HTTP shims for MCP tools.
 
-import os
-import subprocess
-import settings
+The local `pgrep` / `~/logs/bench.log` path is gone. `is_running()` and
+`tail_log()` are now thin async wrappers around the askd HTTP control
+plane in the cllm namespace. `parse_row()` still parses the same
+fixed-width row format that `ask` (and now askd) emit through
+`runAggregator`, so downstream parsing logic in scenario.py / server.py
+is unchanged.
+"""
+
+import ask_client
 
 # Column byte ranges from the ask --bench fixed-width output format:
 #   "%-7d %-7d %-9s %-12s %-11.2f %-12s %-6s"
@@ -10,20 +16,30 @@ import settings
 _HEADER_TOKEN = "thread"
 
 
-def is_running() -> bool:
-    result = subprocess.run(
-        ["pgrep", "-f", "ask --bench"],
-        capture_output=True,
-    )
-    return result.returncode == 0
+async def is_running() -> bool:
+    """True iff askd reports a job in 'running' or 'paused' state.
+
+    Raises ask_client.AskNotDeployedError if askd is unreachable.
+    """
+    status = await ask_client.get_status()
+    return status.get("state") in ("running", "paused")
 
 
-def tail_log(n: int) -> list[str]:
-    path = os.path.expanduser(settings.CLLM_BENCH_LOG)
-    if not os.path.exists(path):
+async def tail_log(n: int) -> list[str]:
+    """Return up to the last n lines of the most recent askd run log.
+
+    Returns [] if no logs exist yet. Raises AskNotDeployedError if askd
+    is unreachable.
+    """
+    listing = await ask_client.list_logs()
+    logs = listing.get("logs", [])
+    if not logs:
         return []
-    with open(path, "r", errors="replace") as f:
-        lines = f.readlines()
+    # listing is sorted newest-first by askd.
+    name = logs[0]["name"]
+    # Pull a generous tail in bytes (~200 chars per fixed-width row).
+    text = await ask_client.tail_log_text(name, tail_bytes=max(n, 1) * 256)
+    lines = text.splitlines()
     return lines[-n:] if len(lines) > n else lines
 
 

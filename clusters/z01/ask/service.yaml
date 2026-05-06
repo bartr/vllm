@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: askd
+  namespace: cllm
+  labels:
+    app.kubernetes.io/name: askd
+spec:
+  selector:
+    app: askd
+  ports:
+    - name: http
+      port: 8008
+      targetPort: http

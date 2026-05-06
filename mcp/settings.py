@@ -1,6 +1,7 @@
 import os
 
 CLLM_BASE_URL = os.environ.get("CLLM_BASE_URL", "http://192.168.68.63:8088").rstrip("/")
+CLLM_ASK_BASE_URL = os.environ.get("CLLM_ASK_BASE_URL", "http://192.168.68.63:8008").rstrip("/")
 CLLM_PROMETHEUS_URL = os.environ.get(
     "CLLM_PROMETHEUS_URL", "http://192.168.68.63:9090"
 ).rstrip("/")

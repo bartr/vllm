@@ -18,8 +18,8 @@ func runAggregator(opts options, results <-chan Result, stdout io.Writer) {
 	window := windowDeque{maxAge: windowSeconds * time.Second}
 
 	if !opts.json {
-		fmt.Fprintf(stdout, "\n%-7s %-7s %-9s %-12s %-11s %-12s %-6s\n",
-			"thread", "tokens", "ttft_ms", "duration_ms", "req_tok/s", "total_tok/s", "cache")
+		fmt.Fprintf(stdout, "\n%-20s %-7s %-7s %-9s %-12s %-11s %-12s %-6s\n",
+			"ts", "thread", "tokens", "ttft_ms", "duration_ms", "req_tok/s", "total_tok/s", "cache")
 	}
 
 	for r := range results {
@@ -57,8 +57,9 @@ func runAggregator(opts options, results <-chan Result, stdout io.Writer) {
 			}
 		}
 
-		fmt.Fprintf(stdout, "%-7d %-7d %-9s %-12s %-11.2f %-12s %-6s",
-			r.Worker, r.CompletionTokens, ttft, duration, reqTPS, totalCol, cache)
+		ts := r.EndedAt.UTC().Format(time.RFC3339)
+		fmt.Fprintf(stdout, "%-20s %-7d %-7d %-9s %-12s %-11.2f %-12s %-6s",
+			ts, r.Worker, r.CompletionTokens, ttft, duration, reqTPS, totalCol, cache)
 		if !r.OK {
 			fmt.Fprintf(stdout, "  ERR: %s", trimErr(r.Err, 80))
 		}

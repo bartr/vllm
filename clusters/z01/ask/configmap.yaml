@@ -1,0 +1,23 @@
+# askd defaults. These become the askd process flags via env vars (the
+# CLLM_* names are honored by the existing ask flag layer; ASK_ADDR /
+# ASK_LOG_DIR are askd-specific). The HTTP /config endpoint can override
+# any of these per-job at runtime; POST /config/reset reverts to the
+# values baked in here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: askd-defaults
+  namespace: cllm
+data:
+  ASK_ADDR: ":8008"
+  ASK_LOG_DIR: "/var/log/askd"
+  # askd autostart defaults — kicked off after the listener is up.
+  # Set ASK_AUTOSTART="false" to disable and require a manual POST /bench.
+  ASK_AUTOSTART: "true"
+  ASK_BENCH: "120"
+  ASK_FILES: "/configs/prompts.yaml"
+  ASK_LOOP: "true"
+  CLLM_URL: "http://cllm.cllm.svc.cluster.local:8080"
+  CLLM_MAX_TOKENS: "100"
+  CLLM_TEMPERATURE: "0.2"
+  CLLM_SYSTEM_PROMPT: "You are a helpful assistant."

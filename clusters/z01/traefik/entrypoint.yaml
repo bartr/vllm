@@ -18,6 +18,12 @@ spec:
           default: true
         exposedPort: 8088
         protocol: TCP
+      ask:
+        port: 8009
+        expose:
+          default: true
+        exposedPort: 8008
+        protocol: TCP
       prometheus:
         port: 9091
         expose:
