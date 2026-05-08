@@ -4,7 +4,7 @@ theme: default
 paginate: true
 size: 16:9
 header: 'Helium vs cLLM — Evidence for HVE'
-footer: 'Bart Robertson · Partner FDE · May 2026'
+footer: 'Bart Robertson · Forward Deployed Engineer · May 2026'
 style: |
   section {
     font-size: 24px;
@@ -69,7 +69,7 @@ style: |
 # Helium vs cLLM
 ## Evidence for Hypervelocity Engineering
 
-Bart Robertson · Partner FDE
+Bart Robertson · Forward Deployed Engineer
 May 2026
 
 ---
@@ -117,7 +117,7 @@ What we were: **all new to Kubernetes, Prometheus, Grafana, GitOps**
 | Axis | Helium (spring 2018) | cLLM (Apr–May 2026) |
 |---|---|---|
 | Time to MVP | **26 weeks** | **4 days** |
-| Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
+| Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 FDE |
 | **People-weeks** | **~104** | **~0.8** |
 | **Same team rebuild today, no HVE, no reuse** | **~13 weeks (~52 person-weeks)** — team's own estimate | — |
 | Stack experience at start | New to K8s, Prom, Grafana, GitOps | 8 yrs each, top-tier K8s FDE |

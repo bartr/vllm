@@ -25,7 +25,7 @@ This talk is not "AI built it for me." It is: an experienced FDE, equipped with 
 | Axis | Helium (spring 2018) | cLLM (Apr–May 2026) |
 |---|---|---|
 | Time to MVP | **26 weeks** (6 months) | **4 days** of focused work |
-| Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 Partner FDE |
+| Team | 2 Principal FDE + 1 Senior FDE + 1 Principal PM | 1 FDE |
 | People-weeks | **~104** | **~0.8** |
 | Counterfactual rebuild (same team, no HVE, 6 mo later, no reuse) | **~13 weeks** (~52 person-weeks) — Helium team's own estimate | — |
 | Reduction vs original Helium | — | **~130×** less effort |
