@@ -5,7 +5,7 @@
 
 ```powershel
 
-git clone https://github.com/bartr/vllm
+git clone https://github.com/bartr/cllm
 
 ```
 

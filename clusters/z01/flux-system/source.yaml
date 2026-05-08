@@ -9,4 +9,4 @@ spec:
     branch: bartr
   # secretRef:
   #   name: flux-system
-  url: https://github.com/bartr/vllm.git
+  url: https://github.com/bartr/cllm.git
